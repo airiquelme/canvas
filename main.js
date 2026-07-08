@@ -174,12 +174,114 @@ function drawShadeThicknessLine(ctx, circleX, circleY, r, azimuth, phase) {
   ctx.moveTo(midPoint.x, midPoint.y);
   ctx.lineTo(edgePoint.x, edgePoint.y);
   ctx.stroke();
-  ctx.fillStyle = '#33ff33';
-  [midPoint, edgePoint].forEach(p => {
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-    ctx.fill();
-  });
+}
+
+function drawGreenLineMidpoint(ctx, circleX, circleY, r, azimuth, phase, sweepStart, sweepEnd) {
+  const localXMid = -phase * r;   // equator point
+  const localXEdge = -r;          // dark pole
+
+  const equatorPoint = { x: circleX + localXMid * Math.cos(azimuth), y: circleY + localXMid * Math.sin(azimuth) };
+  const darkPole = { x: circleX + localXEdge * Math.cos(azimuth), y: circleY + localXEdge * Math.sin(azimuth) };
+
+  const midpoint = { x: (equatorPoint.x + darkPole.x) / 2, y: (equatorPoint.y + darkPole.y) / 2 };
+  const radius = Math.hypot(equatorPoint.x - darkPole.x, equatorPoint.y - darkPole.y) / 2;
+
+  const subCircleRadius = Math.hypot(midpoint.x - circleX, midpoint.y - circleY);
+
+  // Determine which arc of the sub-circle lies in the crescent
+  // (beyond the terminator ellipse, toward the dark rim) -- that
+  // portion draws red, the rest draws green.
+  const ex = Math.abs(phase) * r;
+  const subR = subCircleRadius;
+  let crescentStart = null, crescentEnd = null, entireRed = false;
+
+  if (subR > 1e-9) {
+    if (ex < 1e-9) {
+      crescentStart = azimuth + Math.PI / 2;
+      crescentEnd = azimuth + Math.PI * 1.5;
+    } else {
+      const denom = 1 - (ex * ex) / (r * r);
+      const y2 = (subR * subR - ex * ex) / denom;
+      if (y2 < 0 || y2 > subR * subR + 1e-9) {
+        entireRed = true; // no valid intersection -- dark pole is always in the crescent, so the whole sub-circle is
+      } else {
+        const y = Math.sqrt(Math.min(y2, subR * subR));
+        const xMag = ex * Math.sqrt(Math.max(0, 1 - y2 / (r * r)));
+        const xLocal = phase >= 0 ? -xMag : xMag;
+        // These are LOCAL angles (in the azimuth-rotated frame where
+        // the dark pole sits at local angle PI) -- convert to world
+        // angles by adding azimuth before use.
+        const angleALocal = Math.atan2(y, xLocal);
+        const angleBLocal = Math.atan2(-y, xLocal);
+        function contains(s, e, target) {
+          let ee = e; while (ee < s) ee += Math.PI * 2;
+          const shift = Math.round((s - target) / (Math.PI * 2)) * Math.PI * 2;
+          const t = target + shift;
+          return t >= s && t <= ee;
+        }
+        // Membership test done in LOCAL terms (dark pole = local PI)
+        if (contains(angleALocal, angleBLocal, Math.PI)) { crescentStart = angleALocal + azimuth; crescentEnd = angleBLocal + azimuth; }
+        else { crescentStart = angleBLocal + azimuth; crescentEnd = angleALocal + azimuth; }
+      }
+    }
+  }
+
+  // Additionally cut off by the seam-point chord: the red portion
+  // should only exist on the outer-rim side (opposite the tube).
+  // Intersect the crescent arc (dark-pole side) with the outer-rim
+  // sweep, both as circular intervals.
+  function intersectArcs(startA, endA, startB, endB) {
+    let eA = endA; while (eA < startA) eA += Math.PI * 2;
+    let eB = endB; while (eB < startB) eB += Math.PI * 2;
+    for (const offset of [0, Math.PI * 2, -Math.PI * 2]) {
+      const s = Math.max(startA, startB + offset);
+      const e = Math.min(eA, eB + offset);
+      if (s <= e) return [s, e];
+    }
+    return null;
+  }
+
+  let redStart = null, redEnd = null;
+  if (subR > 1e-9) {
+    if (entireRed) {
+      // Crescent = whole circle; red is just the outer-rim sweep itself.
+      redStart = sweepStart;
+      redEnd = sweepEnd;
+    } else {
+      const result = intersectArcs(crescentStart, crescentEnd, sweepStart, sweepEnd);
+      if (result) { redStart = result[0]; redEnd = result[1]; }
+    }
+  }
+
+  if (subR > 1e-9) {
+    if (redStart !== null) {
+      let re = redEnd; while (re < redStart) re += Math.PI * 2;
+      ctx.strokeStyle = '#ff3333';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(circleX, circleY, subR, redStart, re, false);
+      ctx.stroke();
+
+      ctx.strokeStyle = '#33ff33';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(circleX, circleY, subR, re, redStart + Math.PI * 2, false);
+      ctx.stroke();
+    } else {
+      // No red segment at all -- entire sub-circle is green.
+      ctx.strokeStyle = '#33ff33';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(circleX, circleY, subR, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  ctx.strokeStyle = '#ffee33';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(midpoint.x, midpoint.y, radius, 0, Math.PI * 2);
+  ctx.stroke();
 }
 
 function computeCapIntersection(r, capRadius, poleLocalX, poleLocalY, preferPosX) {
@@ -358,6 +460,140 @@ function drawQualifyingPoints(ctx, c1, azimuth1, r1, c2, azimuth2, r2) {
   });
 }
 
+function drawTerminatorToDarkPoleLines(ctx, circleX, circleY, r, azimuth, phase) {
+  const length = r * (1 - phase) / 2; // half the green thickness line's length
+  const ex = Math.abs(phase) * r;
+  const subR = r * (phase + 1) / 2;
+
+  // Ellipse-subcircle intersection (same math as drawEllipseSubCircleIntersections)
+  let xLocal = 0, yLocal = 0, hasIntersection = false;
+  if (ex < 1e-9) {
+    if (subR <= r) { xLocal = 0; yLocal = subR; hasIntersection = true; }
+  } else {
+    const denom = 1 - (ex * ex) / (r * r);
+    const y2 = (subR * subR - ex * ex) / denom;
+    if (y2 >= 0) {
+      const y = Math.sqrt(y2);
+      const x2 = ex * ex * (1 - y2 / (r * r));
+      if (x2 >= -1e-9) {
+        const x = Math.sqrt(Math.max(0, x2));
+        xLocal = phase >= 0 ? -x : x;
+        yLocal = y;
+        hasIntersection = true;
+      }
+    }
+  }
+  if (!hasIntersection) return;
+
+  const intersectionsLocal = [{ x: xLocal, y: yLocal }, { x: xLocal, y: -yLocal }];
+
+  ctx.strokeStyle = '#ffee33';
+  ctx.lineWidth = 3;
+  intersectionsLocal.forEach(il => {
+    const endPoint = { x: circleX + il.x * Math.cos(azimuth) - il.y * Math.sin(azimuth), y: circleY + il.x * Math.sin(azimuth) + il.y * Math.cos(azimuth) };
+    ctx.beginPath();
+    ctx.arc(endPoint.x, endPoint.y, length, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+}
+
+// Black dot on the green line (at its midpoint), drawn only when the
+// dark pole currently sits in the OUTER rim (not facing the tube).
+function drawDarkPoleOuterRimMarker(ctx, c, r, azimuth, phase, sweepStart, sweepEnd) {
+  let outerStart = sweepStart, outerEnd = sweepEnd;
+  while (outerEnd < outerStart) outerEnd += Math.PI * 2;
+
+  const darkPoleAngle = azimuth + Math.PI;
+  const shift = Math.round((outerStart - darkPoleAngle) / (Math.PI * 2)) * Math.PI * 2;
+  const shiftedDarkPole = darkPoleAngle + shift;
+  const isOuter = shiftedDarkPole >= outerStart && shiftedDarkPole <= outerEnd;
+  if (!isOuter) return;
+
+  const localXMid = -phase * r, localXEdge = -r;
+  const equatorPoint = { x: c.x + localXMid * Math.cos(azimuth), y: c.y + localXMid * Math.sin(azimuth) };
+  const darkPole = { x: c.x + localXEdge * Math.cos(azimuth), y: c.y + localXEdge * Math.sin(azimuth) };
+  const midpoint = { x: (equatorPoint.x + darkPole.x) / 2, y: (equatorPoint.y + darkPole.y) / 2 };
+
+  ctx.fillStyle = '#000000';
+  ctx.beginPath();
+  ctx.arc(midpoint.x, midpoint.y, 5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Checks whether a world-space point lies ON the terminator ellipse,
+// or in the crescent between the ellipse and the dark rim (i.e., on
+// the correct dark side, and outside/on the ellipse boundary).
+function isOnOrBeyondEllipse(c, r, azimuth, phase, point) {
+  const dx = point.x - c.x, dy = point.y - c.y;
+  const xLocal = dx * Math.cos(azimuth) + dy * Math.sin(azimuth);
+  const yLocal = -dx * Math.sin(azimuth) + dy * Math.cos(azimuth);
+
+  const correctSide = phase >= 0 ? xLocal <= 1e-9 : xLocal >= -1e-9;
+  if (!correctSide) return false;
+
+  const ex = Math.abs(phase) * r;
+  if (ex < 1e-9) return true; // ellipse degenerates to the x=0 line; correct side already confirmed
+
+  const val = (xLocal * xLocal) / (ex * ex) + (yLocal * yLocal) / (r * r);
+  return val >= 1 - 1e-9;
+}
+
+function drawEllipseSubCircleIntersections(ctx, circleX, circleY, r, azimuth, phase, sweepStart, sweepEnd) {
+  const ex = Math.abs(phase) * r;
+  const subR = r * (phase + 1) / 2;
+
+  let points = [];
+  if (ex < 1e-9) {
+    if (subR <= r) points = [{ x: 0, y: subR }, { x: 0, y: -subR }];
+  } else {
+    const denom = 1 - (ex * ex) / (r * r);
+    const y2 = (subR * subR - ex * ex) / denom;
+    if (y2 >= 0) {
+      const y = Math.sqrt(y2);
+      const x2 = ex * ex * (1 - y2 / (r * r));
+      if (x2 >= -1e-9) {
+        const x = Math.sqrt(Math.max(0, x2));
+        const xLocal = phase >= 0 ? -x : x;
+        points = [{ x: xLocal, y }, { x: xLocal, y: -y }];
+      }
+    }
+  }
+  if (points.length === 0 || subR < 1e-9) return;
+
+  let outerStart = sweepStart, outerEnd = sweepEnd;
+  while (outerEnd < outerStart) outerEnd += Math.PI * 2;
+
+  ctx.fillStyle = '#ffee33';
+  points.forEach(p => {
+    // World position of the intersection point I
+    const worldI = { x: circleX + p.x * Math.cos(azimuth) - p.y * Math.sin(azimuth), y: circleY + p.x * Math.sin(azimuth) + p.y * Math.cos(azimuth) };
+    // Where the corresponding yellow circle (centered at I) touches the main circle
+    const tangentAngle = Math.atan2(worldI.y - circleY, worldI.x - circleX);
+    const shift = Math.round((outerStart - tangentAngle) / (Math.PI * 2)) * Math.PI * 2;
+    const shiftedAngle = tangentAngle + shift;
+    const touchesOuter = shiftedAngle >= outerStart && shiftedAngle <= outerEnd;
+    if (!touchesOuter) return;
+
+    ctx.beginPath();
+    ctx.arc(worldI.x, worldI.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+// Point A: sits on the sub-circle, at the same angle as a seam point
+// on the main circle.
+function drawPointA(ctx, c, r, azimuth, phase, sweepStart, sweepEnd) {
+  const subR = r * (phase + 1) / 2;
+  ctx.fillStyle = '#ff3333';
+  [sweepStart, sweepEnd].forEach(angle => {
+    const p = { x: c.x + subR * Math.cos(angle), y: c.y + subR * Math.sin(angle) };
+    if (!isOnOrBeyondEllipse(c, r, azimuth, phase, p)) return;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
 // ---------------------------------------------------------
 // RENDER LOOP
 // ---------------------------------------------------------
@@ -374,7 +610,12 @@ function render() {
 
   drawLinkFlat(ctx, top, rTop, bottom, rBottom, baseColor);
 
-  [{ c: top, r: rTop }, { c: bottom, r: rBottom }].forEach(({ c, r }) => {
+  const { t1Angle, t2Angle } = computeLinkTangents(top, rTop, bottom, rBottom);
+
+  [
+    { c: top, r: rTop, sweepStart: t1Angle, sweepEnd: t2Angle },
+    { c: bottom, r: rBottom, sweepStart: t2Angle, sweepEnd: t1Angle },
+  ].forEach(({ c, r, sweepStart, sweepEnd }) => {
     ctx.fillStyle = baseColor;
     ctx.beginPath();
     ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
@@ -383,13 +624,15 @@ function render() {
     const info = getCircleLightInfo(c.x, c.y);
     drawEllipseBoundary(ctx, c.x, c.y, r, info.angle, info.phase);
     drawShadeThicknessLine(ctx, c.x, c.y, r, info.angle, info.phase);
+    drawTerminatorToDarkPoleLines(ctx, c.x, c.y, r, info.angle, info.phase);
+    drawGreenLineMidpoint(ctx, c.x, c.y, r, info.angle, info.phase, sweepStart, sweepEnd);
   });
 
   const topInfo = getCircleLightInfo(top.x, top.y);
   const bottomInfo = getCircleLightInfo(bottom.x, bottom.y);
-  drawShadeEllipse(ctx, top, topInfo.angle, rTop, topInfo.phase, bottom, bottomInfo.angle, rBottom, bottomInfo.phase, shadeColor);
-  drawQualifyingPoints(ctx, top, topInfo.angle, rTop, bottom, bottomInfo.angle, rBottom);
-  drawPoleCaps(ctx, top, topInfo.angle, rTop, topInfo.phase, bottom, bottomInfo.angle, rBottom, bottomInfo.phase);
+  // drawShadeEllipse(ctx, top, topInfo.angle, rTop, topInfo.phase, bottom, bottomInfo.angle, rBottom, bottomInfo.phase, shadeColor);
+  // drawQualifyingPoints(ctx, top, topInfo.angle, rTop, bottom, bottomInfo.angle, rBottom);
+  // drawPoleCaps(ctx, top, topInfo.angle, rTop, topInfo.phase, bottom, bottomInfo.angle, rBottom, bottomInfo.phase);
 
   // Light position marker
   const zMin = -400, zMax = 400, radiusMin = 4, radiusMax = 28;
