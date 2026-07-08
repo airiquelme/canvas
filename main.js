@@ -28,14 +28,12 @@ function applyDesignSpaceTransform() {
 }
 
 // ---------------------------------------------------------
-// LIGHT: orbits azimuthally at fixed radius/z (phase stays constant)
+// LIGHT
 // ---------------------------------------------------------
-const orbitRadius = 380;
-const fixedZ = 250;
-const light = { x: 0, y: 0, z: fixedZ };
+const light = { x: 0, y: 0, z: 0 };
 
 // ---------------------------------------------------------
-// MOON-PHASE CIRCLE SHADING
+// MOON-PHASE CIRCLE SHADING (plain, uncut)
 // ---------------------------------------------------------
 function getCircleLightInfo(circleX, circleY) {
   const dx = light.x - circleX, dy = light.y - circleY, dz = light.z;
@@ -53,19 +51,14 @@ function drawMoonPhaseCircle(ctx, circleX, circleY, r, baseColor, shadeColor, av
   ctx.arc(circleX, circleY, r, 0, Math.PI * 2);
   ctx.clip();
 
-  // No base-color repaint here anymore -- the link's own base fill
-  // already covers this circle, and the tube shade may have already
-  // been drawn on top of that. Repainting base color here would
-  // erase the tube shade; skipping it lets the crescent below simply
-  // ADD to whatever's already there, so the straight tube strip and
-  // the curved crescent merge instead of one overwriting the other.
+  // No base-color repaint here -- the link's own base fill already
+  // covers this circle, and the tube shade may already be drawn on
+  // top of that. Repainting here would erase it; skipping lets the
+  // crescent below simply ADD to what's already there.
   ctx.translate(circleX, circleY);
 
-  // For each connected link, clip out the side of the cutoff line
-  // facing TOWARD it. The cutoff itself still runs perpendicular to
-  // the link direction (same as before) -- but now it's SLID along
-  // that direction to pass through the tangent point instead of
-  // always through the center.
+  // For each connected link, slide the cutoff to the red tangent
+  // point and remove the sliver beyond it (toward the link).
   if (avoidConstraints) {
     for (const { avoidAngle, offset } of avoidConstraints) {
       ctx.rotate(avoidAngle);
@@ -90,66 +83,118 @@ function drawMoonPhaseCircle(ctx, circleX, circleY, r, baseColor, shadeColor, av
   ctx.restore();
 }
 
-// Of the two tangent-equation solutions, only ONE is ever on the
-// visible crescent (the other is its mirror on the hidden side of
-// the ellipse). Returns that one's world point, or null.
-function getVisibleTangentPoint(points, phase) {
-  const visible = points.filter(p => {
-    const cosTheta = Math.cos(p.theta);
-    return phase >= 0 ? cosTheta <= 0 : cosTheta >= 0;
-  });
-  return visible.length ? visible[0] : null;
-}
-
-// Project the tangent point onto the link's own direction to get how
-// far along that axis the cutoff line should slide (0 = through the
-// center, matching the previous behavior).
-function computeSlideOffset(circleX, circleY, avoidAngle, tangentPoint) {
-  if (!tangentPoint) return 0;
-  const dx = tangentPoint.x - circleX, dy = tangentPoint.y - circleY;
-  return dx * Math.cos(avoidAngle) + dy * Math.sin(avoidAngle);
+// Project a point onto the given axis direction, relative to a
+// circle's own center -- how far the cutoff should slide.
+function computeSlideOffset(circleX, circleY, axisAngle, point) {
+  if (!point) return 0;
+  const dx = point.x - circleX, dy = point.y - circleY;
+  return dx * Math.cos(axisAngle) + dy * Math.sin(axisAngle);
 }
 
 // ---------------------------------------------------------
-// TANGENT MARKERS: both points where the shade boundary's tangent
-// is parallel to a given reference (yellow) line direction
+// NEW RED MARKER: points on circle A's shade ellipse where the
+// tangent line is ALSO tangent to circle B (the actual linked
+// circle, not its own ellipse).
 // ---------------------------------------------------------
-function computeTangentPoints(circleX, circleY, r, azimuth, phase, lineAngle) {
-  const delta = lineAngle - azimuth;
-  const k = Math.abs(phase);
-  if (k < 1e-6) return [];
-
-  const branch1 = Math.atan2(-Math.cos(delta), k * Math.sin(delta));
-  const branch2 = branch1 + Math.PI;
-
-  return [branch1, branch2].map(theta => {
-    const localX = k * r * Math.cos(theta);
-    const localY = r * Math.sin(theta);
-    const worldX = circleX + localX * Math.cos(azimuth) - localY * Math.sin(azimuth);
-    const worldY = circleY + localX * Math.sin(azimuth) + localY * Math.cos(azimuth);
-    return { x: worldX, y: worldY, theta };
-  });
+// Ellipse A local tangent line at theta: A_coef*x + B_coef*y = 1
+//   A_coef = cos(theta)/(kA*rA), B_coef = sin(theta)/rA
+// Distance from circle B's center (in A's local frame) to this line
+// must equal rB:
+//   (A_coef*bx + B_coef*by - 1) = +/- rB * sqrt(A_coef^2+B_coef^2)
+function localOf(cA, azimuthA, worldPoint) {
+  const dx = worldPoint.x - cA.x, dy = worldPoint.y - cA.y;
+  return {
+    x: dx * Math.cos(azimuthA) + dy * Math.sin(azimuthA),
+    y: -dx * Math.sin(azimuthA) + dy * Math.cos(azimuthA),
+  };
 }
 
-function drawTangentMarker(ctx, point, lineAngle, length) {
-  const dx = Math.cos(lineAngle) * length, dy = Math.sin(lineAngle) * length;
+function ellipseCircleResidual(theta, kA, rA, bx, by, rB, sign) {
+  const Ac = Math.cos(theta) / (kA * rA);
+  const Bc = Math.sin(theta) / rA;
+  const d = Ac * bx + Bc * by - 1;
+  return d - sign * rB * Math.hypot(Ac, Bc);
+}
+
+function findEllipseCircleRoots(kA, rA, bx, by, rB, sign, steps = 240) {
+  const f = (theta) => ellipseCircleResidual(theta, kA, rA, bx, by, rB, sign);
+  let prevTheta = -Math.PI, prevVal = f(prevTheta);
+  const roots = [];
+  for (let i = 1; i <= steps; i++) {
+    const theta = -Math.PI + (2 * Math.PI) * (i / steps);
+    const val = f(theta);
+    if (isFinite(val) && isFinite(prevVal) && Math.sign(val) !== Math.sign(prevVal)) {
+      let lo = prevTheta, hi = theta, flo = prevVal;
+      for (let it = 0; it < 50; it++) {
+        const mid = (lo + hi) / 2, fm = f(mid);
+        if (Math.sign(fm) === Math.sign(flo)) { lo = mid; flo = fm; } else { hi = mid; }
+      }
+      roots.push((lo + hi) / 2);
+    }
+    prevTheta = theta; prevVal = val;
+  }
+  return roots;
+}
+
+function isVisibleTheta(theta, phase) {
+  const c = Math.cos(theta);
+  return phase >= 0 ? c <= 0 : c >= 0;
+}
+
+// Returns array of { pointA, pointB, theta } -- pointA on circle A's
+// ellipse, pointB the actual tangency point on circle B, connected by
+// the same straight tangent line.
+function computeEllipseCircleTangentPoints(cA, azimuthA, phaseA, rA, cB, rB) {
+  const kA = Math.abs(phaseA);
+  if (kA < 1e-6) return [];
+  const local = localOf(cA, azimuthA, cB);
+
+  const results = [];
+  for (const sign of [1, -1]) {
+    const thetas = findEllipseCircleRoots(kA, rA, local.x, local.y, rB, sign);
+    for (const theta of thetas) {
+      if (!isVisibleTheta(theta, phaseA)) continue;
+      const Ac = Math.cos(theta) / (kA * rA), Bc = Math.sin(theta) / rA;
+      const norm = Math.hypot(Ac, Bc);
+
+      // Point on ellipse A (world space)
+      const lxA = kA * rA * Math.cos(theta), lyA = rA * Math.sin(theta);
+      const pointA = {
+        x: cA.x + lxA * Math.cos(azimuthA) - lyA * Math.sin(azimuthA),
+        y: cA.y + lxA * Math.sin(azimuthA) + lyA * Math.cos(azimuthA),
+      };
+
+      // Tangency point on circle B: foot of perpendicular from B's
+      // center (in A's local frame) onto the tangent line, offset by rB
+      const tangXLocal = local.x - sign * rB * (Ac / norm);
+      const tangYLocal = local.y - sign * rB * (Bc / norm);
+      const pointB = {
+        x: cA.x + tangXLocal * Math.cos(azimuthA) - tangYLocal * Math.sin(azimuthA),
+        y: cA.y + tangXLocal * Math.sin(azimuthA) + tangYLocal * Math.cos(azimuthA),
+      };
+
+      results.push({ pointA, pointB, theta });
+    }
+  }
+  return results;
+}
+
+function drawTangentLine(ctx, pointA, pointB) {
   ctx.strokeStyle = '#ff3333';
   ctx.lineWidth = 3;
   ctx.beginPath();
-  ctx.moveTo(point.x - dx, point.y - dy);
-  ctx.lineTo(point.x + dx, point.y + dy);
+  ctx.moveTo(pointA.x, pointA.y);
+  ctx.lineTo(pointB.x, pointB.y);
   ctx.stroke();
   ctx.fillStyle = '#ff3333';
   ctx.beginPath();
-  ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
+  ctx.arc(pointA.x, pointA.y, 5, 0, Math.PI * 2);
   ctx.fill();
 }
 
-// A strip running PARALLEL TO THE GREEN LINE itself (not the tube's
-// length axis) -- since both green points lie exactly ON that line,
-// translating to either one and rotating by the line's own angle puts
-// the line at local y=0, so the shade is simply everything from there
-// out to the far/shaded edge, no separate offset needed.
+// A strip running parallel to a given line (here, the chosen red
+// tangent line), from that line out to the far/shaded edge of the
+// tube, so it continues the circle's own cutoff shade seamlessly.
 function drawTubeShade(ctx, c1, r1, c2, r2, originX, originY, lineAngle, farEdgeSign, shadeColor) {
   ctx.save();
   traceLinkPath(ctx, c1, r1, c2, r2);
@@ -167,33 +212,47 @@ function drawTubeShade(ctx, c1, r1, c2, r2, originX, originY, lineAngle, farEdge
   ctx.restore();
 }
 
-// Marker's distance from the origin's center, measured along the
-// PERPENDICULAR-to-length axis (how far it sits from the centerline
-// widthwise) -- this sets the strip's width.
-function computePerpOffset(originX, originY, lengthAngle, tangentPoint) {
-  if (!tangentPoint) return 0;
-  const perpAngle = lengthAngle + Math.PI / 2;
-  const dx = tangentPoint.x - originX, dy = tangentPoint.y - originY;
-  return dx * Math.cos(perpAngle) + dy * Math.sin(perpAngle);
+// Which perpendicular side (relative to lineAngle) is the shaded,
+// far-from-light side.
+function computeFarEdgeSign(azimuth, lineAngle) {
+  const perpAngle = lineAngle + Math.PI / 2;
+  return Math.cos(azimuth - perpAngle) >= 0 ? -1 : 1;
 }
 
-// Which perpendicular side (+1 or -1) is the shaded, far-from-light
-// side of this tube -- same logic as the original per-link sweep.
-function computeFarEdgeSign(azimuth, lengthAngle) {
-  const perpAngle = lengthAngle + Math.PI / 2;
-  return Math.cos(azimuth - perpAngle) >= 0 ? -1 : 1;
+// Draws the FULL ellipse terminator curve (not the fixed rim half) in
+// black, always at its true uncut extent -- regardless of whatever
+// half-plane cutoff is currently clipping the actual shade fill. Lets
+// you track where the boundary "really" is even when trimmed.
+function drawEllipseBoundary(ctx, circleX, circleY, r, azimuth, phase) {
+  const ex = Math.abs(phase) * r;
+  const termCcw = phase >= 0 ? false : true;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(circleX, circleY, r, 0, Math.PI * 2);
+  ctx.clip();
+
+  ctx.translate(circleX, circleY);
+  ctx.rotate(azimuth);
+
+  ctx.strokeStyle = '#000000';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, ex, r, 0, Math.PI / 2, -Math.PI / 2, termCcw);
+  ctx.stroke();
+
+  ctx.restore();
 }
 
 // ---------------------------------------------------------
 // COMMON TANGENT TO TWO ELLIPSES (green marker)
 // ---------------------------------------------------------
 // Where would a single straight line be tangent to BOTH circles'
-// (uncut) shade boundaries simultaneously? This is a genuine
-// two-unknown system (no simple closed form like the single-ellipse
-// case), solved numerically: scan + bisect for sign changes in a
-// residual, verify each is a true double-tangent (not a branch-switch
-// artifact), then pick whichever matches the tube's own far/shaded
-// side most closely.
+// (uncut) shade boundaries simultaneously? Solved numerically: scan +
+// bisect for sign changes in a residual, verify each is a true
+// double-tangent (not a branch-switch artifact), then require BOTH
+// points to be on their own circle's VISIBLE side -- this generically
+// leaves exactly one candidate, no unstable tie-break needed.
 function ellipsePointWorld(c, azimuth, k, r, theta) {
   const lx = k * r * Math.cos(theta), ly = r * Math.sin(theta);
   return {
@@ -237,7 +296,7 @@ function computeCommonTangentPoints(cA, azA, phaseA, rA, cB, azB, phaseB, rB, pr
 
   const f = (thetaB) => commonTangentResidual(cA, azA, kA, rA, cB, azB, kB, rB, thetaB).residual;
 
-  const steps = 240; // finer scan -- a coarser one can step over a genuinely thin valid window without ever sampling inside it
+  const steps = 240;
   let prevTheta = -Math.PI, prevVal = f(prevTheta);
   const roots = [];
   for (let i = 1; i <= steps; i++) {
@@ -267,16 +326,10 @@ function computeCommonTangentPoints(cA, azA, phaseA, rA, cB, azB, phaseB, rB, pr
     const PB = ellipsePointWorld(cB, azB, kB, rB, thetaB);
     const lineDir = { x: PB.x - PA.x, y: PB.y - PA.y };
     const tangentACheck = Math.abs(crossVec(TA, lineDir)) / (Math.hypot(TA.x, TA.y) * Math.hypot(lineDir.x, lineDir.y) || 1);
-    if (tangentACheck > 0.01) continue; // spurious branch-switch artifact, not a real double-tangent
+    if (tangentACheck > 0.01) continue;
 
-    // The key filter: BOTH points must be on their own circle's
-    // VISIBLE side (same criterion as the original single-ellipse
-    // marker). This generically leaves exactly ONE candidate -- no
-    // tie-break needed at all, which is what makes it stable.
     if (!isVisible(thetaA, phaseA) || !isVisible(thetaB, phaseB)) continue;
 
-    // On the rare occasion two candidates both pass (right at a
-    // transition), fall back to closest-to-reference as a last resort.
     const score = Math.hypot(PA.x - preferPoint.x, PA.y - preferPoint.y);
     if (score < bestScore) { bestScore = score; best = { pointA: PA, pointB: PB }; }
   }
@@ -294,6 +347,114 @@ function drawGreenTangentLine(ctx, pointA, pointB) {
   [pointA, pointB].forEach(p => {
     ctx.beginPath();
     ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+// Kurzgesagt-style cartoon shade: a thick rounded-cap stroke running
+// along the circle's rim, from one pole directly to the other (the
+// fixed far half of the circle, away from the light) -- matching the
+// black pole markers exactly, not a phase-proportional sweep.
+function drawCartoonShadeLine(ctx, circleX, circleY, r, azimuth, phase, shadeColor) {
+  const thickness = r * (1 - phase); // same length as the green thickness line: 0 at full moon, 2r at new moon
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(circleX, circleY, r, 0, Math.PI * 2);
+  ctx.clip();
+
+  ctx.translate(circleX, circleY);
+  ctx.rotate(azimuth);
+
+  ctx.strokeStyle = shadeColor;
+  ctx.lineWidth = thickness * 2; // lineWidth is the stroke's diameter; doubling makes its RADIUS match the green line
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, true); // pole to pole, via the far side
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// The two "pole" points where the terminator meets the true circle
+// rim -- directly: perpendicular to the light direction, at radius r.
+// No ellipse formula needed at all.
+function drawPoleMarkers(ctx, circleX, circleY, r, azimuth) {
+  const perpAngle = azimuth + Math.PI / 2;
+  const pole1 = { x: circleX + r * Math.cos(perpAngle), y: circleY + r * Math.sin(perpAngle) };
+  const pole2 = { x: circleX - r * Math.cos(perpAngle), y: circleY - r * Math.sin(perpAngle) };
+  ctx.fillStyle = '#000000';
+  [pole1, pole2].forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+// Green line: from the ellipse's widest point (the equator, where the
+// terminator bulges furthest) to the true circle edge at the same
+// height -- showing the maximum shade thickness at the current phase.
+function drawShadeThicknessLine(ctx, circleX, circleY, r, azimuth, phase) {
+  const localXMid = -phase * r;  // widest point of the terminator (y=0)
+  const localXEdge = -r;         // the FIXED boundary edge -- always the same side, never flips with phase sign
+
+  const midPoint = { x: circleX + localXMid * Math.cos(azimuth), y: circleY + localXMid * Math.sin(azimuth) };
+  const edgePoint = { x: circleX + localXEdge * Math.cos(azimuth), y: circleY + localXEdge * Math.sin(azimuth) };
+
+  ctx.strokeStyle = '#33ff33';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(midPoint.x, midPoint.y);
+  ctx.lineTo(edgePoint.x, edgePoint.y);
+  ctx.stroke();
+  ctx.fillStyle = '#33ff33';
+  [midPoint, edgePoint].forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+// Where does the stroke's rounded cap (a circle of radius = the
+// stroke's own radius, centered at the pole) cross back through the
+// main circle? Standard circle-circle intersection, preferring the
+// point in the direction the stroke sweeps (toward the far side).
+function computeCapIntersection(r, capRadius, poleLocalX, poleLocalY, preferNegX) {
+  const d = (r * r - capRadius * capRadius) / 2;
+  const polTheta = Math.atan2(poleLocalY, poleLocalX);
+  const cosVal = d / (r * r);
+  if (Math.abs(cosVal) > 1) return null; // cap has grown large enough to fully engulf the circle
+  const delta = Math.acos(cosVal);
+  const t1 = polTheta + delta, t2 = polTheta - delta;
+  const p1 = { x: r * Math.cos(t1), y: r * Math.sin(t1) };
+  const p2 = { x: r * Math.cos(t2), y: r * Math.sin(t2) };
+  return preferNegX ? (p1.x < p2.x ? p1 : p2) : (p1.x > p2.x ? p1 : p2);
+}
+
+function drawCapMeetingPoints(ctx, circleX, circleY, r, azimuth, phase) {
+  const thickness = r * (1 - phase);
+  const capRadius = thickness;
+
+  const toWorld = (lx, ly) => ({
+    x: circleX + lx * Math.cos(azimuth) - ly * Math.sin(azimuth),
+    y: circleY + lx * Math.sin(azimuth) + ly * Math.cos(azimuth),
+  });
+
+  // Two poles: start (-PI/2 local) and end (PI/2 local). The stroke
+  // sweeps through the far/negative-x side, so each cap's relevant
+  // intersection is the one on that same side.
+  const pole1Local = { x: 0, y: -r };
+  const pole2Local = { x: 0, y: r };
+
+  const pt1 = computeCapIntersection(r, capRadius, pole1Local.x, pole1Local.y, true);
+  const pt2 = computeCapIntersection(r, capRadius, pole2Local.x, pole2Local.y, true);
+
+  ctx.fillStyle = '#ff3333';
+  [pt1, pt2].forEach(pt => {
+    if (!pt) return;
+    const world = toWorld(pt.x, pt.y);
+    ctx.beginPath();
+    ctx.arc(world.x, world.y, 5, 0, Math.PI * 2);
     ctx.fill();
   });
 }
@@ -346,88 +507,43 @@ function render() {
 
   const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2;
 
-  const shoulder = { x: cx - 220, y: cy - 80 };
-  const elbow    = { x: cx,       y: cy + 120 };
-  const wrist    = { x: cx + 220, y: cy - 40  };
-  const rS = 70, rE = 45, rW = 25;
+  // Single circle -- light orbits through z only, cycling smoothly
+  // through every phase from full to new moon.
+  const circle = { x: cx, y: cy };
+  const r = 120;
 
-  drawLinkFlat(ctx, shoulder, rS, elbow, rE, baseColor);
-  drawLinkFlat(ctx, elbow, rE, wrist, rW, baseColor);
+  ctx.fillStyle = baseColor;
+  ctx.beginPath();
+  ctx.arc(circle.x, circle.y, r, 0, Math.PI * 2);
+  ctx.fill();
 
-  // Yellow reference lines between each linked pair
-  const lengthAngle1 = Math.atan2(elbow.y - shoulder.y, elbow.x - shoulder.x);
-  const lengthAngle2 = Math.atan2(wrist.y - elbow.y, wrist.x - elbow.x);
+  const info = getCircleLightInfo(circle.x, circle.y);
 
-  // Tangent points per circle, computed once and reused for both the
-  // trim bounds and the red markers.
-  const shoulderInfo = getCircleLightInfo(shoulder.x, shoulder.y);
-  const elbowInfo = getCircleLightInfo(elbow.x, elbow.y);
-  const wristInfo = getCircleLightInfo(wrist.x, wrist.y);
+  drawCartoonShadeLine(ctx, circle.x, circle.y, r, info.angle, info.phase, shadeColor);
+  drawEllipseBoundary(ctx, circle.x, circle.y, r, info.angle, info.phase);
+  drawPoleMarkers(ctx, circle.x, circle.y, r, info.angle);
+  drawShadeThicknessLine(ctx, circle.x, circle.y, r, info.angle, info.phase);
+  drawCapMeetingPoints(ctx, circle.x, circle.y, r, info.angle, info.phase);
 
-  // Green common-tangent points computed below
-
-  // Compute the green common-tangent points FIRST -- these now drive
-  // both the circle clip and the tube shade width, replacing the red
-  // marker's single-ellipse tangent point.
-  function findGreenPair(cA, rA, infoA, cB, rB, infoB, lengthAngle) {
-    const { t1Angle, t2Angle } = computeLinkTangents(cA, rA, cB, rB);
-    const perpAngle = lengthAngle + Math.PI / 2;
-    const nearIsT1 = Math.cos(infoA.angle - perpAngle) >= 0;
-    const farAngle = nearIsT1 ? t2Angle : t1Angle;
-    const preferPoint = { x: cA.x + rA * Math.cos(farAngle), y: cA.y + rA * Math.sin(farAngle) };
-    return computeCommonTangentPoints(cA, infoA.angle, infoA.phase, rA, cB, infoB.angle, infoB.phase, rB, preferPoint);
-  }
-  const greenPair1 = findGreenPair(shoulder, rS, shoulderInfo, elbow, rE, elbowInfo, lengthAngle1);
-  const greenPair2 = findGreenPair(elbow, rE, elbowInfo, wrist, rW, wristInfo, lengthAngle2);
-
-  // Trim constraints anchored to where each link actually attaches,
-  // not to the marker's own arbitrary position.
-  // Each circle's shade avoids the half facing toward whichever
-  // link(s) it's connected to -- shoulder/wrist have one, elbow has
-  // both (so its shade gets clipped away from BOTH directions).
-  // Now sliding the cutoff to the GREEN point instead of the red one.
-  function buildConstraint(circle, avoidAngle, tangentPoint) {
-    const offset = tangentPoint ? computeSlideOffset(circle.x, circle.y, avoidAngle, tangentPoint) : 0;
-    return { avoidAngle, offset, originX: circle.x, originY: circle.y };
-  }
-
-  const shoulderConstraint = buildConstraint(shoulder, lengthAngle1, greenPair1 ? greenPair1.pointA : null);
-  const elbowConstraint1 = buildConstraint(elbow, lengthAngle1 + Math.PI, greenPair1 ? greenPair1.pointB : null);
-  const elbowConstraint2 = buildConstraint(elbow, lengthAngle2, greenPair2 ? greenPair2.pointA : null);
-  const wristConstraint = buildConstraint(wrist, lengthAngle2 + Math.PI, greenPair2 ? greenPair2.pointB : null);
-
-  // Tube shade: strip runs parallel to the GREEN LINE itself.
-  function buildTubeShadeFromGreen(c1, r1, c2, r2, azimuth, greenPair, useA) {
-    if (!greenPair) return;
-    const { pointA, pointB } = greenPair;
-    const lineAngle = Math.atan2(pointB.y - pointA.y, pointB.x - pointA.x);
-    const origin = useA ? pointA : pointB;
-    const perpAngleGreen = lineAngle + Math.PI / 2;
-    const farEdgeSign = computeFarEdgeSign(azimuth, lineAngle);
-    drawTubeShade(ctx, c1, r1, c2, r2, origin.x, origin.y, lineAngle, farEdgeSign, shadeColor);
-  }
-
-  buildTubeShadeFromGreen(shoulder, rS, elbow, rE, shoulderInfo.angle, greenPair1, true);
-  buildTubeShadeFromGreen(shoulder, rS, elbow, rE, elbowInfo.angle, greenPair1, false);
-  buildTubeShadeFromGreen(elbow, rE, wrist, rW, elbowInfo.angle, greenPair2, true);
-  buildTubeShadeFromGreen(elbow, rE, wrist, rW, wristInfo.angle, greenPair2, false);
-
-  // Circles redraw their own proper crescent fresh on top, correcting
-  // the tube shade's overreach within just their own disk.
-  drawMoonPhaseCircle(ctx, shoulder.x, shoulder.y, rS, baseColor, shadeColor, [shoulderConstraint]);
-  drawMoonPhaseCircle(ctx, elbow.x, elbow.y, rE, baseColor, shadeColor, [elbowConstraint1, elbowConstraint2]);
-  drawMoonPhaseCircle(ctx, wrist.x, wrist.y, rW, baseColor, shadeColor, [wristConstraint]);
-
-  // Green marker: common tangent pairs computed above
-  if (greenPair1) drawGreenTangentLine(ctx, greenPair1.pointA, greenPair1.pointB);
-  if (greenPair2) drawGreenTangentLine(ctx, greenPair2.pointA, greenPair2.pointB);
-
-  // Light position marker
+  // Light position marker -- sized by z: smallest when far (z very
+  // negative, behind), biggest when close (z very positive, in front)
+  const zMin = -400, zMax = 400, radiusMin = 4, radiusMax = 28;
+  const zClamped = Math.max(zMin, Math.min(zMax, light.z));
+  const markerRadius = radiusMin + (radiusMax - radiusMin) * ((zClamped - zMin) / (zMax - zMin));
   ctx.fillStyle = 'rgba(255, 220, 120, 0.9)';
   ctx.beginPath();
-  ctx.arc(light.x, light.y, 12, 0, Math.PI * 2);
+  ctx.arc(light.x, light.y, markerRadius, 0, Math.PI * 2);
   ctx.fill();
 }
+
+// Light orbits in 3D through the Y-Z plane (x stays fixed, centered
+// on the circle) -- sweeping from directly above, through in-front,
+// through directly below, through behind, and back. This covers every
+// combination of azimuth and phase naturally, like a real orbit,
+// rather than only modulating depth along one fixed line.
+const cx0 = DESIGN_WIDTH / 2, cy0 = DESIGN_HEIGHT / 2;
+const lightOrbitRadius = 400;
+light.x = cx0;
 
 let t = 0;
 let lastTime = 0;
@@ -436,11 +552,9 @@ function loop(timestamp) {
   lastTime = timestamp;
   t += dt;
 
-  const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2;
-  const orbitAngle = t * 0.3;
-  light.x = cx + Math.cos(orbitAngle) * orbitRadius;
-  light.y = cy + Math.sin(orbitAngle) * orbitRadius * 0.6;
-  light.z = Math.sin(t * 0.6) * 400; // closer/further, oscillating again
+  const orbitAngle = t * 0.5;
+  light.y = cy0 + Math.sin(orbitAngle) * lightOrbitRadius;
+  light.z = Math.cos(orbitAngle) * lightOrbitRadius;
 
   render();
   requestAnimationFrame(loop);
