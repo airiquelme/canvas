@@ -1,237 +1,52 @@
+// ---------------------------------------------------------
+// CANVAS SETUP
+// ---------------------------------------------------------
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-
-// ---------------------------------------------------------
-// DESIGN SPACE
-// ---------------------------------------------------------
-const DESIGN_WIDTH = 1000;
-const DESIGN_HEIGHT = 1000;
+const DESIGN_WIDTH = 1000, DESIGN_HEIGHT = 800;
 
 function resizeCanvas() {
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = window.innerWidth * dpr;
-  canvas.height = window.innerHeight * dpr;
-  canvas.style.width = window.innerWidth + 'px';
-  canvas.style.height = window.innerHeight + 'px';
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
 }
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
 function applyDesignSpaceTransform() {
-  const dpr = window.devicePixelRatio || 1;
-  const scaleX = (canvas.width / dpr) / DESIGN_WIDTH;
-  const scaleY = (canvas.height / dpr) / DESIGN_HEIGHT;
-  const scale = Math.min(scaleX, scaleY) * dpr;
-  const offsetX = (canvas.width - DESIGN_WIDTH * scale) / 2;
-  const offsetY = (canvas.height - DESIGN_HEIGHT * scale) / 2;
-  ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
+  const sx = canvas.width / DESIGN_WIDTH;
+  const sy = canvas.height / DESIGN_HEIGHT;
+  const scale = Math.min(sx, sy); // preserve aspect ratio
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.scale(scale, scale);
+  ctx.translate(-DESIGN_WIDTH / 2, -DESIGN_HEIGHT / 2);
 }
 
 // ---------------------------------------------------------
-// LIGHT
+// LIGHT & PHASE
 // ---------------------------------------------------------
 const light = { x: 0, y: 0, z: 0 };
 
-// ---------------------------------------------------------
-// MOON-PHASE CIRCLE SHADING (plain, uncut)
-// ---------------------------------------------------------
 function getCircleLightInfo(circleX, circleY) {
-  const dx = light.x - circleX, dy = light.y - circleY, dz = light.z;
-  const dist = Math.hypot(dx, dy, dz) || 1;
+  const dx = light.x - circleX;
+  const dy = light.y - circleY;
+  const dz = light.z;
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
   const angle = Math.atan2(dy, dx);
-  const phase = Math.max(-1, Math.min(1, dz / dist));
-  return { angle, phase };
-}
-
-function drawMoonPhaseCircle(ctx, circleX, circleY, r, baseColor, shadeColor, avoidConstraints) {
-  const { angle, phase } = getCircleLightInfo(circleX, circleY);
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(circleX, circleY, r, 0, Math.PI * 2);
-  ctx.clip();
-
-  // No base-color repaint here -- the link's own base fill already
-  // covers this circle, and the tube shade may already be drawn on
-  // top of that. Repainting here would erase it; skipping lets the
-  // crescent below simply ADD to what's already there.
-  ctx.translate(circleX, circleY);
-
-  // For each connected link, slide the cutoff to the red tangent
-  // point and remove the sliver beyond it (toward the link).
-  if (avoidConstraints) {
-    for (const { avoidAngle, offset } of avoidConstraints) {
-      ctx.rotate(avoidAngle);
-      ctx.beginPath();
-      ctx.rect(-r * 1.5, -r * 1.5, r * 1.5 + offset, r * 3); // keep local x <= offset
-      ctx.clip();
-      ctx.rotate(-avoidAngle);
-    }
-  }
-
-  ctx.rotate(angle); // local +x now points toward the light
-
-  const ex = Math.abs(phase) * r;
-  ctx.fillStyle = shadeColor;
-  ctx.beginPath();
-  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, true);
-  const termCcw = phase >= 0 ? false : true;
-  ctx.ellipse(0, 0, ex, r, 0, Math.PI / 2, -Math.PI / 2, termCcw);
-  ctx.closePath();
-  ctx.fill();
-
-  ctx.restore();
-}
-
-// Project a point onto the given axis direction, relative to a
-// circle's own center -- how far the cutoff should slide.
-function computeSlideOffset(circleX, circleY, axisAngle, point) {
-  if (!point) return 0;
-  const dx = point.x - circleX, dy = point.y - circleY;
-  return dx * Math.cos(axisAngle) + dy * Math.sin(axisAngle);
+  const phase = dz / dist;
+  return { angle, phase, dist };
 }
 
 // ---------------------------------------------------------
-// NEW RED MARKER: points on circle A's shade ellipse where the
-// tangent line is ALSO tangent to circle B (the actual linked
-// circle, not its own ellipse).
+// DRAWING FUNCTIONS
 // ---------------------------------------------------------
-// Ellipse A local tangent line at theta: A_coef*x + B_coef*y = 1
-//   A_coef = cos(theta)/(kA*rA), B_coef = sin(theta)/rA
-// Distance from circle B's center (in A's local frame) to this line
-// must equal rB:
-//   (A_coef*bx + B_coef*by - 1) = +/- rB * sqrt(A_coef^2+B_coef^2)
-function localOf(cA, azimuthA, worldPoint) {
-  const dx = worldPoint.x - cA.x, dy = worldPoint.y - cA.y;
-  return {
-    x: dx * Math.cos(azimuthA) + dy * Math.sin(azimuthA),
-    y: -dx * Math.sin(azimuthA) + dy * Math.cos(azimuthA),
-  };
-}
+const baseColor = '#4fc3f7';
+const shadeColor = 'rgb(2, 50, 80)';
 
-function ellipseCircleResidual(theta, kA, rA, bx, by, rB, sign) {
-  const Ac = Math.cos(theta) / (kA * rA);
-  const Bc = Math.sin(theta) / rA;
-  const d = Ac * bx + Bc * by - 1;
-  return d - sign * rB * Math.hypot(Ac, Bc);
-}
-
-function findEllipseCircleRoots(kA, rA, bx, by, rB, sign, steps = 240) {
-  const f = (theta) => ellipseCircleResidual(theta, kA, rA, bx, by, rB, sign);
-  let prevTheta = -Math.PI, prevVal = f(prevTheta);
-  const roots = [];
-  for (let i = 1; i <= steps; i++) {
-    const theta = -Math.PI + (2 * Math.PI) * (i / steps);
-    const val = f(theta);
-    if (isFinite(val) && isFinite(prevVal) && Math.sign(val) !== Math.sign(prevVal)) {
-      let lo = prevTheta, hi = theta, flo = prevVal;
-      for (let it = 0; it < 50; it++) {
-        const mid = (lo + hi) / 2, fm = f(mid);
-        if (Math.sign(fm) === Math.sign(flo)) { lo = mid; flo = fm; } else { hi = mid; }
-      }
-      roots.push((lo + hi) / 2);
-    }
-    prevTheta = theta; prevVal = val;
-  }
-  return roots;
-}
-
-function isVisibleTheta(theta, phase) {
-  const c = Math.cos(theta);
-  return phase >= 0 ? c <= 0 : c >= 0;
-}
-
-// Returns array of { pointA, pointB, theta } -- pointA on circle A's
-// ellipse, pointB the actual tangency point on circle B, connected by
-// the same straight tangent line.
-function computeEllipseCircleTangentPoints(cA, azimuthA, phaseA, rA, cB, rB) {
-  const kA = Math.abs(phaseA);
-  if (kA < 1e-6) return [];
-  const local = localOf(cA, azimuthA, cB);
-
-  const results = [];
-  for (const sign of [1, -1]) {
-    const thetas = findEllipseCircleRoots(kA, rA, local.x, local.y, rB, sign);
-    for (const theta of thetas) {
-      if (!isVisibleTheta(theta, phaseA)) continue;
-      const Ac = Math.cos(theta) / (kA * rA), Bc = Math.sin(theta) / rA;
-      const norm = Math.hypot(Ac, Bc);
-
-      // Point on ellipse A (world space)
-      const lxA = kA * rA * Math.cos(theta), lyA = rA * Math.sin(theta);
-      const pointA = {
-        x: cA.x + lxA * Math.cos(azimuthA) - lyA * Math.sin(azimuthA),
-        y: cA.y + lxA * Math.sin(azimuthA) + lyA * Math.cos(azimuthA),
-      };
-
-      // Tangency point on circle B: foot of perpendicular from B's
-      // center (in A's local frame) onto the tangent line, offset by rB
-      const tangXLocal = local.x - sign * rB * (Ac / norm);
-      const tangYLocal = local.y - sign * rB * (Bc / norm);
-      const pointB = {
-        x: cA.x + tangXLocal * Math.cos(azimuthA) - tangYLocal * Math.sin(azimuthA),
-        y: cA.y + tangXLocal * Math.sin(azimuthA) + tangYLocal * Math.cos(azimuthA),
-      };
-
-      results.push({ pointA, pointB, theta });
-    }
-  }
-  return results;
-}
-
-function drawTangentLine(ctx, pointA, pointB) {
-  ctx.strokeStyle = '#ff3333';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(pointA.x, pointA.y);
-  ctx.lineTo(pointB.x, pointB.y);
-  ctx.stroke();
-  ctx.fillStyle = '#ff3333';
-  ctx.beginPath();
-  ctx.arc(pointA.x, pointA.y, 5, 0, Math.PI * 2);
-  ctx.fill();
-}
-
-// A strip running parallel to a given line (here, the chosen red
-// tangent line), from that line out to the far/shaded edge of the
-// tube, so it continues the circle's own cutoff shade seamlessly.
-function drawTubeShade(ctx, c1, r1, c2, r2, originX, originY, lineAngle, farEdgeSign, shadeColor) {
-  ctx.save();
-  traceLinkPath(ctx, c1, r1, c2, r2);
-  ctx.clip();
-
-  ctx.translate(originX, originY);
-  ctx.rotate(lineAngle);
-
-  const BIG = 100000;
-  ctx.fillStyle = shadeColor;
-  const yA = 0, yB = farEdgeSign * BIG;
-  const yStart = Math.min(yA, yB), yEnd = Math.max(yA, yB);
-  ctx.fillRect(-BIG, yStart, BIG * 2, yEnd - yStart);
-
-  ctx.restore();
-}
-
-// Which perpendicular side (relative to lineAngle) is the shaded,
-// far-from-light side.
-function computeFarEdgeSign(azimuth, lineAngle) {
-  const perpAngle = lineAngle + Math.PI / 2;
-  return Math.cos(azimuth - perpAngle) >= 0 ? -1 : 1;
-}
-
-// Draws the FULL ellipse terminator curve (not the fixed rim half) in
-// black, always at its true uncut extent -- regardless of whatever
-// half-plane cutoff is currently clipping the actual shade fill. Lets
-// you track where the boundary "really" is even when trimmed.
 function drawEllipseBoundary(ctx, circleX, circleY, r, azimuth, phase) {
   const ex = Math.abs(phase) * r;
   const termCcw = phase >= 0 ? false : true;
 
   ctx.save();
-  ctx.beginPath();
-  ctx.arc(circleX, circleY, r, 0, Math.PI * 2);
-  ctx.clip();
-
   ctx.translate(circleX, circleY);
   ctx.rotate(azimuth);
 
@@ -244,141 +59,6 @@ function drawEllipseBoundary(ctx, circleX, circleY, r, azimuth, phase) {
   ctx.restore();
 }
 
-// ---------------------------------------------------------
-// COMMON TANGENT TO TWO ELLIPSES (green marker)
-// ---------------------------------------------------------
-// Where would a single straight line be tangent to BOTH circles'
-// (uncut) shade boundaries simultaneously? Solved numerically: scan +
-// bisect for sign changes in a residual, verify each is a true
-// double-tangent (not a branch-switch artifact), then require BOTH
-// points to be on their own circle's VISIBLE side -- this generically
-// leaves exactly one candidate, no unstable tie-break needed.
-function ellipsePointWorld(c, azimuth, k, r, theta) {
-  const lx = k * r * Math.cos(theta), ly = r * Math.sin(theta);
-  return {
-    x: c.x + lx * Math.cos(azimuth) - ly * Math.sin(azimuth),
-    y: c.y + lx * Math.sin(azimuth) + ly * Math.cos(azimuth),
-  };
-}
-function ellipseTangentWorld(azimuth, k, r, theta) {
-  const lx = -k * r * Math.sin(theta), ly = r * Math.cos(theta);
-  return {
-    x: lx * Math.cos(azimuth) - ly * Math.sin(azimuth),
-    y: lx * Math.sin(azimuth) + ly * Math.cos(azimuth),
-  };
-}
-function findThetaForDirection(azimuth, k, dirAngle) {
-  const delta = dirAngle - azimuth;
-  const b1 = Math.atan2(-Math.cos(delta), k * Math.sin(delta));
-  return [b1, b1 + Math.PI];
-}
-function crossVec(a, b) { return a.x * b.y - a.y * b.x; }
-
-function commonTangentResidual(cA, azA, kA, rA, cB, azB, kB, rB, thetaB) {
-  const TB = ellipseTangentWorld(azB, kB, rB, thetaB);
-  const dirAngle = Math.atan2(TB.y, TB.x);
-  const candidates = findThetaForDirection(azA, kA, dirAngle);
-  const PB = ellipsePointWorld(cB, azB, kB, rB, thetaB);
-  let best = Infinity, bestThetaA = null;
-  for (const thetaA of candidates) {
-    const PA = ellipsePointWorld(cA, azA, kA, rA, thetaA);
-    const diff = { x: PB.x - PA.x, y: PB.y - PA.y };
-    const denom = Math.hypot(diff.x, diff.y) * Math.hypot(TB.x, TB.y) || 1;
-    const res = crossVec(diff, TB) / denom;
-    if (Math.abs(res) < Math.abs(best)) { best = res; bestThetaA = thetaA; }
-  }
-  return { residual: best, thetaA: bestThetaA };
-}
-
-function computeCommonTangentPoints(cA, azA, phaseA, rA, cB, azB, phaseB, rB, preferPoint) {
-  const kA = Math.abs(phaseA), kB = Math.abs(phaseB);
-  if (kA < 1e-6 || kB < 1e-6) return null;
-
-  const f = (thetaB) => commonTangentResidual(cA, azA, kA, rA, cB, azB, kB, rB, thetaB).residual;
-
-  const steps = 240;
-  let prevTheta = -Math.PI, prevVal = f(prevTheta);
-  const roots = [];
-  for (let i = 1; i <= steps; i++) {
-    const theta = -Math.PI + (2 * Math.PI) * (i / steps);
-    const val = f(theta);
-    if (isFinite(val) && isFinite(prevVal) && Math.sign(val) !== Math.sign(prevVal) && Math.abs(val) < 50 && Math.abs(prevVal) < 50) {
-      let lo = prevTheta, hi = theta, flo = prevVal;
-      for (let it = 0; it < 50; it++) {
-        const mid = (lo + hi) / 2, fm = f(mid);
-        if (Math.sign(fm) === Math.sign(flo)) { lo = mid; flo = fm; } else { hi = mid; }
-      }
-      roots.push((lo + hi) / 2);
-    }
-    prevTheta = theta; prevVal = val;
-  }
-
-  function isVisible(theta, phase) {
-    const c = Math.cos(theta);
-    return phase >= 0 ? c <= 0 : c >= 0;
-  }
-
-  let best = null, bestScore = Infinity;
-  for (const thetaB of roots) {
-    const { thetaA } = commonTangentResidual(cA, azA, kA, rA, cB, azB, kB, rB, thetaB);
-    const TA = ellipseTangentWorld(azA, kA, rA, thetaA);
-    const PA = ellipsePointWorld(cA, azA, kA, rA, thetaA);
-    const PB = ellipsePointWorld(cB, azB, kB, rB, thetaB);
-    const lineDir = { x: PB.x - PA.x, y: PB.y - PA.y };
-    const tangentACheck = Math.abs(crossVec(TA, lineDir)) / (Math.hypot(TA.x, TA.y) * Math.hypot(lineDir.x, lineDir.y) || 1);
-    if (tangentACheck > 0.01) continue;
-
-    if (!isVisible(thetaA, phaseA) || !isVisible(thetaB, phaseB)) continue;
-
-    const score = Math.hypot(PA.x - preferPoint.x, PA.y - preferPoint.y);
-    if (score < bestScore) { bestScore = score; best = { pointA: PA, pointB: PB }; }
-  }
-  return best;
-}
-
-function drawGreenTangentLine(ctx, pointA, pointB) {
-  ctx.strokeStyle = '#33ff33';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(pointA.x, pointA.y);
-  ctx.lineTo(pointB.x, pointB.y);
-  ctx.stroke();
-  ctx.fillStyle = '#33ff33';
-  [pointA, pointB].forEach(p => {
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
-    ctx.fill();
-  });
-}
-
-// Kurzgesagt-style cartoon shade: a thick rounded-cap stroke running
-// along the circle's rim, from one pole directly to the other (the
-// fixed far half of the circle, away from the light) -- matching the
-// black pole markers exactly, not a phase-proportional sweep.
-function drawCartoonShadeLine(ctx, circleX, circleY, r, azimuth, phase, shadeColor) {
-  const thickness = r * (1 - phase); // same length as the green thickness line: 0 at full moon, 2r at new moon
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(circleX, circleY, r, 0, Math.PI * 2);
-  ctx.clip();
-
-  ctx.translate(circleX, circleY);
-  ctx.rotate(azimuth);
-
-  ctx.strokeStyle = shadeColor;
-  ctx.lineWidth = thickness * 2; // lineWidth is the stroke's diameter; doubling makes its RADIUS match the green line
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, true); // pole to pole, via the far side
-  ctx.stroke();
-
-  ctx.restore();
-}
-
-// The two "pole" points where the terminator meets the true circle
-// rim -- directly: perpendicular to the light direction, at radius r.
-// No ellipse formula needed at all.
 function drawPoleMarkers(ctx, circleX, circleY, r, azimuth) {
   const perpAngle = azimuth + Math.PI / 2;
   const pole1 = { x: circleX + r * Math.cos(perpAngle), y: circleY + r * Math.sin(perpAngle) };
@@ -391,12 +71,99 @@ function drawPoleMarkers(ctx, circleX, circleY, r, azimuth) {
   });
 }
 
-// Green line: from the ellipse's widest point (the equator, where the
-// terminator bulges furthest) to the true circle edge at the same
-// height -- showing the maximum shade thickness at the current phase.
+// Shared per-circle computation: given a circle's outer-rim sweep,
+// find the two red circle centers (anchored at the black qualifying
+// points, tangential direction leaning toward the dark pole).
+function computeRedCenters(c, r, azimuth, phase, sweepStart, sweepEnd) {
+  const angles = computeQualifyingAngles(azimuth, sweepStart, sweepEnd);
+  const capRadius = r * (1 - phase);
+  const darkPole = { x: c.x - r * Math.cos(azimuth), y: c.y - r * Math.sin(azimuth) };
+
+  const centers = angles.map(a => {
+    const anchor = { x: c.x + r * Math.cos(a), y: c.y + r * Math.sin(a) };
+    const rx = (anchor.x - c.x) / r, ry = (anchor.y - c.y) / r;
+    const perp1 = { x: -ry, y: rx };
+    const perp2 = { x: ry, y: -rx };
+    const toDarkX = darkPole.x - anchor.x, toDarkY = darkPole.y - anchor.y;
+    const dot1 = perp1.x * toDarkX + perp1.y * toDarkY;
+    const dot2 = perp2.x * toDarkX + perp2.y * toDarkY;
+    const chosen = dot1 > dot2 ? perp1 : perp2;
+    return { x: anchor.x + chosen.x * capRadius, y: anchor.y + chosen.y * capRadius };
+  });
+
+  return { capRadius, centers };
+}
+
+function drawShadeEllipse(ctx, c1, azimuth1, r1, phase1, c2, azimuth2, r2, phase2, shadeColor) {
+  const { t1Angle, t2Angle } = computeLinkTangents(c1, r1, c2, r2);
+
+  [
+    { c: c1, r: r1, azimuth: azimuth1, phase: phase1, sweepStart: t1Angle, sweepEnd: t2Angle },
+    { c: c2, r: r2, azimuth: azimuth2, phase: phase2, sweepStart: t2Angle, sweepEnd: t1Angle },
+  ].forEach(({ c, r, azimuth, phase, sweepStart, sweepEnd }) => {
+    const angles = computeQualifyingAngles(azimuth, sweepStart, sweepEnd);
+    const capRadius = r * (1 - phase);
+    const darkPole = { x: c.x - r * Math.cos(azimuth), y: c.y - r * Math.sin(azimuth) };
+
+    const anchors = angles.map(a => ({ x: c.x + r * Math.cos(a), y: c.y + r * Math.sin(a) }));
+    const radials = anchors.map(anchor => ({ x: (anchor.x - c.x) / r, y: (anchor.y - c.y) / r }));
+    const reds = anchors.map((anchor, i) => {
+      const rx = radials[i].x, ry = radials[i].y;
+      const perp1 = { x: -ry, y: rx }, perp2 = { x: ry, y: -rx };
+      const toDarkX = darkPole.x - anchor.x, toDarkY = darkPole.y - anchor.y;
+      const dot1 = perp1.x * toDarkX + perp1.y * toDarkY, dot2 = perp2.x * toDarkX + perp2.y * toDarkY;
+      const chosen = dot1 > dot2 ? perp1 : perp2;
+      return { x: anchor.x + chosen.x * capRadius, y: anchor.y + chosen.y * capRadius };
+    });
+    const [red1, red2] = reds;
+    const [radial1, radial2] = radials;
+
+    // The circular arc through red1 and red2, tangent at each to that
+    // same terminator/seam point's own tangent direction: its center
+    // is where the two radial lines (through each red center, in that
+    // point's own radial direction) intersect.
+    const denom = radial1.x * radial2.y - radial1.y * radial2.x;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.strokeStyle = shadeColor;
+    ctx.lineWidth = capRadius * 2;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+
+    if (Math.abs(denom) < 1e-9) {
+      // Degenerate (parallel radials) -- fall back to a straight line
+      ctx.moveTo(red1.x, red1.y);
+      ctx.lineTo(red2.x, red2.y);
+    } else {
+      const t = ((red2.x - red1.x) * radial2.y - (red2.y - red1.y) * radial2.x) / denom;
+      const arcCenter = { x: red1.x + t * radial1.x, y: red1.y + t * radial1.y };
+      const arcR = Math.hypot(arcCenter.x - red1.x, arcCenter.y - red1.y);
+      const startAngle = Math.atan2(red1.y - arcCenter.y, red1.x - arcCenter.x);
+      const endAngle = Math.atan2(red2.y - arcCenter.y, red2.x - arcCenter.x);
+
+      // Test both real canvas sweeps (properly accounting for angle
+      // wraparound) and pick whichever bulges outward, away from c.
+      function sweepMidDist(ccwTest) {
+        let s = startAngle, e = endAngle;
+        if (!ccwTest) { while (e < s) e += Math.PI * 2; } else { while (e > s) e -= Math.PI * 2; }
+        const mid = (s + e) / 2;
+        const pt = { x: arcCenter.x + arcR * Math.cos(mid), y: arcCenter.y + arcR * Math.sin(mid) };
+        return Math.hypot(pt.x - c.x, pt.y - c.y);
+      }
+      const ccw = sweepMidDist(true) > sweepMidDist(false);
+      ctx.arc(arcCenter.x, arcCenter.y, arcR, startAngle, endAngle, ccw);
+    }
+
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
 function drawShadeThicknessLine(ctx, circleX, circleY, r, azimuth, phase) {
-  const localXMid = -phase * r;  // widest point of the terminator (y=0)
-  const localXEdge = -r;         // the FIXED boundary edge -- always the same side, never flips with phase sign
+  const localXMid = -phase * r;
+  const localXEdge = -r;
 
   const midPoint = { x: circleX + localXMid * Math.cos(azimuth), y: circleY + localXMid * Math.sin(azimuth) };
   const edgePoint = { x: circleX + localXEdge * Math.cos(azimuth), y: circleY + localXEdge * Math.sin(azimuth) };
@@ -415,20 +182,16 @@ function drawShadeThicknessLine(ctx, circleX, circleY, r, azimuth, phase) {
   });
 }
 
-// Where does the stroke's rounded cap (a circle of radius = the
-// stroke's own radius, centered at the pole) cross back through the
-// main circle? Standard circle-circle intersection, preferring the
-// point in the direction the stroke sweeps (toward the far side).
-function computeCapIntersection(r, capRadius, poleLocalX, poleLocalY, preferNegX) {
+function computeCapIntersection(r, capRadius, poleLocalX, poleLocalY, preferPosX) {
   const d = (r * r - capRadius * capRadius) / 2;
   const polTheta = Math.atan2(poleLocalY, poleLocalX);
   const cosVal = d / (r * r);
-  if (Math.abs(cosVal) > 1) return null; // cap has grown large enough to fully engulf the circle
+  if (Math.abs(cosVal) > 1) return null;
   const delta = Math.acos(cosVal);
   const t1 = polTheta + delta, t2 = polTheta - delta;
   const p1 = { x: r * Math.cos(t1), y: r * Math.sin(t1) };
   const p2 = { x: r * Math.cos(t2), y: r * Math.sin(t2) };
-  return preferNegX ? (p1.x < p2.x ? p1 : p2) : (p1.x > p2.x ? p1 : p2);
+  return preferPosX ? (p1.x > p2.x ? p1 : p2) : (p1.x < p2.x ? p1 : p2);
 }
 
 function drawCapMeetingPoints(ctx, circleX, circleY, r, azimuth, phase) {
@@ -440,9 +203,6 @@ function drawCapMeetingPoints(ctx, circleX, circleY, r, azimuth, phase) {
     y: circleY + lx * Math.sin(azimuth) + ly * Math.cos(azimuth),
   });
 
-  // Two poles: start (-PI/2 local) and end (PI/2 local). The stroke
-  // sweeps through the far/negative-x side, so each cap's relevant
-  // intersection is the one on that same side.
   const pole1Local = { x: 0, y: -r };
   const pole2Local = { x: 0, y: r };
 
@@ -459,32 +219,55 @@ function drawCapMeetingPoints(ctx, circleX, circleY, r, azimuth, phase) {
   });
 }
 
+function drawPoleCaps(ctx, c1, azimuth1, r1, phase1, c2, azimuth2, r2, phase2) {
+  const { t1Angle, t2Angle } = computeLinkTangents(c1, r1, c2, r2);
+
+  [
+    { c: c1, r: r1, azimuth: azimuth1, phase: phase1, sweepStart: t1Angle, sweepEnd: t2Angle },
+    { c: c2, r: r2, azimuth: azimuth2, phase: phase2, sweepStart: t2Angle, sweepEnd: t1Angle },
+  ].forEach(({ c, r, azimuth, phase, sweepStart, sweepEnd }) => {
+    const { capRadius, centers } = computeRedCenters(c, r, azimuth, phase, sweepStart, sweepEnd);
+    centers.forEach(redCenter => {
+      ctx.strokeStyle = '#ff3333';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(redCenter.x, redCenter.y, capRadius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = '#ff3333';
+      ctx.beginPath();
+      ctx.arc(redCenter.x, redCenter.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+}
+
 // ---------------------------------------------------------
 // SHAPES: two-circle tangent link (flat, no shading of its own)
 // ---------------------------------------------------------
 function computeLinkTangents(c1, r1, c2, r2) {
   const dx = c2.x - c1.x, dy = c2.y - c1.y;
-  const d = Math.hypot(dx, dy);
+  const d = Math.sqrt(dx * dx + dy * dy);
   const centerAngle = Math.atan2(dy, dx);
   const alpha = Math.asin((r1 - r2) / d);
-  const t1Angle = centerAngle + Math.PI / 2 + alpha;
-  const t2Angle = centerAngle - Math.PI / 2 - alpha;
-  const point = (c, r, a) => ({ x: c.x + r * Math.cos(a), y: c.y + r * Math.sin(a) });
-  return {
-    p1a: point(c1, r1, t1Angle), p2a: point(c2, r2, t1Angle),
-    p1b: point(c1, r1, t2Angle), p2b: point(c2, r2, t2Angle),
-    t1Angle, t2Angle,
-  };
+  const t1Angle = centerAngle + Math.PI / 2 - alpha;
+  const t2Angle = centerAngle - Math.PI / 2 + alpha;
+  return { t1Angle, t2Angle };
 }
 
 function traceLinkPath(ctx, c1, r1, c2, r2) {
-  const { p1a, p2a, p1b, t1Angle, t2Angle } = computeLinkTangents(c1, r1, c2, r2);
+  const { t1Angle, t2Angle } = computeLinkTangents(c1, r1, c2, r2);
+  const p1a = { x: c1.x + r1 * Math.cos(t1Angle), y: c1.y + r1 * Math.sin(t1Angle) };
+  const p1b = { x: c2.x + r2 * Math.cos(t1Angle), y: c2.y + r2 * Math.sin(t1Angle) };
+  const p2a = { x: c2.x + r2 * Math.cos(t2Angle), y: c2.y + r2 * Math.sin(t2Angle) };
+  const p2b = { x: c1.x + r1 * Math.cos(t2Angle), y: c1.y + r1 * Math.sin(t2Angle) };
+
   ctx.beginPath();
   ctx.moveTo(p1a.x, p1a.y);
-  ctx.lineTo(p2a.x, p2a.y);
-  ctx.arc(c2.x, c2.y, r2, t1Angle, t2Angle, true);
   ctx.lineTo(p1b.x, p1b.y);
-  ctx.arc(c1.x, c1.y, r1, t2Angle, t1Angle, true);
+  ctx.arc(c2.x, c2.y, r2, t1Angle, t2Angle, false);
+  ctx.lineTo(p2b.x, p2b.y);
+  ctx.arc(c1.x, c1.y, r1, t2Angle, t1Angle, false);
   ctx.closePath();
 }
 
@@ -494,12 +277,90 @@ function drawLinkFlat(ctx, c1, r1, c2, r2, baseColor) {
   ctx.fill();
 }
 
-// ---------------------------------------------------------
-// RENDER
-// ---------------------------------------------------------
-const baseColor = '#4fc3f7';
-const shadeColor = 'rgb(2, 50, 80)';
+function drawTubeTangentPoints(ctx, c1, r1, c2, r2) {
+  const { t1Angle, t2Angle } = computeLinkTangents(c1, r1, c2, r2);
+  const points = [
+    { x: c1.x + r1 * Math.cos(t1Angle), y: c1.y + r1 * Math.sin(t1Angle) },
+    { x: c1.x + r1 * Math.cos(t2Angle), y: c1.y + r1 * Math.sin(t2Angle) },
+    { x: c2.x + r2 * Math.cos(t1Angle), y: c2.y + r2 * Math.sin(t1Angle) },
+    { x: c2.x + r2 * Math.cos(t2Angle), y: c2.y + r2 * Math.sin(t2Angle) },
+  ];
+  ctx.fillStyle = '#ffee33';
+  points.forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
 
+function angDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+// Pure computation: given a circle's outer-rim sweep [sweepStart,
+// sweepEnd] and its azimuth, returns the two angles where the outer
+// rim intersects the dark rim -- via direct interval intersection,
+// no per-point branching, no wraparound ambiguity.
+function computeQualifyingAngles(azimuth, sweepStart, sweepEnd) {
+  let outerStart = sweepStart;
+  let outerEnd = sweepEnd;
+  while (outerEnd < outerStart) outerEnd += Math.PI * 2;
+
+  // Dark-rim interval: cos(theta-azimuth)<=0 holds for
+  // theta in [azimuth+PI/2, azimuth+3*PI/2].
+  let darkStart = azimuth + Math.PI / 2;
+  let darkEnd = azimuth + Math.PI * 1.5;
+  const shift = Math.round((outerStart - darkStart) / (Math.PI * 2)) * Math.PI * 2;
+  darkStart += shift;
+  darkEnd += shift;
+
+  for (const offset of [0, Math.PI * 2, -Math.PI * 2]) {
+    const ds = darkStart + offset, de = darkEnd + offset;
+    const start = Math.max(outerStart, ds);
+    const end = Math.min(outerEnd, de);
+    if (start <= end) return [start, end];
+  }
+  // Fallback: right at the boundary where a terminator point and a
+  // seam point coincide, floating-point noise can make the interval
+  // intersection above flicker between a tiny valid window and none
+  // at all. Falling back to the seam points themselves is not just a
+  // band-aid -- at exactly that boundary they ARE the same point, so
+  // this is the mathematically correct answer, and it's always defined.
+  return [outerStart, outerEnd];
+}
+
+// Black dots, derived directly via interval intersection instead of
+// testing discrete candidate points each frame (which flickers near
+// angle wraparound boundaries).
+//
+// c1's exposed/outer arc sweeps t1Angle -> t2Angle (through the far
+// side, away from c2); c2's sweeps the other way, t2Angle -> t1Angle
+// (matching traceLinkPath's actual geometry).
+function drawQualifyingPoints(ctx, c1, azimuth1, r1, c2, azimuth2, r2) {
+  const { t1Angle, t2Angle } = computeLinkTangents(c1, r1, c2, r2);
+
+  [
+    { c: c1, r: r1, azimuth: azimuth1, sweepStart: t1Angle, sweepEnd: t2Angle },
+    { c: c2, r: r2, azimuth: azimuth2, sweepStart: t2Angle, sweepEnd: t1Angle },
+  ].forEach(({ c, r, azimuth, sweepStart, sweepEnd }) => {
+    const angles = computeQualifyingAngles(azimuth, sweepStart, sweepEnd);
+    if (!angles) return;
+    ctx.fillStyle = '#000000';
+    angles.forEach(a => {
+      const x = c.x + r * Math.cos(a), y = c.y + r * Math.sin(a);
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+}
+
+// ---------------------------------------------------------
+// RENDER LOOP
+// ---------------------------------------------------------
 function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -507,26 +368,30 @@ function render() {
 
   const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2;
 
-  // Single circle -- light orbits through z only, cycling smoothly
-  // through every phase from full to new moon.
-  const circle = { x: cx, y: cy };
-  const r = 120;
+  const top = { x: cx, y: cy - 150 };
+  const bottom = { x: cx, y: cy + 150 };
+  const rTop = 90, rBottom = 60;
 
-  ctx.fillStyle = baseColor;
-  ctx.beginPath();
-  ctx.arc(circle.x, circle.y, r, 0, Math.PI * 2);
-  ctx.fill();
+  drawLinkFlat(ctx, top, rTop, bottom, rBottom, baseColor);
 
-  const info = getCircleLightInfo(circle.x, circle.y);
+  [{ c: top, r: rTop }, { c: bottom, r: rBottom }].forEach(({ c, r }) => {
+    ctx.fillStyle = baseColor;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    ctx.fill();
 
-  drawCartoonShadeLine(ctx, circle.x, circle.y, r, info.angle, info.phase, shadeColor);
-  drawEllipseBoundary(ctx, circle.x, circle.y, r, info.angle, info.phase);
-  drawPoleMarkers(ctx, circle.x, circle.y, r, info.angle);
-  drawShadeThicknessLine(ctx, circle.x, circle.y, r, info.angle, info.phase);
-  drawCapMeetingPoints(ctx, circle.x, circle.y, r, info.angle, info.phase);
+    const info = getCircleLightInfo(c.x, c.y);
+    drawEllipseBoundary(ctx, c.x, c.y, r, info.angle, info.phase);
+    drawShadeThicknessLine(ctx, c.x, c.y, r, info.angle, info.phase);
+  });
 
-  // Light position marker -- sized by z: smallest when far (z very
-  // negative, behind), biggest when close (z very positive, in front)
+  const topInfo = getCircleLightInfo(top.x, top.y);
+  const bottomInfo = getCircleLightInfo(bottom.x, bottom.y);
+  drawShadeEllipse(ctx, top, topInfo.angle, rTop, topInfo.phase, bottom, bottomInfo.angle, rBottom, bottomInfo.phase, shadeColor);
+  drawQualifyingPoints(ctx, top, topInfo.angle, rTop, bottom, bottomInfo.angle, rBottom);
+  drawPoleCaps(ctx, top, topInfo.angle, rTop, topInfo.phase, bottom, bottomInfo.angle, rBottom, bottomInfo.phase);
+
+  // Light position marker
   const zMin = -400, zMax = 400, radiusMin = 4, radiusMax = 28;
   const zClamped = Math.max(zMin, Math.min(zMax, light.z));
   const markerRadius = radiusMin + (radiusMax - radiusMin) * ((zClamped - zMin) / (zMax - zMin));
@@ -536,27 +401,39 @@ function render() {
   ctx.fill();
 }
 
-// Light orbits in 3D through the Y-Z plane (x stays fixed, centered
-// on the circle) -- sweeping from directly above, through in-front,
-// through directly below, through behind, and back. This covers every
-// combination of azimuth and phase naturally, like a real orbit,
-// rather than only modulating depth along one fixed line.
+// Light orbits azimuthally around the shape in the X/Y plane, while Z
+// also oscillates independently -- full 3D movement. Marker size still
+// tracks Z (smallest far away, biggest up close).
 const cx0 = DESIGN_WIDTH / 2, cy0 = DESIGN_HEIGHT / 2;
-const lightOrbitRadius = 400;
-light.x = cx0;
+const orbitRadius = 400;
+const zAmplitude = 400;
 
 let t = 0;
 let lastTime = 0;
+let paused = false;
+
+const pauseBtn = document.getElementById('pauseBtn');
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+  if (!paused) lastTime = performance.now(); // avoid a big dt jump on resume
+});
+
 function loop(timestamp) {
-  const dt = (timestamp - lastTime) / 1000;
-  lastTime = timestamp;
-  t += dt;
+  if (!paused) {
+    const dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    t += dt;
 
-  const orbitAngle = t * 0.5;
-  light.y = cy0 + Math.sin(orbitAngle) * lightOrbitRadius;
-  light.z = Math.cos(orbitAngle) * lightOrbitRadius;
+    const orbitAngle = t * 0.4;
+    light.x = cx0 + Math.cos(orbitAngle) * orbitRadius;
+    light.y = cy0 + Math.sin(orbitAngle) * orbitRadius;
+    light.z = Math.sin(t * 0.7) * zAmplitude;
 
-  render();
+    render();
+  } else {
+    lastTime = timestamp;
+  }
   requestAnimationFrame(loop);
 }
 
