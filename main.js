@@ -57,9 +57,9 @@ function createNode(center, radius) {
 
 const meshes = {};
 let nextMeshId = 1;
-function createMesh(nodeIds, color, z = 0) {
+function createMesh(nodeIds, color) {
   const id = nextMeshId++;
-  meshes[id] = { id, nodeIds, color, z };
+  meshes[id] = { id, nodeIds, color };
   return id;
 }
 
@@ -124,47 +124,61 @@ function computePairTangents(c1, r1, c2, r2) {
   return { t1Angle: centerAngle + Math.PI / 2 - alpha, t2Angle: centerAngle - Math.PI / 2 + alpha };
 }
 
-function drawPairCapsule(ctx, c1, r1, c2, r2, color) {
+function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 = false) {
   const { t1Angle, t2Angle } = computePairTangents(c1, r1, c2, r2);
   const p1a = { x: c1.x + r1 * Math.cos(t1Angle), y: c1.y + r1 * Math.sin(t1Angle) };
   const p1b = { x: c2.x + r2 * Math.cos(t1Angle), y: c2.y + r2 * Math.sin(t1Angle) };
+  const p2a = { x: c2.x + r2 * Math.cos(t2Angle), y: c2.y + r2 * Math.sin(t2Angle) };
   const p2b = { x: c1.x + r1 * Math.cos(t2Angle), y: c1.y + r1 * Math.sin(t2Angle) };
 
   ctx.beginPath();
   ctx.moveTo(p1a.x, p1a.y);
   ctx.lineTo(p1b.x, p1b.y);
-  ctx.arc(c2.x, c2.y, r2, t1Angle, t2Angle, true);
+  if (!skipCap2) {
+    ctx.arc(c2.x, c2.y, r2, t1Angle, t2Angle, true);
+  } else {
+    ctx.lineTo(p2a.x, p2a.y);
+  }
   ctx.lineTo(p2b.x, p2b.y);
-  ctx.arc(c1.x, c1.y, r1, t2Angle, t1Angle, true);
+  if (!skipCap1) {
+    ctx.arc(c1.x, c1.y, r1, t2Angle, t1Angle, true);
+  } else {
+    ctx.lineTo(p1a.x, p1a.y);
+  }
   ctx.closePath();
   ctx.fillStyle = color;
   ctx.fill();
 }
 
-function drawMeshFlat(ctx, meshNodes, color) {
-  traceMeshPath(ctx, meshNodes);
-  ctx.fillStyle = color;
-  ctx.fill();
+function drawMeshFlat(ctx, meshNodes, color, sharedNodeIds = new Set()) {
+  ctx.save();
 
-  // Circles at each corner (hull node), radius equal to that node's
-  // own radius -- simple overlay for now, no tangent-arc rounding yet.
+  // HULL FILL TEMPORARILY DISABLED -- verifying circles + capsules alone cover the shape
+  // traceMeshPath(ctx, meshNodes);
+  // ctx.fillStyle = color;
+  // ctx.fill();
+
+  // Hull circles -- skip shared nodes entirely, never attempt to render them.
   const hull = meshNodes.length === 1 ? [0] : convexHullIndices(meshNodes.map(n => n.center));
   hull.forEach(idx => {
     const node = meshNodes[idx];
+    if (sharedNodeIds.has(node.id)) return;
     ctx.beginPath();
     ctx.arc(node.center.x, node.center.y, node.radius, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
   });
 
-  // Wasteful for now, but simple: connect EVERY node to every other
-  // node with a tangent capsule, not just hull-adjacent ones. Their
-  // union covers the shape without needing precise hull-tangent math.
+  // Pair capsules -- skip the end-cap arc at any shared-node end.
   for (let i = 0; i < meshNodes.length; i++) {
     for (let j = i + 1; j < meshNodes.length; j++) {
-      drawPairCapsule(ctx, meshNodes[i].center, meshNodes[i].radius, meshNodes[j].center, meshNodes[j].radius, color);
+      const skip1 = sharedNodeIds.has(meshNodes[i].id);
+      const skip2 = sharedNodeIds.has(meshNodes[j].id);
+      drawPairCapsule(ctx, meshNodes[i].center, meshNodes[i].radius, meshNodes[j].center, meshNodes[j].radius, color, skip1, skip2);
     }
   }
+
+  ctx.restore();
 }
 
 // ---------------------------------------------------------
@@ -237,45 +251,299 @@ function projectNode(node, camPos, basis) {
   const camSpace = worldToCamera(node.center, camPos, basis);
   const screenCenterOfDesign = { x: DESIGN_WIDTH / 2, y: DESIGN_HEIGHT / 2 };
   const proj = projectToScreen(camSpace, camera.fov, camera.orbitRadius, screenCenterOfDesign);
-  return { id: node.id, center: { x: proj.x, y: proj.y }, radius: node.radius * proj.scale };
+  // depth = camera-space z (distance along the viewing direction),
+  // carried along so rendering priority can use it without a second
+  // world-to-camera pass.
+  return { id: node.id, center: { x: proj.x, y: proj.y }, radius: node.radius * proj.scale, depth: camSpace.z };
+}
+
+// ---------------------------------------------------------
+// SHARED-NODE JOINT SPLIT (moon-phase division)
+// ---------------------------------------------------------
+// A node shared by exactly two meshes renders as a circle split
+// between the two meshes' colors, "phases of the moon" style. The
+// split is derived from real 3D geometry:
+//  - Each mesh's "approach direction" at the node = from the node
+//    toward the centroid of the mesh's OTHER nodes (in camera space).
+//    Convexity guarantees the centroid is interior, so this is always
+//    a meaningful "toward that mesh's body" direction.
+//  - The joint axis (difference of the two approach directions) gives
+//    the terminator's screen azimuth from its projected part, and the
+//    phase from its component along the viewing direction -- same
+//    role the light direction played in classic moon-phase shading.
+// Meaning: if the joint were a real sphere between two 3D tubes, the
+// tube leaning toward the camera would genuinely wrap more of it.
+
+function centroidOfOtherNodes(mesh, sharedNodeId) {
+  const others = mesh.nodeIds.filter(id => id !== sharedNodeId);
+  if (others.length === 0) return null;
+  const sum = others.reduce((acc, id) => {
+    const c = nodes[id].center;
+    return { x: acc.x + c.x, y: acc.y + c.y, z: acc.z + c.z };
+  }, { x: 0, y: 0, z: 0 });
+  return { x: sum.x / others.length, y: sum.y / others.length, z: sum.z / others.length };
+}
+
+// Draws the split circle: colorA fills the side facing meshA, colorB
+// the side facing meshB, divided by the terminator ellipse.
+function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, colorA, colorB, separatorColor) {
+  const r = screenRadius;
+  const ex = Math.abs(phase) * r;
+  const termCcw = phase >= 0;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(screenCenter.x, screenCenter.y, r, 0, Math.PI * 2);
+  ctx.clip();
+
+  ctx.translate(screenCenter.x, screenCenter.y);
+  ctx.rotate(azimuth);
+
+  // A's region: the -x half, bounded by the terminator ellipse.
+  ctx.fillStyle = colorA;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
+  ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
+  ctx.closePath();
+  ctx.fill();
+
+  // B's region: the +x half, bounded by the terminator ellipse.
+  ctx.fillStyle = colorB;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
+  ctx.ellipse(0, 0, ex, r, 0, Math.PI / 2, -Math.PI / 2, termCcw);
+  ctx.closePath();
+  ctx.fill();
+
+  // Separator stroke along the terminator ellipse -- minimum thickness
+  // to cover the sub-pixel gap between the two filled halves. Color
+  // is always the lower-id mesh's color, stable across all frames.
+  ctx.strokeStyle = separatorColor;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
+  ctx.stroke();
+
+  // Rim strokes: one per half in each mesh's own color, covering
+  // the antialiased white edge at the circle's outer boundary.
+  ctx.strokeStyle = colorA;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
+  ctx.stroke();
+
+  ctx.strokeStyle = colorB;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
+  ctx.stroke();
+
+  ctx.restore();
 }
 
 function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   applyDesignSpaceTransform();
 
   const camPos = getCameraPosition();
   const basis = computeViewBasis(camPos, camera.target);
 
-  // Painter's algorithm: draw back-to-front by z. Lower z = farther
-  // away (drawn first, ends up behind); higher z = closer (drawn
-  // last, ends up in front). This is still an independent, manually
-  // assigned priority for now, separate from true camera depth.
-  const sortedMeshes = Object.values(meshes).slice().sort((a, b) => a.z - b.z);
+  // Build ownership map for shared nodes
+  const owners = {};
+  Object.values(meshes).forEach(mesh => {
+    mesh.nodeIds.forEach(id => { (owners[id] ||= []).push(mesh.id); });
+  });
+  const sharedNodeIds = new Set(Object.keys(owners).filter(id => owners[id].length >= 2).map(Number));
 
-  sortedMeshes.forEach(mesh => {
-    const meshNodes = mesh.nodeIds.map(id => projectNode(nodes[id], camPos, basis));
-    drawMeshFlat(ctx, meshNodes, mesh.color);
+  // Project all nodes once
+  const projectedNodes = {};
+  Object.values(nodes).forEach(node => {
+    projectedNodes[node.id] = projectNode(node, camPos, basis);
+  });
+
+  // Build a flat list of primitives, each with its own depth key.
+  // - circle: depth = node's own depth
+  // - capsule: depth = max of its two endpoints' depths
+  // Shared nodes are skipped here and rendered separately after.
+  const primitives = [];
+
+  Object.values(meshes).forEach(mesh => {
+    const pNodes = mesh.nodeIds.map(id => projectedNodes[id]);
+
+    // Node circles (skip shared nodes)
+    const hull = pNodes.length === 1 ? [0] : convexHullIndices(pNodes.map(n => n.center));
+    hull.forEach(idx => {
+      const pn = pNodes[idx];
+      if (sharedNodeIds.has(pn.id)) return;
+      const color = mesh.color;
+      primitives.push({
+        depth: pn.depth,
+        ownerMeshId: mesh.id,
+        draw: () => {
+          ctx.beginPath();
+          ctx.arc(pn.center.x, pn.center.y, pn.radius, 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+        }
+      });
+    });
+
+    // Pair capsules (skip end caps at shared nodes)
+    for (let i = 0; i < pNodes.length; i++) {
+      for (let j = i + 1; j < pNodes.length; j++) {
+        const a = pNodes[i], b = pNodes[j];
+        const depth = Math.max(a.depth, b.depth);
+        const skip1 = sharedNodeIds.has(a.id);
+        const skip2 = sharedNodeIds.has(b.id);
+        const color = mesh.color;
+        primitives.push({
+          depth,
+          ownerMeshId: mesh.id,
+          draw: () => drawPairCapsule(ctx, a.center, a.radius, b.center, b.radius, color, skip1, skip2)
+        });
+      }
+    }
+  });
+
+  // Shared nodes: inserted into the primitives list at the right depth
+  // so non-owner meshes that are nearer to the camera still draw over
+  // them correctly. Depth key = min depth among all owner primitives
+  // (i.e. just after the frontmost owner, but before nearer non-owners).
+  Object.keys(owners).forEach(nodeIdStr => {
+    if (owners[nodeIdStr].length < 2) return;
+    const nodeId = Number(nodeIdStr);
+    const p = projectedNodes[nodeId];
+    const ownerIds = owners[nodeId];
+
+    // The shared node's depth key is simply its own projected depth,
+    // so it sorts naturally among all other primitives. A small tie-
+    // break offset ensures it draws just after (on top of) any owner
+    // primitive at the exact same depth.
+    const sharedDepth = p.depth - 0.001;
+
+    if (ownerIds.length !== 2) {
+      primitives.push({
+        depth: sharedDepth,
+        draw: () => {
+          ctx.beginPath();
+          ctx.arc(p.center.x, p.center.y, p.radius, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+        }
+      });
+      return;
+    }
+
+    const meshA = meshes[ownerIds[0]], meshB = meshes[ownerIds[1]];
+    const centroidA = centroidOfOtherNodes(meshA, nodeId);
+    const centroidB = centroidOfOtherNodes(meshB, nodeId);
+    if (!centroidA || !centroidB) return;
+
+    const nodeCam = worldToCamera(nodes[nodeId].center, camPos, basis);
+    const dA = vecNormalize(vecSub(worldToCamera(centroidA, camPos, basis), nodeCam));
+    const dB = vecNormalize(vecSub(worldToCamera(centroidB, camPos, basis), nodeCam));
+    const axis = { x: dB.x - dA.x, y: dB.y - dA.y, z: dB.z - dA.z };
+    const axisLen = Math.hypot(axis.x, axis.y, axis.z);
+    if (axisLen < 1e-9) return;
+
+    const axisN = { x: axis.x / axisLen, y: axis.y / axisLen, z: axis.z / axisLen };
+    const azimuth = Math.atan2(-axisN.y, axisN.x);
+    const phase = axisN.z;
+    const separatorColor = meshA.id < meshB.id ? meshA.color : meshB.color;
+    const center = p.center, radius = p.radius;
+    primitives.push({
+      depth: sharedDepth,
+      draw: () => drawJointSplitCircle(ctx, center, radius, azimuth, phase, meshA.color, meshB.color, separatorColor)
+    });
+  });
+
+  // Sort all primitives back-to-front and draw
+  primitives.sort((a, b) => b.depth - a.depth);
+  primitives.forEach(p => p.draw());
+
+  // Black outlines on every node, drawn last so they're always on top.
+  ctx.strokeStyle = '#000000';
+  ctx.lineWidth = 2;
+  Object.values(nodes).forEach(node => {
+    const p = projectedNodes[node.id];
+    ctx.beginPath();
+    ctx.arc(p.center.x, p.center.y, p.radius, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+
+  // Red dots at intersections between pivot lines of different meshes
+  // sharing the same pivot. For each pivot, for each pair of meshes
+  // (A, B), for each other node in A and each other node in B, find
+  // where the t1/t2 edge of A's capsule meets the t2/t1 edge of B's
+  // capsule at the pivot.
+  function tangentLineAtPivot(pivotCenter, pivotRadius, angle) {
+    const pt = { x: pivotCenter.x + pivotRadius * Math.cos(angle), y: pivotCenter.y + pivotRadius * Math.sin(angle) };
+    const dir = { x: -Math.sin(angle), y: Math.cos(angle) };
+    return { pt, dir };
+  }
+  function lineIntersect2D(p1, d1, p2, d2) {
+    const denom = d1.x * d2.y - d1.y * d2.x;
+    if (Math.abs(denom) < 1e-9) return null;
+    const t = ((p2.x - p1.x) * d2.y - (p2.y - p1.y) * d2.x) / denom;
+    return { x: p1.x + t * d1.x, y: p1.y + t * d1.y };
+  }
+
+  Object.keys(owners).forEach(nodeIdStr => {
+    if (owners[nodeIdStr].length < 2) return;
+    const pivotId = Number(nodeIdStr);
+    const pivotProj = projectedNodes[pivotId];
+    const ownerIds = owners[pivotId];
+
+    // For each pair of owner meshes
+    for (let mi = 0; mi < ownerIds.length; mi++) {
+      for (let mj = mi + 1; mj < ownerIds.length; mj++) {
+        const meshA = meshes[ownerIds[mi]], meshB = meshes[ownerIds[mj]];
+
+        // Other nodes in each mesh connected to the pivot
+        const othersA = meshA.nodeIds.filter(id => id !== pivotId);
+        const othersB = meshB.nodeIds.filter(id => id !== pivotId);
+
+        othersA.forEach(idA => {
+          const pA = projectedNodes[idA];
+          const tanA = computePairTangents(pivotProj.center, pivotProj.radius, pA.center, pA.radius);
+
+          othersB.forEach(idB => {
+            const pB = projectedNodes[idB];
+            const tanB = computePairTangents(pivotProj.center, pivotProj.radius, pB.center, pB.radius);
+
+            // The two near intersections: t1(A)×t2(B) and t2(A)×t1(B)
+            [
+              [tanA.t1Angle, tanB.t2Angle],
+              [tanA.t2Angle, tanB.t1Angle],
+            ].forEach(([angleA, angleB]) => {
+              const lineA = tangentLineAtPivot(pivotProj.center, pivotProj.radius, angleA);
+              const lineB = tangentLineAtPivot(pivotProj.center, pivotProj.radius, angleB);
+              const pt = lineIntersect2D(lineA.pt, lineA.dir, lineB.pt, lineB.dir);
+              if (!pt) return;
+              ctx.fillStyle = '#ff0000';
+              ctx.beginPath();
+              ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+              ctx.fill();
+            });
+          });
+        });
+      }
+    }
   });
 }
 
 // ---------------------------------------------------------
 // EXAMPLE SCENE
 // ---------------------------------------------------------
-// Quadrant 1 (top-left): a node shared between TWO meshes -- a
-// "shoulder" node that's part of both a torso mesh and an arm mesh.
-// Nothing special has to happen for the sharing to work: a Node is
-// just an id that any number of Meshes can reference. The arm is
-// given a higher z so it renders IN FRONT of the torso, demonstrating
-// z-based rendering priority where the two meshes visibly overlap.
+// Quadrant 1 (top-left): the MINIMAL shared-node case -- two 2-node
+// meshes (two "lines") sharing the middle node, forming an elbow.
+// The simplest possible configuration for verifying the joint split.
 const q1x = DESIGN_WIDTH * 0.25, q1y = DESIGN_HEIGHT * 0.25;
-const shoulder = createNode({ x: q1x, y: q1y - 20 }, 35);
-const torsoTop = createNode({ x: q1x - 60, y: q1y - 90 }, 30);
-const torsoBottom = createNode({ x: q1x - 20, y: q1y + 90 }, 45);
-createMesh([shoulder, torsoTop, torsoBottom], '#4fc3f7', 0); // torso, z=0 (behind)
-const elbow = createNode({ x: q1x + 40, y: q1y + 70 }, 20); // repositioned to overlap the torso
-createMesh([shoulder, elbow], '#ff8a65', 1); // arm, z=1 (in front)
+const jointNode = createNode({ x: q1x, y: q1y }, 35);
+const blueEnd = createNode({ x: q1x - 110, y: q1y - 80 }, 30);
+createMesh([blueEnd, jointNode], '#4fc3f7'); // blue line
+const orangeEnd = createNode({ x: q1x + 110, y: q1y + 80, z: 40 }, 25);
+createMesh([jointNode, orangeEnd], '#ff8a65'); // orange line
 
 // Quadrant 2 (top-right): a 3-node triangle, order deliberately scrambled
 const q2x = DESIGN_WIDTH * 0.75, q2y = DESIGN_HEIGHT * 0.25;
@@ -294,6 +562,10 @@ const c3n = createNode({ x: q3x, y: q3y + 120 }, 45);
 const c4n = createNode({ x: q3x, y: q3y - 20 }, 20); // enclosed
 createMesh([c1n, c2n, c3n, c4n], '#a5d6a7');
 
+// A purple 2-node mesh sharing c2n with the green blob above
+const purpleEnd = createNode({ x: q3x + 280, y: q3y - 80 }, 30);
+createMesh([c2n, purpleEnd], '#ce93d8');
+
 // Quadrant 4 (bottom-right): 6 nodes in an irregular, free-form
 // arrangement -- a bigger, more organic-looking blob. Two nodes are
 // given non-zero z to demonstrate perspective scaling: d2 sits closer
@@ -308,19 +580,41 @@ const d5 = createNode({ x: q4x + 30, y: q4y + 140, z: -200 }, 35);
 const d6 = createNode({ x: q4x - 110, y: q4y + 90 }, 25);
 createMesh([d1, d2, d3, d4, d5, d6], '#ce93d8');
 
+// A new green mesh sharing d1 with the purple mesh above -- tests
+// how a node with multiple edges within one mesh handles sharing.
+// d1 is the purple node closest to the orange blob (top-left).
+const e1 = createNode({ x: q4x - 260, y: q4y + 60 }, 30);
+const e2 = createNode({ x: q4x - 200, y: q4y + 180 }, 25);
+createMesh([d1, e1, e2], '#a5d6a7');
+
 // ---------------------------------------------------------
 // ANIMATION LOOP: orbit the camera around the center, always looking
 // at it, to verify meshes stay round/billboard-like (no pancaking)
 // as the viewing angle changes.
 // ---------------------------------------------------------
+// White background
+canvas.style.background = '#ffffff';
+
+let paused = false;
+const pauseBtn = document.getElementById('pauseBtn');
+if (pauseBtn) {
+  pauseBtn.addEventListener('click', () => {
+    paused = !paused;
+    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    if (!paused) lastTime = performance.now();
+  });
+}
+
 let lastTime = 0;
 function loop(timestamp) {
-  const dt = (timestamp - lastTime) / 1000;
-  lastTime = timestamp;
-
-  camera.orbitAngle += dt * 0.4;
-
-  render();
+  if (!paused) {
+    const dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    camera.orbitAngle += dt * 0.4;
+    render();
+  } else {
+    lastTime = timestamp;
+  }
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
