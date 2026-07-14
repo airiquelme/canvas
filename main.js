@@ -124,6 +124,8 @@ function computePairTangents(c1, r1, c2, r2) {
   return { t1Angle: centerAngle + Math.PI / 2 - alpha, t2Angle: centerAngle - Math.PI / 2 + alpha };
 }
 
+
+
 function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 = false) {
   const { t1Angle, t2Angle } = computePairTangents(c1, r1, c2, r2);
   const p1a = { x: c1.x + r1 * Math.cos(t1Angle), y: c1.y + r1 * Math.sin(t1Angle) };
@@ -148,6 +150,35 @@ function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 
   ctx.closePath();
   ctx.fillStyle = color;
   ctx.fill();
+}
+
+// Helper: find the closest point on a circle to a given point
+function closestPointOnCircle(center, radius, point) {
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1e-9) {
+    // Point is at center, just return a point on the circle
+    return { x: center.x + radius, y: center.y };
+  }
+  const angle = Math.atan2(dy, dx);
+  return { x: center.x + radius * Math.cos(angle), y: center.y + radius * Math.sin(angle) };
+}
+
+// Helper: Draw a triangle with three vertices and a thin stroke
+function drawTriangle(ctx, p1, p2, p3, color) {
+  ctx.beginPath();
+  ctx.moveTo(p1.x, p1.y);
+  ctx.lineTo(p2.x, p2.y);
+  ctx.lineTo(p3.x, p3.y);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  
+  // Thin stroke to cover antialiasing gaps
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.stroke();
 }
 
 function drawMeshFlat(ctx, meshNodes, color, sharedNodeIds = new Set()) {
@@ -340,6 +371,22 @@ function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, c
 }
 
 function render() {
+  function edgeSegment(pivotProj, otherProj, angle) {
+    return {
+      a: { x: pivotProj.center.x + pivotProj.radius * Math.cos(angle), y: pivotProj.center.y + pivotProj.radius * Math.sin(angle) },
+      b: { x: otherProj.center.x + otherProj.radius * Math.cos(angle), y: otherProj.center.y + otherProj.radius * Math.sin(angle) },
+    };
+  }
+  function segmentIntersect(s1, s2) {
+    const d1 = { x: s1.b.x - s1.a.x, y: s1.b.y - s1.a.y };
+    const d2 = { x: s2.b.x - s2.a.x, y: s2.b.y - s2.a.y };
+    const denom = d1.x * d2.y - d1.y * d2.x;
+    if (Math.abs(denom) < 1e-9) return null;
+    const t = ((s2.a.x - s1.a.x) * d2.y - (s2.a.y - s1.a.y) * d2.x) / denom;
+    const u = ((s2.a.x - s1.a.x) * d1.y - (s2.a.y - s1.a.y) * d1.x) / denom;
+    if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+    return { x: s1.a.x + t * d1.x, y: s1.a.y + t * d1.y };
+  }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -396,10 +443,92 @@ function render() {
         const skip1 = sharedNodeIds.has(a.id);
         const skip2 = sharedNodeIds.has(b.id);
         const color = mesh.color;
+
+        // Precompute all red lines for this capsule's pivot ends
+        const redLines = [];
+        [{ isPivot: skip1, pivotNode: a, otherNode: b, pivotIsA: true },
+         { isPivot: skip2, pivotNode: b, otherNode: a, pivotIsA: false }].forEach(({ isPivot, pivotNode, otherNode, pivotIsA }) => {
+          if (!isPivot) return;
+          const tanA = computePairTangents(pivotNode.center, pivotNode.radius, otherNode.center, otherNode.radius);
+          (owners[pivotNode.id] || []).forEach(otherMeshId => {
+            if (otherMeshId === mesh.id) return;
+            meshes[otherMeshId].nodeIds.filter(id => id !== pivotNode.id).forEach(otherId => {
+              const pB = projectedNodes[otherId];
+              const tanB = computePairTangents(pivotNode.center, pivotNode.radius, pB.center, pB.radius);
+              const pt =
+                segmentIntersect(edgeSegment(pivotNode, otherNode, tanA.t1Angle), edgeSegment(pivotNode, pB, tanB.t2Angle)) ||
+                segmentIntersect(edgeSegment(pivotNode, otherNode, tanA.t2Angle), edgeSegment(pivotNode, pB, tanB.t1Angle));
+              if (!pt) return;
+              const rimAngle = Math.atan2(pt.y - pivotNode.center.y, pt.x - pivotNode.center.x);
+              const rim = { x: pivotNode.center.x + pivotNode.radius * Math.cos(rimAngle), y: pivotNode.center.y + pivotNode.radius * Math.sin(rimAngle) };
+              const onT1 = !!segmentIntersect(edgeSegment(pivotNode, otherNode, tanA.t1Angle), edgeSegment(pivotNode, pB, tanB.t2Angle));
+              const tangentAngle = onT1 ? tanA.t1Angle : tanA.t2Angle;
+              const tangentRim = { x: pivotNode.center.x + pivotNode.radius * Math.cos(tangentAngle), y: pivotNode.center.y + pivotNode.radius * Math.sin(tangentAngle) };
+              redLines.push({ pt, rim, tangentRim, onT1, pivotIsA });
+            });
+          });
+        });
+
+        // Find the longest red line at build time
+        let longestPt = null, longestRim = null, longestOnT1 = null, longestPivotIsA = null, longestDist = -1;
+        redLines.forEach(({ pt, rim, onT1, pivotIsA }) => {
+          const dist = Math.hypot(rim.x - pt.x, rim.y - pt.y);
+          if (dist > longestDist) { longestDist = dist; longestPt = pt; longestRim = rim; longestOnT1 = onT1; longestPivotIsA = pivotIsA; }
+        });
+
+        // Compute fill triangle from centroid to this capsule
+        // We need the world-space centroid of the mesh
+        const meshCentroid = mesh.nodeIds.reduce(
+          (acc, id) => {
+            const c = nodes[id].center;
+            return { x: acc.x + c.x, y: acc.y + c.y, z: acc.z + c.z };
+          },
+          { x: 0, y: 0, z: 0 }
+        );
+        meshCentroid.x /= mesh.nodeIds.length;
+        meshCentroid.y /= mesh.nodeIds.length;
+        meshCentroid.z /= mesh.nodeIds.length;
+
+        // Project centroid to screen space
+        const centroidCam = worldToCamera(meshCentroid, camPos, basis);
+        const screenCenterOfDesign = { x: DESIGN_WIDTH / 2, y: DESIGN_HEIGHT / 2 };
+        const centroidProj = projectToScreen(centroidCam, camera.fov, camera.orbitRadius, screenCenterOfDesign);
+        const screenCentroid = { x: centroidProj.x, y: centroidProj.y };
+
         primitives.push({
           depth,
           ownerMeshId: mesh.id,
-          draw: () => drawPairCapsule(ctx, a.center, a.radius, b.center, b.radius, color, skip1, skip2)
+          draw: () => {
+            // Draw fill triangle from centroid to closest points on each node circle
+            const p2 = closestPointOnCircle(a.center, a.radius, screenCentroid);
+            const p3 = closestPointOnCircle(b.center, b.radius, screenCentroid);
+            drawTriangle(ctx, screenCentroid, p2, p3, color);
+            
+            // Draw capsule outline on top
+            drawPairCapsule(ctx, a.center, a.radius, b.center, b.radius, color, skip1, skip2);
+            // DEBUG -- red lines, dotted lines, dot (temporarily disabled)
+            // redLines.forEach(({ pt, rim, tangentRim }) => {
+            //   ctx.strokeStyle = '#ff0000';
+            //   ctx.lineWidth = 2;
+            //   ctx.setLineDash([]);
+            //   ctx.beginPath();
+            //   ctx.moveTo(pt.x, pt.y);
+            //   ctx.lineTo(rim.x, rim.y);
+            //   ctx.stroke();
+            //   ctx.setLineDash([6, 4]);
+            //   ctx.beginPath();
+            //   ctx.moveTo(pt.x, pt.y);
+            //   ctx.lineTo(tangentRim.x, tangentRim.y);
+            //   ctx.stroke();
+            //   ctx.setLineDash([]);
+            // });
+            if (longestPt) {
+              ctx.fillStyle = '#ff0000';
+              ctx.beginPath();
+              ctx.arc(longestPt.x, longestPt.y, 5, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
         });
       }
     }
@@ -461,88 +590,28 @@ function render() {
   primitives.sort((a, b) => b.depth - a.depth);
   primitives.forEach(p => p.draw());
 
-  // Black outlines on every node, drawn last so they're always on top.
-  ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 2;
-  Object.values(nodes).forEach(node => {
-    const p = projectedNodes[node.id];
-    ctx.beginPath();
-    ctx.arc(p.center.x, p.center.y, p.radius, 0, Math.PI * 2);
-    ctx.stroke();
-  });
-
-  // Red dots at intersections between pivot lines of different meshes
-  // sharing the same pivot. For each pivot, for each pair of meshes
-  // (A, B), for each other node in A and each other node in B, find
-  // where the t1/t2 edge of A's capsule meets the t2/t1 edge of B's
-  // capsule at the pivot.
-  function tangentLineAtPivot(pivotCenter, pivotRadius, angle) {
-    const pt = { x: pivotCenter.x + pivotRadius * Math.cos(angle), y: pivotCenter.y + pivotRadius * Math.sin(angle) };
-    const dir = { x: -Math.sin(angle), y: Math.cos(angle) };
-    return { pt, dir };
-  }
-  function lineIntersect2D(p1, d1, p2, d2) {
-    const denom = d1.x * d2.y - d1.y * d2.x;
-    if (Math.abs(denom) < 1e-9) return null;
-    const t = ((p2.x - p1.x) * d2.y - (p2.y - p1.y) * d2.x) / denom;
-    return { x: p1.x + t * d1.x, y: p1.y + t * d1.y };
-  }
-
-  Object.keys(owners).forEach(nodeIdStr => {
-    if (owners[nodeIdStr].length < 2) return;
-    const pivotId = Number(nodeIdStr);
-    const pivotProj = projectedNodes[pivotId];
-    const ownerIds = owners[pivotId];
-
-    // For each pair of owner meshes
-    for (let mi = 0; mi < ownerIds.length; mi++) {
-      for (let mj = mi + 1; mj < ownerIds.length; mj++) {
-        const meshA = meshes[ownerIds[mi]], meshB = meshes[ownerIds[mj]];
-
-        // Other nodes in each mesh connected to the pivot
-        const othersA = meshA.nodeIds.filter(id => id !== pivotId);
-        const othersB = meshB.nodeIds.filter(id => id !== pivotId);
-
-        othersA.forEach(idA => {
-          const pA = projectedNodes[idA];
-          const tanA = computePairTangents(pivotProj.center, pivotProj.radius, pA.center, pA.radius);
-
-          othersB.forEach(idB => {
-            const pB = projectedNodes[idB];
-            const tanB = computePairTangents(pivotProj.center, pivotProj.radius, pB.center, pB.radius);
-
-            // The two near intersections: t1(A)×t2(B) and t2(A)×t1(B)
-            [
-              [tanA.t1Angle, tanB.t2Angle],
-              [tanA.t2Angle, tanB.t1Angle],
-            ].forEach(([angleA, angleB]) => {
-              const lineA = tangentLineAtPivot(pivotProj.center, pivotProj.radius, angleA);
-              const lineB = tangentLineAtPivot(pivotProj.center, pivotProj.radius, angleB);
-              const pt = lineIntersect2D(lineA.pt, lineA.dir, lineB.pt, lineB.dir);
-              if (!pt) return;
-              ctx.fillStyle = '#ff0000';
-              ctx.beginPath();
-              ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
-              ctx.fill();
-            });
-          });
-        });
-      }
-    }
-  });
+  // DEBUG -- Black outlines (temporarily disabled)
+  // ctx.strokeStyle = '#000000';
+  // ctx.lineWidth = 2;
+  // Object.values(nodes).forEach(node => {
+  //   const p = projectedNodes[node.id];
+  //   ctx.beginPath();
+  //   ctx.arc(p.center.x, p.center.y, p.radius, 0, Math.PI * 2);
+  //   ctx.stroke();
+  // });
 }
 
 // ---------------------------------------------------------
 // EXAMPLE SCENE
 // ---------------------------------------------------------
 // Quadrant 1 (top-left): the MINIMAL shared-node case -- two 2-node
-// meshes (two "lines") sharing the middle node, forming an elbow.
+// meshes (two "lines") sharing the middle node, forming a V shape.
 // The simplest possible configuration for verifying the joint split.
 const q1x = DESIGN_WIDTH * 0.25, q1y = DESIGN_HEIGHT * 0.25;
 const jointNode = createNode({ x: q1x, y: q1y }, 35);
-const blueEnd = createNode({ x: q1x - 110, y: q1y - 80 }, 30);
+const blueEnd = createNode({ x: q1x - 110, y: q1y - 100 }, 30);
 createMesh([blueEnd, jointNode], '#4fc3f7'); // blue line
-const orangeEnd = createNode({ x: q1x + 110, y: q1y + 80, z: 40 }, 25);
+const orangeEnd = createNode({ x: q1x + 110, y: q1y - 100, z: 40 }, 25);
 createMesh([jointNode, orangeEnd], '#ff8a65'); // orange line
 
 // Quadrant 2 (top-right): a 3-node triangle, order deliberately scrambled
