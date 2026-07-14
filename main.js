@@ -124,8 +124,6 @@ function computePairTangents(c1, r1, c2, r2) {
   return { t1Angle: centerAngle + Math.PI / 2 - alpha, t2Angle: centerAngle - Math.PI / 2 + alpha };
 }
 
-
-
 function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 = false) {
   const { t1Angle, t2Angle } = computePairTangents(c1, r1, c2, r2);
   const p1a = { x: c1.x + r1 * Math.cos(t1Angle), y: c1.y + r1 * Math.sin(t1Angle) };
@@ -150,6 +148,101 @@ function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 
   ctx.closePath();
   ctx.fillStyle = color;
   ctx.fill();
+}
+
+// Helper: Find tangent point on ellipse from external point, pick the one on visible arc
+function findEllipseTangentPoint(ellipseCenter, radiusX, radiusY, ellipseRotation, phase, externalPoint) {
+  // Transform external point to ellipse's local coordinate system
+  const dx = externalPoint.x - ellipseCenter.x;
+  const dy = externalPoint.y - ellipseCenter.y;
+  const cos_rot = Math.cos(-ellipseRotation);
+  const sin_rot = Math.sin(-ellipseRotation);
+  const localX = dx * cos_rot - dy * sin_rot;
+  const localY = dx * sin_rot + dy * cos_rot;
+
+  // Find tangent points by searching around the ellipse
+  const candidates = [];
+  
+  for (let t = 0; t < Math.PI * 2; t += 0.02) {
+    const cos_t = Math.cos(t);
+    const sin_t = Math.sin(t);
+    
+    // Point on ellipse
+    const px = radiusX * cos_t;
+    const py = radiusY * sin_t;
+    
+    // Vector from ellipse point to external point
+    const vx = localX - px;
+    const vy = localY - py;
+    
+    // Normal to ellipse at this point
+    const nx = cos_t / (radiusX * radiusX);
+    const ny = sin_t / (radiusY * radiusY);
+    
+    // For tangency: dot product should be ~0
+    const dot = vx * nx + vy * ny;
+    candidates.push({ t, dot, px, py });
+  }
+  
+  // Find local minima of |dot| to get tangent points
+  let tangents = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const prev = candidates[(i - 1 + candidates.length) % candidates.length];
+    const curr = candidates[i];
+    const next = candidates[(i + 1) % candidates.length];
+    
+    if (Math.abs(curr.dot) < Math.abs(prev.dot) && Math.abs(curr.dot) < Math.abs(next.dot)) {
+      tangents.push(curr);
+    }
+  }
+  
+  // Determine visible arc based on phase
+  // termCcw = phase >= 0 (same logic as drawJointSplitCircle)
+  // If phase >= 0: visible arc is drawn as [-π/2, π/2] counterclockwise (normal)
+  // If phase < 0: visible arc is drawn as [-π/2, π/2] clockwise (flipped)
+  const visibleTangents = tangents.filter(t => {
+    let angle = t.t;
+    while (angle > Math.PI) angle -= Math.PI * 2;
+    while (angle < -Math.PI) angle += Math.PI * 2;
+    
+    if (phase >= 0) {
+      // Normal: visible arc is [-π/2, π/2]
+      return angle >= -Math.PI / 2 && angle <= Math.PI / 2;
+    } else {
+      // Flipped: visible arc is the other half [π/2, 3π/2] or [-π/2, -3π/2]
+      return angle <= -Math.PI / 2 || angle >= Math.PI / 2;
+    }
+  });
+  
+  // Pick the tangent closest to angle 0 (center of visible arc)
+  const bestTangent = visibleTangents.length > 0 
+    ? visibleTangents.reduce((best, curr) => {
+        let currAngle = curr.t % (Math.PI * 2);
+        if (currAngle > Math.PI) currAngle -= Math.PI * 2;
+        if (currAngle < -Math.PI) currAngle += Math.PI * 2;
+        
+        let bestAngle = best.t % (Math.PI * 2);
+        if (bestAngle > Math.PI) bestAngle -= Math.PI * 2;
+        if (bestAngle < -Math.PI) bestAngle += Math.PI * 2;
+        
+        // For flipped phase, measure distance from π instead of 0
+        const currDist = phase >= 0 ? Math.abs(currAngle) : Math.abs(Math.abs(currAngle) - Math.PI);
+        const bestDist = phase >= 0 ? Math.abs(bestAngle) : Math.abs(Math.abs(bestAngle) - Math.PI);
+        
+        return currDist < bestDist ? curr : best;
+      })
+    : tangents[0];
+  
+  // Convert to screen space
+  if (bestTangent) {
+    const cos_rot_back = Math.cos(ellipseRotation);
+    const sin_rot_back = Math.sin(ellipseRotation);
+    const screenX = ellipseCenter.x + (bestTangent.px * cos_rot_back - bestTangent.py * sin_rot_back);
+    const screenY = ellipseCenter.y + (bestTangent.px * sin_rot_back + bestTangent.py * cos_rot_back);
+    return { x: screenX, y: screenY };
+  }
+  
+  return null;
 }
 
 // Helper: find the closest point on a circle to a given point
@@ -179,37 +272,6 @@ function drawTriangle(ctx, p1, p2, p3, color) {
   ctx.strokeStyle = color;
   ctx.lineWidth = 1;
   ctx.stroke();
-}
-
-function drawMeshFlat(ctx, meshNodes, color, sharedNodeIds = new Set()) {
-  ctx.save();
-
-  // HULL FILL TEMPORARILY DISABLED -- verifying circles + capsules alone cover the shape
-  // traceMeshPath(ctx, meshNodes);
-  // ctx.fillStyle = color;
-  // ctx.fill();
-
-  // Hull circles -- skip shared nodes entirely, never attempt to render them.
-  const hull = meshNodes.length === 1 ? [0] : convexHullIndices(meshNodes.map(n => n.center));
-  hull.forEach(idx => {
-    const node = meshNodes[idx];
-    if (sharedNodeIds.has(node.id)) return;
-    ctx.beginPath();
-    ctx.arc(node.center.x, node.center.y, node.radius, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-  });
-
-  // Pair capsules -- skip the end-cap arc at any shared-node end.
-  for (let i = 0; i < meshNodes.length; i++) {
-    for (let j = i + 1; j < meshNodes.length; j++) {
-      const skip1 = sharedNodeIds.has(meshNodes[i].id);
-      const skip2 = sharedNodeIds.has(meshNodes[j].id);
-      drawPairCapsule(ctx, meshNodes[i].center, meshNodes[i].radius, meshNodes[j].center, meshNodes[j].radius, color, skip1, skip2);
-    }
-  }
-
-  ctx.restore();
 }
 
 // ---------------------------------------------------------
@@ -291,19 +353,6 @@ function projectNode(node, camPos, basis) {
 // ---------------------------------------------------------
 // SHARED-NODE JOINT SPLIT (moon-phase division)
 // ---------------------------------------------------------
-// A node shared by exactly two meshes renders as a circle split
-// between the two meshes' colors, "phases of the moon" style. The
-// split is derived from real 3D geometry:
-//  - Each mesh's "approach direction" at the node = from the node
-//    toward the centroid of the mesh's OTHER nodes (in camera space).
-//    Convexity guarantees the centroid is interior, so this is always
-//    a meaningful "toward that mesh's body" direction.
-//  - The joint axis (difference of the two approach directions) gives
-//    the terminator's screen azimuth from its projected part, and the
-//    phase from its component along the viewing direction -- same
-//    role the light direction played in classic moon-phase shading.
-// Meaning: if the joint were a real sphere between two 3D tubes, the
-// tube leaning toward the camera would genuinely wrap more of it.
 
 function centroidOfOtherNodes(mesh, sharedNodeId) {
   const others = mesh.nodeIds.filter(id => id !== sharedNodeId);
@@ -401,6 +450,16 @@ function render() {
     mesh.nodeIds.forEach(id => { (owners[id] ||= []).push(mesh.id); });
   });
   const sharedNodeIds = new Set(Object.keys(owners).filter(id => owners[id].length >= 2).map(Number));
+  
+  // Build a set of moon phase nodes (ANY owner is 2-node mesh)
+  const moonPhaseNodeIds = new Set();
+  Object.keys(owners).forEach(nodeIdStr => {
+    const nodeId = Number(nodeIdStr);
+    const ownerIds = owners[nodeId];
+    if (ownerIds.length >= 2 && ownerIds.some(meshId => meshes[meshId].nodeIds.length === 2)) {
+      moonPhaseNodeIds.add(nodeId);
+    }
+  });
 
   // Project all nodes once
   const projectedNodes = {};
@@ -408,34 +467,57 @@ function render() {
     projectedNodes[node.id] = projectNode(node, camPos, basis);
   });
 
+  // Build a map to store moon phase node rendering data for red line drawing
+  const moonPhaseNodeData = {};
+
+  Object.keys(owners).forEach(nodeIdStr => {
+    if (owners[nodeIdStr].length < 2) return;
+    const nodeId = Number(nodeIdStr);
+    const ownerIds = owners[nodeId];
+
+    // Check if ANY owner is a 2-node mesh
+    const hasAny2NodeOwner = ownerIds.some(meshId => meshes[meshId].nodeIds.length === 2);
+
+    // Only process moon phase if at least one owner is 2-node
+    if (!hasAny2NodeOwner) return;
+
+    // At least one 2-node owner - calculate moon phase data
+    if (ownerIds.length !== 2) return;  // Moon phase only works with 2 owners
+
+    const p = projectedNodes[nodeId];
+    const meshA = meshes[ownerIds[0]], meshB = meshes[ownerIds[1]];
+    const centroidA = centroidOfOtherNodes(meshA, nodeId);
+    const centroidB = centroidOfOtherNodes(meshB, nodeId);
+    if (!centroidA || !centroidB) return;
+
+    const nodeCam = worldToCamera(nodes[nodeId].center, camPos, basis);
+    const dA = vecNormalize(vecSub(worldToCamera(centroidA, camPos, basis), nodeCam));
+    const dB = vecNormalize(vecSub(worldToCamera(centroidB, camPos, basis), nodeCam));
+    const axis = { x: dB.x - dA.x, y: dB.y - dA.y, z: dB.z - dA.z };
+    const axisLen = Math.hypot(axis.x, axis.y, axis.z);
+    if (axisLen < 1e-9) return;
+
+    const axisN = { x: axis.x / axisLen, y: axis.y / axisLen, z: axis.z / axisLen };
+    const azimuth = Math.atan2(-axisN.y, axisN.x);
+    const phase = axisN.z;
+    
+    // Store moon phase data for this node
+    moonPhaseNodeData[nodeId] = {
+      center: p.center,
+      radius: p.radius,
+      azimuth: azimuth,
+      phase: phase
+    };
+  });
+
   // Build a flat list of primitives, each with its own depth key.
-  // - circle: depth = node's own depth
-  // - capsule: depth = max of its two endpoints' depths
-  // Shared nodes are skipped here and rendered separately after.
+  // Node circles now render with their pairs for proper depth sorting.
   const primitives = [];
 
   Object.values(meshes).forEach(mesh => {
     const pNodes = mesh.nodeIds.map(id => projectedNodes[id]);
 
-    // Node circles (skip shared nodes)
-    const hull = pNodes.length === 1 ? [0] : convexHullIndices(pNodes.map(n => n.center));
-    hull.forEach(idx => {
-      const pn = pNodes[idx];
-      if (sharedNodeIds.has(pn.id)) return;
-      const color = mesh.color;
-      primitives.push({
-        depth: pn.depth,
-        ownerMeshId: mesh.id,
-        draw: () => {
-          ctx.beginPath();
-          ctx.arc(pn.center.x, pn.center.y, pn.radius, 0, Math.PI * 2);
-          ctx.fillStyle = color;
-          ctx.fill();
-        }
-      });
-    });
-
-    // Pair capsules (skip end caps at shared nodes)
+    // Pair capsules and node circles
     for (let i = 0; i < pNodes.length; i++) {
       for (let j = i + 1; j < pNodes.length; j++) {
         const a = pNodes[i], b = pNodes[j];
@@ -475,9 +557,11 @@ function render() {
           const dist = Math.hypot(rim.x - pt.x, rim.y - pt.y);
           if (dist > longestDist) { longestDist = dist; longestPt = pt; longestRim = rim; longestOnT1 = onT1; longestPivotIsA = pivotIsA; }
         });
+        
+        // Determine which pivot node the longest red line belongs to
+        const longestPivotNodeId = longestPivotIsA ? a.id : b.id;
 
         // Compute fill triangle from centroid to this capsule
-        // We need the world-space centroid of the mesh
         const meshCentroid = mesh.nodeIds.reduce(
           (acc, id) => {
             const c = nodes[id].center;
@@ -506,23 +590,55 @@ function render() {
             
             // Draw capsule outline on top
             drawPairCapsule(ctx, a.center, a.radius, b.center, b.radius, color, skip1, skip2);
-            // DEBUG -- red lines, dotted lines, dot (temporarily disabled)
-            // redLines.forEach(({ pt, rim, tangentRim }) => {
-            //   ctx.strokeStyle = '#ff0000';
-            //   ctx.lineWidth = 2;
-            //   ctx.setLineDash([]);
-            //   ctx.beginPath();
-            //   ctx.moveTo(pt.x, pt.y);
-            //   ctx.lineTo(rim.x, rim.y);
-            //   ctx.stroke();
-            //   ctx.setLineDash([6, 4]);
-            //   ctx.beginPath();
-            //   ctx.moveTo(pt.x, pt.y);
-            //   ctx.lineTo(tangentRim.x, tangentRim.y);
-            //   ctx.stroke();
-            //   ctx.setLineDash([]);
-            // });
-            if (longestPt) {
+            
+            // Draw the two node circles for this pair (unless they're moon phase nodes)
+            if (!moonPhaseNodeIds.has(a.id)) {
+              ctx.beginPath();
+              ctx.arc(a.center.x, a.center.y, a.radius, 0, Math.PI * 2);
+              ctx.fillStyle = color;
+              ctx.fill();
+            }
+            if (!moonPhaseNodeIds.has(b.id)) {
+              ctx.beginPath();
+              ctx.arc(b.center.x, b.center.y, b.radius, 0, Math.PI * 2);
+              ctx.fillStyle = color;
+              ctx.fill();
+            }
+            
+            // DEBUG -- red dot and tangent line to visible terminator (only on moon phase pivot nodes)
+            if (longestPt && moonPhaseNodeIds.has(longestPivotNodeId)) {
+              let ellipseData = moonPhaseNodeData[longestPivotNodeId];
+              
+              // Fallback: if data isn't populated, use the projected node directly
+              if (!ellipseData) {
+                const p = projectedNodes[longestPivotNodeId];
+                ellipseData = {
+                  center: p.center,
+                  radius: p.radius,
+                  azimuth: 0,
+                  phase: 0
+                };
+              }
+              
+              if (ellipseData) {
+                // Find tangent point on the visible terminator ellipse
+                const r = ellipseData.radius;
+                const ex = Math.abs(ellipseData.phase) * r;
+                const tangentPoint = findEllipseTangentPoint(ellipseData.center, ex, r, ellipseData.azimuth, ellipseData.phase, longestPt);
+                
+                if (tangentPoint) {
+                  // Draw red line from longest point to tangent point
+                  ctx.strokeStyle = '#ff0000';
+                  ctx.lineWidth = 1.5;
+                  ctx.setLineDash([]);
+                  ctx.beginPath();
+                  ctx.moveTo(longestPt.x, longestPt.y);
+                  ctx.lineTo(tangentPoint.x, tangentPoint.y);
+                  ctx.stroke();
+                }
+              }
+              
+              // Draw red dot at longest point
               ctx.fillStyle = '#ff0000';
               ctx.beginPath();
               ctx.arc(longestPt.x, longestPt.y, 5, 0, Math.PI * 2);
@@ -534,61 +650,47 @@ function render() {
     }
   });
 
-  // Shared nodes: inserted into the primitives list at the right depth
-  // so non-owner meshes that are nearer to the camera still draw over
-  // them correctly. Depth key = min depth among all owner primitives
-  // (i.e. just after the frontmost owner, but before nearer non-owners).
-  Object.keys(owners).forEach(nodeIdStr => {
-    if (owners[nodeIdStr].length < 2) return;
+  // Render moon phase nodes (2-node + any other mesh)
+  Object.keys(moonPhaseNodeData).forEach(nodeIdStr => {
     const nodeId = Number(nodeIdStr);
-    const p = projectedNodes[nodeId];
     const ownerIds = owners[nodeId];
-
-    // The shared node's depth key is simply its own projected depth,
-    // so it sorts naturally among all other primitives. A small tie-
-    // break offset ensures it draws just after (on top of) any owner
-    // primitive at the exact same depth.
+    
+    const p = projectedNodes[nodeId];
     const sharedDepth = p.depth - 0.001;
-
-    if (ownerIds.length !== 2) {
-      primitives.push({
-        depth: sharedDepth,
-        draw: () => {
-          ctx.beginPath();
-          ctx.arc(p.center.x, p.center.y, p.radius, 0, Math.PI * 2);
-          ctx.fillStyle = '#ffffff';
-          ctx.fill();
-        }
-      });
-      return;
-    }
-
     const meshA = meshes[ownerIds[0]], meshB = meshes[ownerIds[1]];
-    const centroidA = centroidOfOtherNodes(meshA, nodeId);
-    const centroidB = centroidOfOtherNodes(meshB, nodeId);
-    if (!centroidA || !centroidB) return;
-
-    const nodeCam = worldToCamera(nodes[nodeId].center, camPos, basis);
-    const dA = vecNormalize(vecSub(worldToCamera(centroidA, camPos, basis), nodeCam));
-    const dB = vecNormalize(vecSub(worldToCamera(centroidB, camPos, basis), nodeCam));
-    const axis = { x: dB.x - dA.x, y: dB.y - dA.y, z: dB.z - dA.z };
-    const axisLen = Math.hypot(axis.x, axis.y, axis.z);
-    if (axisLen < 1e-9) return;
-
-    const axisN = { x: axis.x / axisLen, y: axis.y / axisLen, z: axis.z / axisLen };
-    const azimuth = Math.atan2(-axisN.y, axisN.x);
-    const phase = axisN.z;
+    const ellipseData = moonPhaseNodeData[nodeId];
+    
     const separatorColor = meshA.id < meshB.id ? meshA.color : meshB.color;
-    const center = p.center, radius = p.radius;
+    const center = ellipseData.center, radius = ellipseData.radius;
     primitives.push({
       depth: sharedDepth,
-      draw: () => drawJointSplitCircle(ctx, center, radius, azimuth, phase, meshA.color, meshB.color, separatorColor)
+      draw: () => drawJointSplitCircle(ctx, center, radius, ellipseData.azimuth, ellipseData.phase, meshA.color, meshB.color, separatorColor)
     });
   });
 
   // Sort all primitives back-to-front and draw
   primitives.sort((a, b) => b.depth - a.depth);
   primitives.forEach(p => p.draw());
+
+  // DEBUG -- Black outline of visible terminator arc for moon phase nodes
+  Object.keys(moonPhaseNodeData).forEach(nodeIdStr => {
+    const nodeId = Number(nodeIdStr);
+    const ellipseData = moonPhaseNodeData[nodeId];
+    const r = ellipseData.radius;
+    const ex = Math.abs(ellipseData.phase) * r;
+    const termCcw = ellipseData.phase >= 0;
+    
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = 2;
+    ctx.save();
+    ctx.translate(ellipseData.center.x, ellipseData.center.y);
+    ctx.rotate(ellipseData.azimuth);
+    ctx.beginPath();
+    // Draw the same arc as drawJointSplitCircle uses for the terminator
+    ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
+    ctx.stroke();
+    ctx.restore();
+  });
 
   // DEBUG -- Black outlines (temporarily disabled)
   // ctx.strokeStyle = '#000000';
@@ -606,7 +708,6 @@ function render() {
 // ---------------------------------------------------------
 // Quadrant 1 (top-left): the MINIMAL shared-node case -- two 2-node
 // meshes (two "lines") sharing the middle node, forming a V shape.
-// The simplest possible configuration for verifying the joint split.
 const q1x = DESIGN_WIDTH * 0.25, q1y = DESIGN_HEIGHT * 0.25;
 const jointNode = createNode({ x: q1x, y: q1y }, 35);
 const blueEnd = createNode({ x: q1x - 110, y: q1y - 100 }, 30);
@@ -649,19 +750,14 @@ const d5 = createNode({ x: q4x + 30, y: q4y + 140, z: -200 }, 35);
 const d6 = createNode({ x: q4x - 110, y: q4y + 90 }, 25);
 createMesh([d1, d2, d3, d4, d5, d6], '#ce93d8');
 
-// A new green mesh sharing d1 with the purple mesh above -- tests
-// how a node with multiple edges within one mesh handles sharing.
-// d1 is the purple node closest to the orange blob (top-left).
+// A new green mesh sharing d1 with the purple mesh above
 const e1 = createNode({ x: q4x - 260, y: q4y + 60 }, 30);
 const e2 = createNode({ x: q4x - 200, y: q4y + 180 }, 25);
 createMesh([d1, e1, e2], '#a5d6a7');
 
 // ---------------------------------------------------------
-// ANIMATION LOOP: orbit the camera around the center, always looking
-// at it, to verify meshes stay round/billboard-like (no pancaking)
-// as the viewing angle changes.
+// ANIMATION LOOP
 // ---------------------------------------------------------
-// White background
 canvas.style.background = '#ffffff';
 
 let paused = false;
