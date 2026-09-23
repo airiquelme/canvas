@@ -150,9 +150,49 @@ function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 
   ctx.fill();
 }
 
-// Helper: Find tangent point on ellipse from external point, pick the one on visible arc
+// Helper: compute the (up to) 2 raw analytic tangent point candidates from
+// an external point to an ellipse, in the ellipse's own local (unrotated)
+// coordinate space. Returns [] if no well-defined tangent exists.
+function computeEllipseTangentCandidatesLocal(radiusX, radiusY, localX, localY) {
+  const a = Math.max(radiusX, 1e-4);
+  const b = radiusY;
+
+  const u = localX / a;
+  const v = localY / b;
+  const d2 = u * u + v * v; // must be >= 1 since externalPoint is outside the ellipse
+
+  let X1, Y1, X2, Y2;
+  if (Math.abs(v) > 1e-6) {
+    const disc = Math.max(0, d2 - 1);
+    const sqrtTerm = Math.abs(v) * Math.sqrt(disc);
+    X1 = (u + sqrtTerm) / d2;
+    X2 = (u - sqrtTerm) / d2;
+    Y1 = (1 - X1 * u) / v;
+    Y2 = (1 - X2 * u) / v;
+  } else if (Math.abs(u) > 1e-6) {
+    // externalPoint lies along the local x-axis: line becomes X*u = 1
+    X1 = X2 = 1 / u;
+    const yy = Math.sqrt(Math.max(0, 1 - X1 * X1));
+    Y1 = yy;
+    Y2 = -yy;
+  } else {
+    // externalPoint effectively at the ellipse center -- no well-defined tangent
+    return [];
+  }
+
+  return [
+    { x: a * X1, y: b * Y1, angle: Math.atan2(Y1, X1) },
+    { x: a * X2, y: b * Y2, angle: Math.atan2(Y2, X2) },
+  ];
+}
+
+// Helper: Find tangent point on ellipse from external point, pick the one on visible arc.
+// Uses the closed-form analytic solution (exactly 2 tangent points from an
+// external point to an ellipse) instead of a numeric angular search -- the
+// old search could occasionally miss the correct candidate near the visible
+// range's boundary for a stray frame, causing a visible flicker to the wrong side.
 function findEllipseTangentPoint(ellipseCenter, radiusX, radiusY, ellipseRotation, phase, externalPoint) {
-  // Transform external point to ellipse's local coordinate system
+  // Transform external point to ellipse's local (unrotated) coordinate system
   const dx = externalPoint.x - ellipseCenter.x;
   const dy = externalPoint.y - ellipseCenter.y;
   const cos_rot = Math.cos(-ellipseRotation);
@@ -160,89 +200,76 @@ function findEllipseTangentPoint(ellipseCenter, radiusX, radiusY, ellipseRotatio
   const localX = dx * cos_rot - dy * sin_rot;
   const localY = dx * sin_rot + dy * cos_rot;
 
-  // Find tangent points by searching around the ellipse
-  const candidates = [];
-  
-  for (let t = 0; t < Math.PI * 2; t += 0.02) {
-    const cos_t = Math.cos(t);
-    const sin_t = Math.sin(t);
-    
-    // Point on ellipse
-    const px = radiusX * cos_t;
-    const py = radiusY * sin_t;
-    
-    // Vector from ellipse point to external point
-    const vx = localX - px;
-    const vy = localY - py;
-    
-    // Normal to ellipse at this point
-    const nx = cos_t / (radiusX * radiusX);
-    const ny = sin_t / (radiusY * radiusY);
-    
-    // For tangency: dot product should be ~0
-    const dot = vx * nx + vy * ny;
-    candidates.push({ t, dot, px, py });
-  }
-  
-  // Find local minima of |dot| to get tangent points
-  let tangents = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const prev = candidates[(i - 1 + candidates.length) % candidates.length];
-    const curr = candidates[i];
-    const next = candidates[(i + 1) % candidates.length];
-    
-    if (Math.abs(curr.dot) < Math.abs(prev.dot) && Math.abs(curr.dot) < Math.abs(next.dot)) {
-      tangents.push(curr);
+  const candidates = computeEllipseTangentCandidatesLocal(radiusX, radiusY, localX, localY);
+  if (candidates.length === 0) return null;
+
+  // Which side of the split (local x sign) is actually visible: the
+  // terminator sweeps through positive local x when phase >= 0, and
+  // through negative local x when phase < 0 (matches drawJointSplitCircle's
+  // termCcw convention). Checking the sign of x directly avoids any
+  // angle-wraparound edge cases near the ±90° pole boundary.
+  const wantsPositiveSide = phase >= 0;
+  const onCorrectSide = (c) => (c.x >= 0) === wantsPositiveSide;
+
+  const angularDist = (p, q) => {
+    let d = p - q;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return Math.abs(d);
+  };
+
+  // The "near" tangent is always the one whose angle is closest to the
+  // external point's own direction from the ellipse center -- this is
+  // mathematically the correct discriminator (picking "whichever candidate
+  // happens to be first" can silently grab the wrong/far one).
+  const dirAngle = Math.atan2(localY, localX);
+
+  const sideCandidates = candidates.filter(onCorrectSide);
+  const pool = sideCandidates.length > 0 ? sideCandidates : candidates;
+  let bestTangent = pool.reduce((best, curr) =>
+    angularDist(curr.angle, dirAngle) < angularDist(best.angle, dirAngle) ? curr : best
+  );
+
+  const a = Math.max(radiusX, 1e-4);
+  const centerAngle = wantsPositiveSide ? 0 : Math.PI;
+  let capped = false;
+  const useCenterFallback = () => {
+    bestTangent = { x: a * Math.cos(centerAngle), y: radiusY * Math.sin(centerAngle), angle: centerAngle };
+    capped = true;
+  };
+
+  // Safety cap #1: if the chosen point still doesn't actually land on the
+  // correct side (e.g. near-degenerate geometry where both real tangent
+  // points sit on the wrong side), don't risk a wrong-side pick -- just
+  // use the center of the visible arc instead.
+  if (!onCorrectSide(bestTangent)) {
+    useCenterFallback();
+  } else {
+    // Safety cap #2: being on the correct HALF isn't enough -- it also
+    // needs to be on the correct QUARTER, i.e. between the center and
+    // whichever pole is nearest the external point, not the far pole.
+    // Compare each one's signed offset from the arc's center; if the
+    // candidate has overshot into the opposite quarter, clamp to center.
+    const signedOffset = (angle) => {
+      let d = angle - centerAngle;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      return d;
+    };
+    const candidateOffset = signedOffset(bestTangent.angle);
+    const dirOffset = signedOffset(dirAngle);
+    const sign = (v) => (v > 1e-9 ? 1 : v < -1e-9 ? -1 : 0);
+    if (sign(candidateOffset) !== 0 && sign(dirOffset) !== 0 && sign(candidateOffset) !== sign(dirOffset)) {
+      useCenterFallback();
     }
   }
-  
-  // Determine visible arc based on phase
-  // termCcw = phase >= 0 (same logic as drawJointSplitCircle)
-  // If phase >= 0: visible arc is drawn as [-π/2, π/2] counterclockwise (normal)
-  // If phase < 0: visible arc is drawn as [-π/2, π/2] clockwise (flipped)
-  const visibleTangents = tangents.filter(t => {
-    let angle = t.t;
-    while (angle > Math.PI) angle -= Math.PI * 2;
-    while (angle < -Math.PI) angle += Math.PI * 2;
-    
-    if (phase >= 0) {
-      // Normal: visible arc is [-π/2, π/2]
-      return angle >= -Math.PI / 2 && angle <= Math.PI / 2;
-    } else {
-      // Flipped: visible arc is the other half [π/2, 3π/2] or [-π/2, -3π/2]
-      return angle <= -Math.PI / 2 || angle >= Math.PI / 2;
-    }
-  });
-  
-  // Pick the tangent closest to angle 0 (center of visible arc)
-  const bestTangent = visibleTangents.length > 0 
-    ? visibleTangents.reduce((best, curr) => {
-        let currAngle = curr.t % (Math.PI * 2);
-        if (currAngle > Math.PI) currAngle -= Math.PI * 2;
-        if (currAngle < -Math.PI) currAngle += Math.PI * 2;
-        
-        let bestAngle = best.t % (Math.PI * 2);
-        if (bestAngle > Math.PI) bestAngle -= Math.PI * 2;
-        if (bestAngle < -Math.PI) bestAngle += Math.PI * 2;
-        
-        // For flipped phase, measure distance from π instead of 0
-        const currDist = phase >= 0 ? Math.abs(currAngle) : Math.abs(Math.abs(currAngle) - Math.PI);
-        const bestDist = phase >= 0 ? Math.abs(bestAngle) : Math.abs(Math.abs(bestAngle) - Math.PI);
-        
-        return currDist < bestDist ? curr : best;
-      })
-    : tangents[0];
-  
-  // Convert to screen space
-  if (bestTangent) {
-    const cos_rot_back = Math.cos(ellipseRotation);
-    const sin_rot_back = Math.sin(ellipseRotation);
-    const screenX = ellipseCenter.x + (bestTangent.px * cos_rot_back - bestTangent.py * sin_rot_back);
-    const screenY = ellipseCenter.y + (bestTangent.px * sin_rot_back + bestTangent.py * cos_rot_back);
-    return { x: screenX, y: screenY };
-  }
-  
-  return null;
+
+  // Convert back to screen space
+  const cos_rot_back = Math.cos(ellipseRotation);
+  const sin_rot_back = Math.sin(ellipseRotation);
+  const screenX = ellipseCenter.x + (bestTangent.x * cos_rot_back - bestTangent.y * sin_rot_back);
+  const screenY = ellipseCenter.y + (bestTangent.x * sin_rot_back + bestTangent.y * cos_rot_back);
+  return { x: screenX, y: screenY, capped };
 }
 
 // Helper: find the closest point on a circle to a given point
@@ -398,11 +425,12 @@ function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, c
   // Separator stroke along the terminator ellipse -- minimum thickness
   // to cover the sub-pixel gap between the two filled halves. Color
   // is always the lower-id mesh's color, stable across all frames.
-  ctx.strokeStyle = separatorColor;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
-  ctx.stroke();
+  // -- Temporarily disabled to check if it's still needed.
+  // ctx.strokeStyle = separatorColor;
+  // ctx.lineWidth = 1.5;
+  // ctx.beginPath();
+  // ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
+  // ctx.stroke();
 
   // Rim strokes: one per half in each mesh's own color, covering
   // the antialiased white edge at the circle's outer boundary.
@@ -435,6 +463,55 @@ function render() {
     const u = ((s2.a.x - s1.a.x) * d1.y - (s2.a.y - s1.a.y) * d1.x) / denom;
     if (t < 0 || t > 1 || u < 0 || u > 1) return null;
     return { x: s1.a.x + t * d1.x, y: s1.a.y + t * d1.y };
+  }
+  // Where a ray (origin + t*dir, t >= 0) crosses a circle it isn't tangent
+  // to, it hits two points: a near one (facing back toward the ray's
+  // origin/pivot) and a far one (the outer side). We want the FAR one --
+  // that's the side matching the capsule's actual outer silhouette, not
+  // a point cutting through the middle of the short node.
+  function rayCircleFarSide(origin, dir, center, radius) {
+    const fx = origin.x - center.x, fy = origin.y - center.y;
+    const a = dir.x * dir.x + dir.y * dir.y;
+    if (a < 1e-9) return null;
+    const b = 2 * (fx * dir.x + fy * dir.y);
+    const c = fx * fx + fy * fy - radius * radius;
+    const disc = b * b - 4 * a * c;
+    if (disc < 0) return null;
+    const sqrtDisc = Math.sqrt(disc);
+    const roots = [(-b - sqrtDisc) / (2 * a), (-b + sqrtDisc) / (2 * a)].filter(t => t >= 0).sort((x, y) => x - y);
+    if (roots.length === 0) return null;
+    const t = roots[roots.length - 1];
+    return { x: origin.x + t * dir.x, y: origin.y + t * dir.y, t };
+  }
+  // Same as segmentIntersect, but when the true crossing point lies beyond
+  // one segment's far end (that node's arm is simply shorter than the
+  // other's), fall back to where the OTHER line first enters that short
+  // node's own circle -- the actual point the two capsules visually meet,
+  // rather than reporting no intersection at all.
+  function segmentIntersectWithCircleFallback(s1, s2, farNode1, farNode2) {
+    const d1 = { x: s1.b.x - s1.a.x, y: s1.b.y - s1.a.y };
+    const d2 = { x: s2.b.x - s2.a.x, y: s2.b.y - s2.a.y };
+    const denom = d1.x * d2.y - d1.y * d2.x;
+    if (Math.abs(denom) < 1e-9) return null;
+    const t = ((s2.a.x - s1.a.x) * d2.y - (s2.a.y - s1.a.y) * d2.x) / denom;
+    const u = ((s2.a.x - s1.a.x) * d1.y - (s2.a.y - s1.a.y) * d1.x) / denom;
+    if (t < 0 || u < 0) return null; // crossing is behind the pivot -- still invalid
+    if (t <= 1 && u <= 1) {
+      return { x: s1.a.x + t * d1.x, y: s1.a.y + t * d1.y };
+    }
+    if (t > 1) {
+      // s1's own arm (toward farNode1) is the short one -- check where
+      // s2's line crosses the far side of farNode1's circle instead.
+      const hit = rayCircleFarSide(s2.a, d2, farNode1.center, farNode1.radius);
+      if (hit && hit.t <= 1) return { x: hit.x, y: hit.y };
+    }
+    if (u > 1) {
+      // s2's own arm (toward farNode2) is the short one -- check where
+      // s1's line crosses the far side of farNode2's circle instead.
+      const hit = rayCircleFarSide(s1.a, d1, farNode2.center, farNode2.radius);
+      if (hit && hit.t <= 1) return { x: hit.x, y: hit.y };
+    }
+    return null;
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#ffffff';
@@ -506,13 +583,20 @@ function render() {
       center: p.center,
       radius: p.radius,
       azimuth: azimuth,
-      phase: phase
+      phase: phase,
+      idA: meshA.id,
+      idB: meshB.id,
+      colorA: meshA.color,
+      colorB: meshB.color
     };
   });
 
   // Build a flat list of primitives, each with its own depth key.
   // Node circles now render with their pairs for proper depth sorting.
   const primitives = [];
+  // Collected separately so the debug tangent line/dots can be drawn
+  // unconditionally on top of everything, like the black debug outline.
+  const debugTangentData = [];
 
   Object.values(meshes).forEach(mesh => {
     const pNodes = mesh.nodeIds.map(id => projectedNodes[id]);
@@ -538,12 +622,12 @@ function render() {
               const pB = projectedNodes[otherId];
               const tanB = computePairTangents(pivotNode.center, pivotNode.radius, pB.center, pB.radius);
               const pt =
-                segmentIntersect(edgeSegment(pivotNode, otherNode, tanA.t1Angle), edgeSegment(pivotNode, pB, tanB.t2Angle)) ||
-                segmentIntersect(edgeSegment(pivotNode, otherNode, tanA.t2Angle), edgeSegment(pivotNode, pB, tanB.t1Angle));
+                segmentIntersectWithCircleFallback(edgeSegment(pivotNode, otherNode, tanA.t1Angle), edgeSegment(pivotNode, pB, tanB.t2Angle), otherNode, pB) ||
+                segmentIntersectWithCircleFallback(edgeSegment(pivotNode, otherNode, tanA.t2Angle), edgeSegment(pivotNode, pB, tanB.t1Angle), otherNode, pB);
               if (!pt) return;
               const rimAngle = Math.atan2(pt.y - pivotNode.center.y, pt.x - pivotNode.center.x);
               const rim = { x: pivotNode.center.x + pivotNode.radius * Math.cos(rimAngle), y: pivotNode.center.y + pivotNode.radius * Math.sin(rimAngle) };
-              const onT1 = !!segmentIntersect(edgeSegment(pivotNode, otherNode, tanA.t1Angle), edgeSegment(pivotNode, pB, tanB.t2Angle));
+              const onT1 = !!segmentIntersectWithCircleFallback(edgeSegment(pivotNode, otherNode, tanA.t1Angle), edgeSegment(pivotNode, pB, tanB.t2Angle), otherNode, pB);
               const tangentAngle = onT1 ? tanA.t1Angle : tanA.t2Angle;
               const tangentRim = { x: pivotNode.center.x + pivotNode.radius * Math.cos(tangentAngle), y: pivotNode.center.y + pivotNode.radius * Math.sin(tangentAngle) };
               redLines.push({ pt, rim, tangentRim, onT1, pivotIsA });
@@ -552,14 +636,21 @@ function render() {
         });
 
         // Find the longest red line at build time
-        let longestPt = null, longestRim = null, longestOnT1 = null, longestPivotIsA = null, longestDist = -1;
-        redLines.forEach(({ pt, rim, onT1, pivotIsA }) => {
+        let longestPt = null, longestRim = null, longestTangentRim = null, longestOnT1 = null, longestPivotIsA = null, longestDist = -1;
+        redLines.forEach(({ pt, rim, tangentRim, onT1, pivotIsA }) => {
           const dist = Math.hypot(rim.x - pt.x, rim.y - pt.y);
-          if (dist > longestDist) { longestDist = dist; longestPt = pt; longestRim = rim; longestOnT1 = onT1; longestPivotIsA = pivotIsA; }
+          if (dist > longestDist) { longestDist = dist; longestPt = pt; longestRim = rim; longestTangentRim = tangentRim; longestOnT1 = onT1; longestPivotIsA = pivotIsA; }
         });
         
         // Determine which pivot node the longest red line belongs to
         const longestPivotNodeId = longestPivotIsA ? a.id : b.id;
+
+        // Stash this for the final top-layer debug pass instead of drawing
+        // it inline (inline drawing gets sorted into depth order and can
+        // end up buried under the moon phase circle).
+        if (longestPt && moonPhaseNodeIds.has(longestPivotNodeId)) {
+          debugTangentData.push({ longestPt, longestRim, longestTangentRim, longestPivotNodeId, meshId: mesh.id });
+        }
 
         // Compute fill triangle from centroid to this capsule
         const meshCentroid = mesh.nodeIds.reduce(
@@ -604,46 +695,6 @@ function render() {
               ctx.fillStyle = color;
               ctx.fill();
             }
-            
-            // DEBUG -- red dot and tangent line to visible terminator (only on moon phase pivot nodes)
-            if (longestPt && moonPhaseNodeIds.has(longestPivotNodeId)) {
-              let ellipseData = moonPhaseNodeData[longestPivotNodeId];
-              
-              // Fallback: if data isn't populated, use the projected node directly
-              if (!ellipseData) {
-                const p = projectedNodes[longestPivotNodeId];
-                ellipseData = {
-                  center: p.center,
-                  radius: p.radius,
-                  azimuth: 0,
-                  phase: 0
-                };
-              }
-              
-              if (ellipseData) {
-                // Find tangent point on the visible terminator ellipse
-                const r = ellipseData.radius;
-                const ex = Math.abs(ellipseData.phase) * r;
-                const tangentPoint = findEllipseTangentPoint(ellipseData.center, ex, r, ellipseData.azimuth, ellipseData.phase, longestPt);
-                
-                if (tangentPoint) {
-                  // Draw red line from longest point to tangent point
-                  ctx.strokeStyle = '#ff0000';
-                  ctx.lineWidth = 1.5;
-                  ctx.setLineDash([]);
-                  ctx.beginPath();
-                  ctx.moveTo(longestPt.x, longestPt.y);
-                  ctx.lineTo(tangentPoint.x, tangentPoint.y);
-                  ctx.stroke();
-                }
-              }
-              
-              // Draw red dot at longest point
-              ctx.fillStyle = '#ff0000';
-              ctx.beginPath();
-              ctx.arc(longestPt.x, longestPt.y, 5, 0, Math.PI * 2);
-              ctx.fill();
-            }
           }
         });
       }
@@ -672,24 +723,133 @@ function render() {
   primitives.sort((a, b) => b.depth - a.depth);
   primitives.forEach(p => p.draw());
 
-  // DEBUG -- Black outline of visible terminator arc for moon phase nodes
-  Object.keys(moonPhaseNodeData).forEach(nodeIdStr => {
-    const nodeId = Number(nodeIdStr);
-    const ellipseData = moonPhaseNodeData[nodeId];
-    const r = ellipseData.radius;
-    const ex = Math.abs(ellipseData.phase) * r;
-    const termCcw = ellipseData.phase >= 0;
-    
-    ctx.strokeStyle = '#000000';
-    ctx.lineWidth = 2;
-    ctx.save();
-    ctx.translate(ellipseData.center.x, ellipseData.center.y);
-    ctx.rotate(ellipseData.azimuth);
+  // Fix up the moon phase joint's boundary: redirect each mesh's capsule
+  // edge at the point where it crosses the other mesh's edge (longestPt),
+  // handing the outer sliver and the crescent's tip over to the correct
+  // color instead of leaving them on the wrong side of the seam.
+  debugTangentData.forEach(({ longestPt, longestRim, longestTangentRim, longestPivotNodeId, meshId }) => {
+    const ellipseData = moonPhaseNodeData[longestPivotNodeId];
+    if (!ellipseData) return;
+
+    const { center, radius: r, azimuth, phase, colorA, colorB, idA } = ellipseData;
+    const ex = Math.abs(phase) * r;
+    const tangentPoint = findEllipseTangentPoint(center, ex, r, azimuth, phase, longestPt);
+
+    // rimHit (where the red line crosses the rim) and the outer wedge only
+    // depend on where the line crosses the rim, which stays well-defined
+    // even in the capped edge case -- so they should always apply. Only
+    // the INNER (phase/crescent tip) wedge has the "carve out a huge
+    // chunk" problem at the cap, so that part alone is skipped there.
+    if (tangentPoint) {
+      // --- Find where the red line (longestPt -> tangentPoint) crosses
+      // the OUTER rim circle (it must cross exactly once, since longestPt
+      // is outside the node and tangentPoint is inside it). ---
+      const dxseg = tangentPoint.x - longestPt.x, dyseg = tangentPoint.y - longestPt.y;
+      const fx = longestPt.x - center.x, fy = longestPt.y - center.y;
+      const a_coef = dxseg * dxseg + dyseg * dyseg;
+      const b_coef = 2 * (fx * dxseg + fy * dyseg);
+      const c_coef = fx * fx + fy * fy - r * r;
+      const disc = b_coef * b_coef - 4 * a_coef * c_coef;
+
+      let rimHit = null;
+      if (disc >= 0 && a_coef > 1e-9) {
+        const sqrtDisc = Math.sqrt(disc);
+        const t1 = (-b_coef - sqrtDisc) / (2 * a_coef);
+        const t2 = (-b_coef + sqrtDisc) / (2 * a_coef);
+        const validT = [t1, t2].find(t => t >= 0 && t <= 1);
+        if (validT !== undefined) {
+          rimHit = { x: longestPt.x + dxseg * validT, y: longestPt.y + dyseg * validT };
+        }
+      }
+
+      if (rimHit) {
+        // Work in the ellipse's local (unrotated) frame for the arcs.
+        const toLocal = (pt) => {
+          const dx = pt.x - center.x, dy = pt.y - center.y;
+          const cosA = Math.cos(-azimuth), sinA = Math.sin(-azimuth);
+          return { x: dx * cosA - dy * sinA, y: dx * sinA + dy * cosA };
+        };
+        const localRimHit = toLocal(rimHit);
+        const localTangent = toLocal(tangentPoint);
+        const rimHitAngle = Math.atan2(localRimHit.y, localRimHit.x);
+        const angleT = Math.atan2(localTangent.y / r, localTangent.x / Math.max(ex, 1e-4));
+
+        const angularDist = (p, q) => {
+          let d = p - q;
+          while (d > Math.PI) d -= Math.PI * 2;
+          while (d < -Math.PI) d += Math.PI * 2;
+          return Math.abs(d);
+        };
+        // The tip is bounded by whichever pole (always at local ±90°) is
+        // nearest to the tangent point.
+        const poleAngle = angularDist(angleT, Math.PI / 2) <= angularDist(angleT, -Math.PI / 2)
+          ? Math.PI / 2 : -Math.PI / 2;
+
+        // Whichever color currently occupies that sliver (based on the
+        // standard colorA/colorB angular split) gets swapped to the other.
+        let normRim = rimHitAngle;
+        while (normRim < 0) normRim += Math.PI * 2;
+        while (normRim >= Math.PI * 2) normRim -= Math.PI * 2;
+        const inColorARange = normRim >= Math.PI / 2 && normRim <= (3 * Math.PI / 2);
+        const otherColor = inColorARange ? colorB : colorA;
+
+        const shortArcParams = (startAngle, endAngle) => {
+          let diff = endAngle - startAngle;
+          while (diff > Math.PI) diff -= Math.PI * 2;
+          while (diff < -Math.PI) diff += Math.PI * 2;
+          return { anticlockwise: diff < 0 };
+        };
+
+        ctx.save();
+        ctx.translate(center.x, center.y);
+        ctx.rotate(azimuth);
+
+        // --- Outer wedge: redirect the boundary. Instead of the old
+        // capsule edge continuing from longestPt to longestTangentRim (the
+        // black line, straight into the rim), cut it off at longestPt and
+        // give that sliver -- bounded by the black-line edge, the rim, and
+        // the red line down to rimHit -- to the OTHER mesh's color. Net
+        // effect: the rendered boundary now effectively follows the red
+        // line from longestPt to the rim instead of the old edge.
+        if (longestTangentRim) {
+          const otherColorOuter = meshId === idA ? colorB : colorA;
+          const localTangentRim = toLocal(longestTangentRim);
+          const localLongestPt = toLocal(longestPt);
+          const tangentRimAngle = Math.atan2(localTangentRim.y, localTangentRim.x);
+          const outerRimSweep = shortArcParams(rimHitAngle, tangentRimAngle);
+
+          ctx.beginPath();
+          ctx.moveTo(localTangentRim.x, localTangentRim.y);
+          ctx.lineTo(localLongestPt.x, localLongestPt.y);
+          ctx.lineTo(localRimHit.x, localRimHit.y);
+          ctx.arc(0, 0, r, rimHitAngle, tangentRimAngle, outerRimSweep.anticlockwise);
+          ctx.closePath();
+          ctx.fillStyle = otherColorOuter;
+          ctx.fill();
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(localRimHit.x, localRimHit.y);
+        const rimSweep = shortArcParams(rimHitAngle, poleAngle);
+        ctx.arc(0, 0, r, rimHitAngle, poleAngle, rimSweep.anticlockwise);
+        const termSweep = shortArcParams(poleAngle, angleT);
+        ctx.ellipse(0, 0, ex, r, 0, poleAngle, angleT, termSweep.anticlockwise);
+        ctx.closePath();
+        // The inner (phase/crescent) wedge is the one that carves out a
+        // huge chunk at the capped edge case -- skip only this part there.
+        if (!tangentPoint.capped) {
+          ctx.fillStyle = otherColor;
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+    }
+
+    // DEBUG -- red dot at the found intersection point (longestPt)
+    ctx.fillStyle = '#ff0000';
     ctx.beginPath();
-    // Draw the same arc as drawJointSplitCircle uses for the terminator
-    ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
-    ctx.stroke();
-    ctx.restore();
+    ctx.arc(longestPt.x, longestPt.y, 5, 0, Math.PI * 2);
+    ctx.fill();
   });
 
   // DEBUG -- Black outlines (temporarily disabled)
