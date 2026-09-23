@@ -393,7 +393,7 @@ function centroidOfOtherNodes(mesh, sharedNodeId) {
 
 // Draws the split circle: colorA fills the side facing meshA, colorB
 // the side facing meshB, divided by the terminator ellipse.
-function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, colorA, colorB, separatorColor) {
+function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, colorA, colorB, separatorColor, strokeRange) {
   const r = screenRadius;
   const ex = Math.abs(phase) * r;
   const termCcw = phase >= 0;
@@ -413,6 +413,22 @@ function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, c
   ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
   ctx.closePath();
   ctx.fill();
+
+  // Stroke colorA's own boundary (in its own color) right after its fill
+  // and before colorB fills over it -- colorB's fill (drawn next) then
+  // naturally covers the half of this stroke on its own side, leaving no
+  // sub-pixel gap between the two separately-drawn fills. Only the FAR
+  // segment (from the far pole up to the tangent point) needs this -- the
+  // near segment gets separately handled/recolored by the inner wedge fix,
+  // so stop there if that range was provided by the caller.
+  const strokeStart = strokeRange ? strokeRange.start : -Math.PI / 2;
+  const strokeEnd = strokeRange ? strokeRange.end : Math.PI / 2;
+  const strokeAnticlockwise = strokeRange ? strokeRange.anticlockwise : !termCcw;
+  ctx.strokeStyle = '#ffff00'; // DIAGNOSTIC: bright yellow instead of colorA
+  ctx.lineWidth = 8;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, ex, r, 0, strokeStart, strokeEnd, strokeAnticlockwise);
+  ctx.stroke();
 
   // B's region: the +x half, bounded by the terminator ellipse.
   ctx.fillStyle = colorB;
@@ -681,6 +697,45 @@ function render() {
             
             // Draw capsule outline on top
             drawPairCapsule(ctx, a.center, a.radius, b.center, b.radius, color, skip1, skip2);
+
+            // If this pivot is a moon phase node, patch this capsule's own
+            // outer boundary (in its own color) right here -- as part of
+            // its own natural draw call, in-layer -- rather than in a
+            // separate pass that always runs last. The wedge fill (drawn
+            // later, in the Fix-up pass) then naturally covers the half of
+            // this stroke on its own side.
+            if (longestPt && moonPhaseNodeIds.has(longestPivotNodeId)) {
+              const ellipseData = moonPhaseNodeData[longestPivotNodeId];
+              if (ellipseData) {
+                const { center: epCenter, radius: epR, azimuth: epAzimuth, phase: epPhase } = ellipseData;
+                const epEx = Math.abs(epPhase) * epR;
+                const tangentPoint = findEllipseTangentPoint(epCenter, epEx, epR, epAzimuth, epPhase, longestPt);
+                if (tangentPoint) {
+                  const dxseg = tangentPoint.x - longestPt.x, dyseg = tangentPoint.y - longestPt.y;
+                  const fx = longestPt.x - epCenter.x, fy = longestPt.y - epCenter.y;
+                  const a_coef = dxseg * dxseg + dyseg * dyseg;
+                  const b_coef = 2 * (fx * dxseg + fy * dyseg);
+                  const c_coef = fx * fx + fy * fy - epR * epR;
+                  const disc = b_coef * b_coef - 4 * a_coef * c_coef;
+                  if (disc >= 0 && a_coef > 1e-9) {
+                    const sqrtDisc = Math.sqrt(disc);
+                    const t1 = (-b_coef - sqrtDisc) / (2 * a_coef);
+                    const t2 = (-b_coef + sqrtDisc) / (2 * a_coef);
+                    const validT = [t1, t2].find(t => t >= 0 && t <= 1);
+                    if (validT !== undefined) {
+                      const rimHit = { x: longestPt.x + dxseg * validT, y: longestPt.y + dyseg * validT };
+                      ctx.strokeStyle = color;
+                      ctx.lineWidth = 8;
+                      ctx.setLineDash([]);
+                      ctx.beginPath();
+                      ctx.moveTo(longestPt.x, longestPt.y);
+                      ctx.lineTo(rimHit.x, rimHit.y);
+                      ctx.stroke();
+                    }
+                  }
+                }
+              }
+            }
             
             // Draw the two node circles for this pair (unless they're moon phase nodes)
             if (!moonPhaseNodeIds.has(a.id)) {
@@ -701,6 +756,10 @@ function render() {
     }
   });
 
+  // DIAGNOSTIC -- markers drawn unconditionally last, after the Fix-up
+  // pass, so nothing can cover them.
+  const diagnosticMarkers = [];
+
   // Render moon phase nodes (2-node + any other mesh)
   Object.keys(moonPhaseNodeData).forEach(nodeIdStr => {
     const nodeId = Number(nodeIdStr);
@@ -713,9 +772,57 @@ function render() {
     
     const separatorColor = meshA.id < meshB.id ? meshA.color : meshB.color;
     const center = ellipseData.center, radius = ellipseData.radius;
+
+    // Compute the far-pole-to-tangent-point stroke range, using the same
+    // (first) debugTangentData entry the inner wedge fix will later use,
+    // so the far stroke and the near wedge line up at the same boundary.
+    let strokeRange = null;
+    const entry = debugTangentData.find(d => d.longestPivotNodeId === nodeId);
+    if (entry) {
+      const { azimuth, phase } = ellipseData;
+      const ex = Math.abs(phase) * radius;
+      const tangentPoint = findEllipseTangentPoint(center, ex, radius, azimuth, phase, entry.longestPt);
+      if (tangentPoint) {
+        const cosA = Math.cos(-azimuth), sinA = Math.sin(-azimuth);
+        const dx = tangentPoint.x - center.x, dy = tangentPoint.y - center.y;
+        const localX = dx * cosA - dy * sinA, localY = dx * sinA + dy * cosA;
+        const angleT = Math.atan2(localY / radius, localX / Math.max(ex, 1e-4));
+
+        const dx2 = entry.longestPt.x - center.x, dy2 = entry.longestPt.y - center.y;
+        const localX2 = dx2 * cosA - dy2 * sinA, localY2 = dx2 * sinA + dy2 * cosA;
+        const dirAngle = Math.atan2(localY2, localX2);
+
+        const angularDist = (a, b) => {
+          let d = a - b;
+          while (d > Math.PI) d -= Math.PI * 2;
+          while (d < -Math.PI) d += Math.PI * 2;
+          return Math.abs(d);
+        };
+        const nearPole = angularDist(dirAngle, Math.PI / 2) <= angularDist(dirAngle, -Math.PI / 2)
+          ? Math.PI / 2 : -Math.PI / 2;
+        const farPole = -nearPole;
+
+        let diff = angleT - farPole;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        strokeRange = { start: farPole, end: angleT, anticlockwise: diff < 0 };
+
+        // DIAGNOSTIC -- mark the computed far-pole (magenta) and
+        // tangent-point (cyan) stroke endpoints.
+        const farPoleLocal = { x: ex * Math.cos(farPole), y: radius * Math.sin(farPole) };
+        const cosB = Math.cos(azimuth), sinB = Math.sin(azimuth);
+        const farPoleScreen = {
+          x: center.x + farPoleLocal.x * cosB - farPoleLocal.y * sinB,
+          y: center.y + farPoleLocal.x * sinB + farPoleLocal.y * cosB,
+        };
+        diagnosticMarkers.push({ x: farPoleScreen.x, y: farPoleScreen.y, color: '#ff00ff' });
+        diagnosticMarkers.push({ x: tangentPoint.x, y: tangentPoint.y, color: '#00ffff' });
+      }
+    }
+
     primitives.push({
       depth: sharedDepth,
-      draw: () => drawJointSplitCircle(ctx, center, radius, ellipseData.azimuth, ellipseData.phase, meshA.color, meshB.color, separatorColor)
+      draw: () => drawJointSplitCircle(ctx, center, radius, ellipseData.azimuth, ellipseData.phase, meshA.color, meshB.color, separatorColor, strokeRange)
     });
   });
 
@@ -727,6 +834,15 @@ function render() {
   // edge at the point where it crosses the other mesh's edge (longestPt),
   // handing the outer sliver and the crescent's tip over to the correct
   // color instead of leaving them on the wrong side of the seam.
+  //
+  // The OUTER wedge is inherently per-mesh (each mesh patches its own
+  // segment with the other's color -- these don't conflict since they're
+  // different lines/colors), so every entry gets one. The INNER (crescent
+  // tip) wedge, however, is a node-level correction -- applying it once
+  // per owning mesh stacks two overlapping fills on top of each other, so
+  // that part alone is only done once per node.
+  const innerWedgeDone = new Set();
+
   debugTangentData.forEach(({ longestPt, longestRim, longestTangentRim, longestPivotNodeId, meshId }) => {
     const ellipseData = moonPhaseNodeData[longestPivotNodeId];
     if (!ellipseData) return;
@@ -824,7 +940,7 @@ function render() {
           ctx.lineTo(localRimHit.x, localRimHit.y);
           ctx.arc(0, 0, r, rimHitAngle, tangentRimAngle, outerRimSweep.anticlockwise);
           ctx.closePath();
-          ctx.fillStyle = otherColorOuter;
+          ctx.fillStyle = '#00ff00'; // DIAGNOSTIC: bright green instead of otherColorOuter
           ctx.fill();
         }
 
@@ -837,18 +953,22 @@ function render() {
         ctx.closePath();
         // The inner (phase/crescent) wedge is the one that carves out a
         // huge chunk at the capped edge case -- skip only this part there.
-        if (!tangentPoint.capped) {
-          ctx.fillStyle = otherColor;
+        // Also a node-level fix (see comment above), so only do it once.
+        if (!tangentPoint.capped && !innerWedgeDone.has(longestPivotNodeId)) {
+          innerWedgeDone.add(longestPivotNodeId);
+          ctx.fillStyle = '#ff8800'; // DIAGNOSTIC: bright orange-red instead of otherColor
           ctx.fill();
         }
         ctx.restore();
       }
     }
+  });
 
-    // DEBUG -- red dot at the found intersection point (longestPt)
-    ctx.fillStyle = '#ff0000';
+  // DIAGNOSTIC -- draw markers now, unconditionally last
+  diagnosticMarkers.forEach(m => {
+    ctx.fillStyle = m.color;
     ctx.beginPath();
-    ctx.arc(longestPt.x, longestPt.y, 5, 0, Math.PI * 2);
+    ctx.arc(m.x, m.y, 6, 0, Math.PI * 2);
     ctx.fill();
   });
 
