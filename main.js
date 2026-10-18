@@ -5,6 +5,21 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const DESIGN_WIDTH = 1000, DESIGN_HEIGHT = 800;
 
+// DEBUG -- paints the background magenta so antialiasing seam gaps
+// between separately-filled pieces stand out.
+const GAP_DEBUG = false;
+
+// Seam strokes cover the sub-pixel gap where two separately-filled
+// pieces meet. Width is in device pixels, independent of transform.
+const SEAM_PX = 1.5;
+function seamLineWidth(ctx) {
+  const t = ctx.getTransform();
+  return SEAM_PX / Math.hypot(t.a, t.b);
+}
+
+// A moon-phase crescent thinner than this (device pixels) is not drawn.
+const MIN_CRESCENT_PX = 1;
+
 function resizeCanvas() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
@@ -242,26 +257,13 @@ function findEllipseTangentPoint(ellipseCenter, radiusX, radiusY, ellipseRotatio
   // correct side (e.g. near-degenerate geometry where both real tangent
   // points sit on the wrong side), don't risk a wrong-side pick -- just
   // use the center of the visible arc instead.
+  // (A former safety cap #2 also clamped any candidate that overshot the
+  // arc's center into the far quarter. At extreme phases that overshoot is
+  // the genuine tangent, and clamping it skipped the inner wedge, leaving
+  // the crescent tail visible. The wedge now picks its pole from the
+  // external point's direction, so the overshoot is handled correctly.)
   if (!onCorrectSide(bestTangent)) {
     useCenterFallback();
-  } else {
-    // Safety cap #2: being on the correct HALF isn't enough -- it also
-    // needs to be on the correct QUARTER, i.e. between the center and
-    // whichever pole is nearest the external point, not the far pole.
-    // Compare each one's signed offset from the arc's center; if the
-    // candidate has overshot into the opposite quarter, clamp to center.
-    const signedOffset = (angle) => {
-      let d = angle - centerAngle;
-      while (d > Math.PI) d -= Math.PI * 2;
-      while (d < -Math.PI) d += Math.PI * 2;
-      return d;
-    };
-    const candidateOffset = signedOffset(bestTangent.angle);
-    const dirOffset = signedOffset(dirAngle);
-    const sign = (v) => (v > 1e-9 ? 1 : v < -1e-9 ? -1 : 0);
-    if (sign(candidateOffset) !== 0 && sign(dirOffset) !== 0 && sign(candidateOffset) !== sign(dirOffset)) {
-      useCenterFallback();
-    }
   }
 
   // Convert back to screen space
@@ -393,10 +395,24 @@ function centroidOfOtherNodes(mesh, sharedNodeId) {
 
 // Draws the split circle: colorA fills the side facing meshA, colorB
 // the side facing meshB, divided by the terminator ellipse.
-function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, colorA, colorB, separatorColor, strokeRange) {
+//
+// Layering: the whole disc is filled in the DOMINANT color first, then
+// the thin CRESCENT side (between the terminator and the rim) is drawn on
+// top. The crescent's antialiased edges always blend over solid color, so
+// the terminator needs no seam stroke. phase >= 0 -> crescent is colorB
+// on the +x side; phase < 0 -> crescent is colorA on the -x side.
+//
+// trim (optional, local coords): cuts the crescent's tail off at the
+// tangent line -- the crescent then runs far pole -> along the terminator
+// to the tangent point (trim.start/end/anticlockwise) -> straight along
+// the tangent line to trim.rimHit -> back along the rim to the far pole.
+// The tail beyond the line is simply left in the dominant color.
+function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, colorA, colorB, separatorColor, trim) {
   const r = screenRadius;
   const ex = Math.abs(phase) * r;
   const termCcw = phase >= 0;
+  const dominantColor = termCcw ? colorA : colorB;
+  const crescentColor = termCcw ? colorB : colorA;
 
   ctx.save();
   ctx.beginPath();
@@ -406,37 +422,33 @@ function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, c
   ctx.translate(screenCenter.x, screenCenter.y);
   ctx.rotate(azimuth);
 
-  // A's region: the -x half, bounded by the terminator ellipse.
-  ctx.fillStyle = colorA;
+  ctx.fillStyle = dominantColor;
   ctx.beginPath();
-  ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
-  ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, !termCcw);
-  ctx.closePath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
   ctx.fill();
 
-  // Stroke colorA's own boundary (in its own color) right after its fill
-  // and before colorB fills over it -- colorB's fill (drawn next) then
-  // naturally covers the half of this stroke on its own side, leaving no
-  // sub-pixel gap between the two separately-drawn fills. Only the FAR
-  // segment (from the far pole up to the tangent point) needs this -- the
-  // near segment gets separately handled/recolored by the inner wedge fix,
-  // so stop there if that range was provided by the caller.
-  const strokeStart = strokeRange ? strokeRange.start : -Math.PI / 2;
-  const strokeEnd = strokeRange ? strokeRange.end : Math.PI / 2;
-  const strokeAnticlockwise = strokeRange ? strokeRange.anticlockwise : !termCcw;
-  ctx.strokeStyle = '#ffff00'; // DIAGNOSTIC: bright yellow instead of colorA
-  ctx.lineWidth = 8;
-  ctx.beginPath();
-  ctx.ellipse(0, 0, ex, r, 0, strokeStart, strokeEnd, strokeAnticlockwise);
-  ctx.stroke();
-
-  // B's region: the +x half, bounded by the terminator ellipse.
-  ctx.fillStyle = colorB;
-  ctx.beginPath();
-  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
-  ctx.ellipse(0, 0, ex, r, 0, Math.PI / 2, -Math.PI / 2, termCcw);
-  ctx.closePath();
-  ctx.fill();
+  // When |phase| -> 1 the crescent shrinks below a pixel and antialiasing
+  // renders it as a slim hairline along the rim -- skip it below
+  // MIN_CRESCENT_PX, leaving the whole disc in the dominant color.
+  const t = ctx.getTransform();
+  if ((r - ex) * Math.hypot(t.a, t.b) >= MIN_CRESCENT_PX) {
+    ctx.fillStyle = crescentColor;
+    ctx.beginPath();
+    if (trim) {
+      const rimHitAngle = Math.atan2(trim.rimHit.y, trim.rimHit.x);
+      ctx.ellipse(0, 0, ex, r, 0, trim.start, trim.end, trim.anticlockwise);
+      ctx.lineTo(trim.rimHit.x, trim.rimHit.y);
+      ctx.arc(0, 0, r, rimHitAngle, trim.start, !trim.anticlockwise);
+    } else if (termCcw) {
+      ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
+      ctx.ellipse(0, 0, ex, r, 0, Math.PI / 2, -Math.PI / 2, true);
+    } else {
+      ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
+      ctx.ellipse(0, 0, ex, r, 0, -Math.PI / 2, Math.PI / 2, true);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
 
   // Separator stroke along the terminator ellipse -- minimum thickness
   // to cover the sub-pixel gap between the two filled halves. Color
@@ -450,15 +462,16 @@ function drawJointSplitCircle(ctx, screenCenter, screenRadius, azimuth, phase, c
 
   // Rim strokes: one per half in each mesh's own color, covering
   // the antialiased white edge at the circle's outer boundary.
-  ctx.strokeStyle = colorA;
-  ctx.beginPath();
-  ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
-  ctx.stroke();
-
-  ctx.strokeStyle = colorB;
-  ctx.beginPath();
-  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
-  ctx.stroke();
+  // -- Temporarily hidden.
+  // ctx.strokeStyle = colorA;
+  // ctx.beginPath();
+  // ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
+  // ctx.stroke();
+  //
+  // ctx.strokeStyle = colorB;
+  // ctx.beginPath();
+  // ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
+  // ctx.stroke();
 
   ctx.restore();
 }
@@ -530,7 +543,7 @@ function render() {
     return null;
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = GAP_DEBUG ? '#ff00ff' : '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   applyDesignSpaceTransform();
 
@@ -544,12 +557,14 @@ function render() {
   });
   const sharedNodeIds = new Set(Object.keys(owners).filter(id => owners[id].length >= 2).map(Number));
   
-  // Build a set of moon phase nodes (ANY owner is 2-node mesh)
+  // Build a set of moon phase nodes: a node shared by EXACTLY two meshes,
+  // BOTH of which are 2-node meshes. Every other shared node renders as a
+  // plain circle with the regular capsule logic.
   const moonPhaseNodeIds = new Set();
   Object.keys(owners).forEach(nodeIdStr => {
     const nodeId = Number(nodeIdStr);
     const ownerIds = owners[nodeId];
-    if (ownerIds.length >= 2 && ownerIds.some(meshId => meshes[meshId].nodeIds.length === 2)) {
+    if (ownerIds.length === 2 && ownerIds.every(meshId => meshes[meshId].nodeIds.length === 2)) {
       moonPhaseNodeIds.add(nodeId);
     }
   });
@@ -563,19 +578,8 @@ function render() {
   // Build a map to store moon phase node rendering data for red line drawing
   const moonPhaseNodeData = {};
 
-  Object.keys(owners).forEach(nodeIdStr => {
-    if (owners[nodeIdStr].length < 2) return;
-    const nodeId = Number(nodeIdStr);
+  moonPhaseNodeIds.forEach(nodeId => {
     const ownerIds = owners[nodeId];
-
-    // Check if ANY owner is a 2-node mesh
-    const hasAny2NodeOwner = ownerIds.some(meshId => meshes[meshId].nodeIds.length === 2);
-
-    // Only process moon phase if at least one owner is 2-node
-    if (!hasAny2NodeOwner) return;
-
-    // At least one 2-node owner - calculate moon phase data
-    if (ownerIds.length !== 2) return;  // Moon phase only works with 2 owners
 
     const p = projectedNodes[nodeId];
     const meshA = meshes[ownerIds[0]], meshB = meshes[ownerIds[1]];
@@ -724,13 +728,14 @@ function render() {
                     const validT = [t1, t2].find(t => t >= 0 && t <= 1);
                     if (validT !== undefined) {
                       const rimHit = { x: longestPt.x + dxseg * validT, y: longestPt.y + dyseg * validT };
-                      ctx.strokeStyle = color;
-                      ctx.lineWidth = 8;
-                      ctx.setLineDash([]);
-                      ctx.beginPath();
-                      ctx.moveTo(longestPt.x, longestPt.y);
-                      ctx.lineTo(rimHit.x, rimHit.y);
-                      ctx.stroke();
+                      // -- Temporarily hidden.
+                      // ctx.strokeStyle = color;
+                      // ctx.lineWidth = 8;
+                      // ctx.setLineDash([]);
+                      // ctx.beginPath();
+                      // ctx.moveTo(longestPt.x, longestPt.y);
+                      // ctx.lineTo(rimHit.x, rimHit.y);
+                      // ctx.stroke();
                     }
                   }
                 }
@@ -756,11 +761,7 @@ function render() {
     }
   });
 
-  // DIAGNOSTIC -- markers drawn unconditionally last, after the Fix-up
-  // pass, so nothing can cover them.
-  const diagnosticMarkers = [];
-
-  // Render moon phase nodes (2-node + any other mesh)
+  // Render moon phase nodes (shared by exactly two 2-node meshes)
   Object.keys(moonPhaseNodeData).forEach(nodeIdStr => {
     const nodeId = Number(nodeIdStr);
     const ownerIds = owners[nodeId];
@@ -773,16 +774,16 @@ function render() {
     const separatorColor = meshA.id < meshB.id ? meshA.color : meshB.color;
     const center = ellipseData.center, radius = ellipseData.radius;
 
-    // Compute the far-pole-to-tangent-point stroke range, using the same
-    // (first) debugTangentData entry the inner wedge fix will later use,
-    // so the far stroke and the near wedge line up at the same boundary.
-    let strokeRange = null;
+    // Compute the crescent trim (see drawJointSplitCircle) from the first
+    // debugTangentData entry for this node. Not applied in the capped
+    // fallback case, where the tangent point is only an approximation.
+    let trim = null;
     const entry = debugTangentData.find(d => d.longestPivotNodeId === nodeId);
     if (entry) {
       const { azimuth, phase } = ellipseData;
       const ex = Math.abs(phase) * radius;
       const tangentPoint = findEllipseTangentPoint(center, ex, radius, azimuth, phase, entry.longestPt);
-      if (tangentPoint) {
+      if (tangentPoint && !tangentPoint.capped) {
         const cosA = Math.cos(-azimuth), sinA = Math.sin(-azimuth);
         const dx = tangentPoint.x - center.x, dy = tangentPoint.y - center.y;
         const localX = dx * cosA - dy * sinA, localY = dx * sinA + dy * cosA;
@@ -805,24 +806,25 @@ function render() {
         let diff = angleT - farPole;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
-        strokeRange = { start: farPole, end: angleT, anticlockwise: diff < 0 };
-
-        // DIAGNOSTIC -- mark the computed far-pole (magenta) and
-        // tangent-point (cyan) stroke endpoints.
-        const farPoleLocal = { x: ex * Math.cos(farPole), y: radius * Math.sin(farPole) };
-        const cosB = Math.cos(azimuth), sinB = Math.sin(azimuth);
-        const farPoleScreen = {
-          x: center.x + farPoleLocal.x * cosB - farPoleLocal.y * sinB,
-          y: center.y + farPoleLocal.x * sinB + farPoleLocal.y * cosB,
-        };
-        diagnosticMarkers.push({ x: farPoleScreen.x, y: farPoleScreen.y, color: '#ff00ff' });
-        diagnosticMarkers.push({ x: tangentPoint.x, y: tangentPoint.y, color: '#00ffff' });
+        // Where the tangent line (tangent point -> longestPt) exits the rim:
+        // the tangent point is inside the circle and longestPt outside, so
+        // exactly one root lies in (0, 1].
+        const sx = localX2 - localX, sy = localY2 - localY;
+        const qa = sx * sx + sy * sy;
+        const qb = 2 * (localX * sx + localY * sy);
+        const qc = localX * localX + localY * localY - radius * radius;
+        const qDisc = qb * qb - 4 * qa * qc;
+        if (qa > 1e-9 && qDisc >= 0) {
+          const s = (-qb + Math.sqrt(qDisc)) / (2 * qa);
+          const rimHit = { x: localX + sx * s, y: localY + sy * s };
+          trim = { start: farPole, end: angleT, anticlockwise: diff < 0, rimHit };
+        }
       }
     }
 
     primitives.push({
       depth: sharedDepth,
-      draw: () => drawJointSplitCircle(ctx, center, radius, ellipseData.azimuth, ellipseData.phase, meshA.color, meshB.color, separatorColor, strokeRange)
+      draw: () => drawJointSplitCircle(ctx, center, radius, ellipseData.azimuth, ellipseData.phase, meshA.color, meshB.color, separatorColor, trim)
     });
   });
 
@@ -837,11 +839,7 @@ function render() {
   //
   // The OUTER wedge is inherently per-mesh (each mesh patches its own
   // segment with the other's color -- these don't conflict since they're
-  // different lines/colors), so every entry gets one. The INNER (crescent
-  // tip) wedge, however, is a node-level correction -- applying it once
-  // per owning mesh stacks two overlapping fills on top of each other, so
-  // that part alone is only done once per node.
-  const innerWedgeDone = new Set();
+  // different lines/colors), so every entry gets one.
 
   debugTangentData.forEach(({ longestPt, longestRim, longestTangentRim, longestPivotNodeId, meshId }) => {
     const ellipseData = moonPhaseNodeData[longestPivotNodeId];
@@ -853,9 +851,7 @@ function render() {
 
     // rimHit (where the red line crosses the rim) and the outer wedge only
     // depend on where the line crosses the rim, which stays well-defined
-    // even in the capped edge case -- so they should always apply. Only
-    // the INNER (phase/crescent tip) wedge has the "carve out a huge
-    // chunk" problem at the cap, so that part alone is skipped there.
+    // even in the capped edge case -- so they always apply.
     if (tangentPoint) {
       // --- Find where the red line (longestPt -> tangentPoint) crosses
       // the OUTER rim circle (it must cross exactly once, since longestPt
@@ -886,28 +882,7 @@ function render() {
           return { x: dx * cosA - dy * sinA, y: dx * sinA + dy * cosA };
         };
         const localRimHit = toLocal(rimHit);
-        const localTangent = toLocal(tangentPoint);
         const rimHitAngle = Math.atan2(localRimHit.y, localRimHit.x);
-        const angleT = Math.atan2(localTangent.y / r, localTangent.x / Math.max(ex, 1e-4));
-
-        const angularDist = (p, q) => {
-          let d = p - q;
-          while (d > Math.PI) d -= Math.PI * 2;
-          while (d < -Math.PI) d += Math.PI * 2;
-          return Math.abs(d);
-        };
-        // The tip is bounded by whichever pole (always at local ±90°) is
-        // nearest to the tangent point.
-        const poleAngle = angularDist(angleT, Math.PI / 2) <= angularDist(angleT, -Math.PI / 2)
-          ? Math.PI / 2 : -Math.PI / 2;
-
-        // Whichever color currently occupies that sliver (based on the
-        // standard colorA/colorB angular split) gets swapped to the other.
-        let normRim = rimHitAngle;
-        while (normRim < 0) normRim += Math.PI * 2;
-        while (normRim >= Math.PI * 2) normRim -= Math.PI * 2;
-        const inColorARange = normRim >= Math.PI / 2 && normRim <= (3 * Math.PI / 2);
-        const otherColor = inColorARange ? colorB : colorA;
 
         const shortArcParams = (startAngle, endAngle) => {
           let diff = endAngle - startAngle;
@@ -940,36 +915,30 @@ function render() {
           ctx.lineTo(localRimHit.x, localRimHit.y);
           ctx.arc(0, 0, r, rimHitAngle, tangentRimAngle, outerRimSweep.anticlockwise);
           ctx.closePath();
-          ctx.fillStyle = '#00ff00'; // DIAGNOSTIC: bright green instead of otherColorOuter
+          ctx.fillStyle = otherColorOuter;
           ctx.fill();
+
+          // Seam strokes along the wedge edges that border its own color:
+          // the old capsule edge (meets the other mesh's capsule) and the
+          // rim arc (meets the node circle). The red-line edge is left
+          // alone -- the wedge sits over solid capsule color there.
+          ctx.strokeStyle = otherColorOuter;
+          ctx.lineWidth = seamLineWidth(ctx);
+          ctx.beginPath();
+          ctx.moveTo(localTangentRim.x, localTangentRim.y);
+          ctx.lineTo(localLongestPt.x, localLongestPt.y);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(0, 0, r, rimHitAngle, tangentRimAngle, outerRimSweep.anticlockwise);
+          ctx.stroke();
         }
 
-        ctx.beginPath();
-        ctx.moveTo(localRimHit.x, localRimHit.y);
-        const rimSweep = shortArcParams(rimHitAngle, poleAngle);
-        ctx.arc(0, 0, r, rimHitAngle, poleAngle, rimSweep.anticlockwise);
-        const termSweep = shortArcParams(poleAngle, angleT);
-        ctx.ellipse(0, 0, ex, r, 0, poleAngle, angleT, termSweep.anticlockwise);
-        ctx.closePath();
-        // The inner (phase/crescent) wedge is the one that carves out a
-        // huge chunk at the capped edge case -- skip only this part there.
-        // Also a node-level fix (see comment above), so only do it once.
-        if (!tangentPoint.capped && !innerWedgeDone.has(longestPivotNodeId)) {
-          innerWedgeDone.add(longestPivotNodeId);
-          ctx.fillStyle = '#ff8800'; // DIAGNOSTIC: bright orange-red instead of otherColor
-          ctx.fill();
-        }
+        // (The crescent's tail beyond the tangent line -- formerly an inner
+        // wedge patched on top here -- is now trimmed directly inside
+        // drawJointSplitCircle, so it never gets drawn in the first place.)
         ctx.restore();
       }
     }
-  });
-
-  // DIAGNOSTIC -- draw markers now, unconditionally last
-  diagnosticMarkers.forEach(m => {
-    ctx.fillStyle = m.color;
-    ctx.beginPath();
-    ctx.arc(m.x, m.y, 6, 0, Math.PI * 2);
-    ctx.fill();
   });
 
   // DEBUG -- Black outlines (temporarily disabled)
@@ -986,54 +955,17 @@ function render() {
 // ---------------------------------------------------------
 // EXAMPLE SCENE
 // ---------------------------------------------------------
-// Quadrant 1 (top-left): the MINIMAL shared-node case -- two 2-node
-// meshes (two "lines") sharing the middle node, forming a V shape.
-const q1x = DESIGN_WIDTH * 0.25, q1y = DESIGN_HEIGHT * 0.25;
-const jointNode = createNode({ x: q1x, y: q1y }, 35);
-const blueEnd = createNode({ x: q1x - 110, y: q1y - 100 }, 30);
+// The MINIMAL shared-node case -- two 2-node meshes (two "lines")
+// sharing the middle node, forming a V shape. Scaled up 2x and
+// centered in the design space (the V's bounding box is centered,
+// so the joint sits below center and the ends above it).
+const S = 2; // scale factor
+const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2 + 50 * S;
+const jointNode = createNode({ x: cx, y: cy }, 35 * S);
+const blueEnd = createNode({ x: cx - 110 * S, y: cy - 100 * S }, 30 * S);
 createMesh([blueEnd, jointNode], '#4fc3f7'); // blue line
-const orangeEnd = createNode({ x: q1x + 110, y: q1y - 100, z: 40 }, 25);
+const orangeEnd = createNode({ x: cx + 110 * S, y: cy - 100 * S, z: 40 * S }, 25 * S);
 createMesh([jointNode, orangeEnd], '#ff8a65'); // orange line
-
-// Quadrant 2 (top-right): a 3-node triangle, order deliberately scrambled
-const q2x = DESIGN_WIDTH * 0.75, q2y = DESIGN_HEIGHT * 0.25;
-const b1 = createNode({ x: q2x, y: q2y - 100 }, 50);
-const b2 = createNode({ x: q2x + 120, y: q2y + 80 }, 35);
-const b3 = createNode({ x: q2x - 120, y: q2y + 60 }, 40);
-createMesh([b3, b1, b2], '#ff8a65');
-
-// Quadrant 3 (bottom-left): 4 nodes, one deliberately enclosed inside
-// the hull of the other three -- demonstrates it's excluded from the
-// hull outline but still connects via the all-pairs capsules.
-const q3x = DESIGN_WIDTH * 0.25, q3y = DESIGN_HEIGHT * 0.75;
-const c1n = createNode({ x: q3x - 130, y: q3y - 100 }, 45);
-const c2n = createNode({ x: q3x + 130, y: q3y - 100 }, 45);
-const c3n = createNode({ x: q3x, y: q3y + 120 }, 45);
-const c4n = createNode({ x: q3x, y: q3y - 20 }, 20); // enclosed
-createMesh([c1n, c2n, c3n, c4n], '#a5d6a7');
-
-// A purple 2-node mesh sharing c2n with the green blob above
-const purpleEnd = createNode({ x: q3x + 280, y: q3y - 80 }, 30);
-createMesh([c2n, purpleEnd], '#ce93d8');
-
-// Quadrant 4 (bottom-right): 6 nodes in an irregular, free-form
-// arrangement -- a bigger, more organic-looking blob. Two nodes are
-// given non-zero z to demonstrate perspective scaling: d2 sits closer
-// to the viewer (z>0, renders bigger than its stored radius), d5
-// sits farther away (z<0, renders smaller).
-const q4x = DESIGN_WIDTH * 0.75, q4y = DESIGN_HEIGHT * 0.75;
-const d1 = createNode({ x: q4x - 150, y: q4y - 60 }, 40);
-const d2 = createNode({ x: q4x - 60, y: q4y - 130, z: 200 }, 55);
-const d3 = createNode({ x: q4x + 90, y: q4y - 100 }, 30);
-const d4 = createNode({ x: q4x + 150, y: q4y + 40 }, 45);
-const d5 = createNode({ x: q4x + 30, y: q4y + 140, z: -200 }, 35);
-const d6 = createNode({ x: q4x - 110, y: q4y + 90 }, 25);
-createMesh([d1, d2, d3, d4, d5, d6], '#ce93d8');
-
-// A new green mesh sharing d1 with the purple mesh above
-const e1 = createNode({ x: q4x - 260, y: q4y + 60 }, 30);
-const e2 = createNode({ x: q4x - 200, y: q4y + 180 }, 25);
-createMesh([d1, e1, e2], '#a5d6a7');
 
 // ---------------------------------------------------------
 // ANIMATION LOOP
