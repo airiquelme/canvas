@@ -1,5 +1,6 @@
 // Entry point: canvas setup, UI buttons, animation loop. See CLAUDE.md.
 import { camera } from './camera.js';
+import { debug } from './config.js';
 import { buildDemoScene } from './scene.js';
 import { render } from './render.js';
 
@@ -39,6 +40,16 @@ if (themeBtn) {
     themeBtn.textContent = darkMode ? 'Light mode' : 'Dark mode';
     document.body.style.background = darkMode ? '#000000' : '#ffffff';
     canvas.style.background = darkMode ? '#000000' : '#ffffff';
+    drawFrame();
+  });
+}
+
+const debugBtn = document.getElementById('debugBtn');
+if (debugBtn) {
+  debugBtn.addEventListener('click', () => {
+    debug.on = !debug.on;
+    debugBtn.textContent = debug.on ? 'Debug: on' : 'Debug: off';
+    debugBtn.style.background = debug.on ? '#b71c1c' : '#333';
     drawFrame();
   });
 }

@@ -9,6 +9,7 @@ export const camera = {
   orbitAngle: 0,
   height: 0, // world-y offset from the target
   fov: Math.PI / 3,
+  zoom: 1, // magnifies everything about the screen center
 };
 
 export function getCameraPosition() {
@@ -38,7 +39,7 @@ export function worldToCamera(point, camPos, basis) {
 export function projectToScreen(camSpace, fov, refDistance, screenCenter) {
   const focalLength = 1 / Math.tan(fov / 2);
   const screenScale = refDistance * Math.tan(fov / 2);
-  const scale = (focalLength * screenScale) / camSpace.z;
+  const scale = (focalLength * screenScale) / camSpace.z * camera.zoom;
   return {
     x: screenCenter.x + camSpace.x * scale,
     y: screenCenter.y - camSpace.y * scale,

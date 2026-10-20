@@ -12,6 +12,81 @@ export function wrapAngle(a) {
   return a;
 }
 
+// ---------------------------------------------------------
+// 3D SIGNED DISTANCES (negative inside) and root finding
+// ---------------------------------------------------------
+
+export function sdfSphere(p, c, r) {
+  return Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z) - r;
+}
+
+// Cone frustum (capsule) from sphere (a, ra) to sphere (b, rb). Not an
+// exact distance, but the sign is right, which is all the roots need.
+export function sdfFrustum(p, a, ra, b, rb) {
+  const ab = vecSub(b, a), ap = vecSub(p, a);
+  const t = Math.min(1, Math.max(0, vecDot(ap, ab) / (vecDot(ab, ab) || 1)));
+  return Math.hypot(ap.x - ab.x * t, ap.y - ab.y * t, ap.z - ab.z * t) - (ra + (rb - ra) * t);
+}
+
+// Outward face planes { n, p, idx } of the convex hull of 3D points; empty when
+// they are all coplanar (no volume).
+export function hullPlanes(pts) {
+  const planes = [];
+  for (let i = 0; i < pts.length; i++) for (let j = i + 1; j < pts.length; j++) for (let k = j + 1; k < pts.length; k++) {
+    const n = vecCross(vecSub(pts[j], pts[i]), vecSub(pts[k], pts[i]));
+    if (Math.hypot(n.x, n.y, n.z) < 1e-9) continue;
+    const nn = vecNormalize(n);
+    let pos = false, neg = false;
+    pts.forEach(q => {
+      const d = vecDot(nn, vecSub(q, pts[i]));
+      if (d > 1e-6) pos = true; else if (d < -1e-6) neg = true;
+    });
+    if (pos && neg) continue;
+    if (!pos && !neg) return [];
+    planes.push({ n: pos ? { x: -nn.x, y: -nn.y, z: -nn.z } : nn, p: pts[i], idx: [i, j, k] });
+  }
+  return planes;
+}
+
+// The visible flat face of three spheres: the plane tangent to all three on
+// the outward side of `outN` (the centers' face normal). Returns { n, p, tri }
+// (tri = the three contact points), or null when no tangent plane exists.
+export function sphereFace(centers, radii, outN) {
+  const e1 = vecSub(centers[1], centers[0]), e2 = vecSub(centers[2], centers[0]);
+  const r1 = radii[0] - radii[1], r2 = radii[0] - radii[2];
+  const a11 = vecDot(e1, e1), a12 = vecDot(e1, e2), a22 = vecDot(e2, e2);
+  const det = a11 * a22 - a12 * a12;
+  if (Math.abs(det) < 1e-12) return null;
+  const a = (r1 * a22 - r2 * a12) / det, b = (r2 * a11 - r1 * a12) / det;
+  const w = { x: a * e1.x + b * e2.x, y: a * e1.y + b * e2.y, z: a * e1.z + b * e2.z };
+  const w2 = vecDot(w, w);
+  if (w2 >= 1) return null;
+  const h = Math.sqrt(1 - w2);
+  const n = { x: w.x + h * outN.x, y: w.y + h * outN.y, z: w.z + h * outN.z };
+  const at = (c, r) => ({ x: c.x + r * n.x, y: c.y + r * n.y, z: c.z + r * n.z });
+  return { n, p: at(centers[0], radii[0]), tri: centers.map((c, i) => at(c, radii[i])) };
+}
+
+// Is p (on the face's plane) inside the face triangle?
+export function pointInTriangle(p, [a, b, c]) {
+  const n = vecCross(vecSub(b, a), vecSub(c, a));
+  return [[a, b], [b, c], [c, a]].every(([u, v]) => vecDot(vecCross(vecSub(v, u), vecSub(p, u)), n) >= 0);
+}
+
+export function insideHull(planes, p) {
+  return planes.length > 0 && planes.every(({ n, p: q }) => vecDot(n, vecSub(p, q)) < 0);
+}
+
+// A root of f in [lo, hi], given f(lo) and f(hi) differ in sign.
+export function bisectRoot(f, lo, hi, iters = 24) {
+  const loNeg = f(lo) < 0;
+  for (let i = 0; i < iters; i++) {
+    const mid = (lo + hi) / 2;
+    if ((f(mid) < 0) === loNeg) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
 export function circleRimPoint(center, radius, angle) {
   return { x: center.x + radius * Math.cos(angle), y: center.y + radius * Math.sin(angle) };
 }
@@ -218,10 +293,21 @@ function ellipseTangentCandidatesLocal(radiusX, radiusY, localX, localY) {
   ];
 }
 
-// The tangent point on the terminator ellipse's visible half (local x > 0
-// for phase >= 0, x < 0 otherwise) nearest the external point's direction.
-// When no candidate is on that half, returns the half's center with
-// capped: true -- a fallback, not a real tangent (see CLAUDE.md).
+// The tangent point where the seam line touches the terminator ellipse. Always
+// a true tangent point (the line touches the ellipse and never enters it),
+// except in a narrow window of thin ellipses described below.
+//  - Only the half of the ellipse on the crescent's side (local x >= 0 for
+//    phase >= 0, x <= 0 otherwise) is a boundary between the joint's two
+//    colors, so a wide ellipse takes the tangent on that half nearest the
+//    external point (if both touch the hidden half: the pole it faces).
+//  - A collapsed ellipse is a line, and its two halves coincide. Taking the
+//    visible half's tangent then flips with the sign of the phase, and can be
+//    the far end of the line on one side of the swap and the near end on the
+//    other. So for a thin ellipse the nearest tangent is taken, on either
+//    side: the point moves toward the external point as the ellipse collapses
+//    and back out after the swap. The two choices are blended along the
+//    ellipse while its half-width goes from 0.02 to 0.08 of its height (a few
+//    pixels, so the blend is barely off the tangent).
 export function findEllipseTangentPoint(ellipseCenter, radiusX, radiusY, ellipseRotation, phase, externalPoint) {
   const dx = externalPoint.x - ellipseCenter.x;
   const dy = externalPoint.y - ellipseCenter.y;
@@ -234,27 +320,31 @@ export function findEllipseTangentPoint(ellipseCenter, radiusX, radiusY, ellipse
   if (candidates.length === 0) return null;
 
   const wantsPositiveSide = phase >= 0;
-  const onCorrectSide = (c) => (c.x >= 0) === wantsPositiveSide;
   const angularDist = (p, q) => Math.abs(wrapAngle(p - q));
   const dirAngle = Math.atan2(localY, localX);
+  const closest = (list) => list.reduce((best, curr) =>
+    angularDist(curr.angle, dirAngle) < angularDist(best.angle, dirAngle) ? curr : best);
 
-  const sideCandidates = candidates.filter(onCorrectSide);
-  const pool = sideCandidates.length > 0 ? sideCandidates : candidates;
-  let bestTangent = pool.reduce((best, curr) =>
-    angularDist(curr.angle, dirAngle) < angularDist(best.angle, dirAngle) ? curr : best
-  );
+  const nearSign = localY >= 0 ? 1 : -1; // which pole the external point faces
+  const distToPoint = (c) => Math.hypot(c.x - localX, c.y - localY);
+  const nearest = candidates.reduce((best, c) => distToPoint(c) < distToPoint(best) ? c : best);
+  const visible = candidates.filter((c) => wantsPositiveSide ? c.x >= 0 : c.x <= 0);
+  const onVisibleHalf = visible.length > 0
+    ? closest(visible)
+    : { x: 0, y: nearSign * radiusY, angle: nearSign * Math.PI / 2 };
 
-  let capped = false;
-  if (!onCorrectSide(bestTangent)) {
-    const a = Math.max(radiusX, 1e-4);
-    const centerAngle = wantsPositiveSide ? 0 : Math.PI;
-    bestTangent = { x: a * Math.cos(centerAngle), y: radiusY * Math.sin(centerAngle), angle: centerAngle };
-    capped = true;
+  const width = radiusX / radiusY; // 1 for a full circle, 0 for a line
+  const t = Math.min(1, Math.max(0, (width - 0.02) / (0.08 - 0.02)));
+  const weight = t * t * (3 - 2 * t); // 0: nearest tangent, 1: visible half's
+  let bestTangent = onVisibleHalf;
+  if (weight < 1) {
+    const angle = nearest.angle + wrapAngle(onVisibleHalf.angle - nearest.angle) * weight;
+    bestTangent = { x: Math.max(radiusX, 1e-4) * Math.cos(angle), y: radiusY * Math.sin(angle) };
   }
 
   const cos_rot_back = Math.cos(ellipseRotation);
   const sin_rot_back = Math.sin(ellipseRotation);
   const screenX = ellipseCenter.x + (bestTangent.x * cos_rot_back - bestTangent.y * sin_rot_back);
   const screenY = ellipseCenter.y + (bestTangent.x * sin_rot_back + bestTangent.y * cos_rot_back);
-  return { x: screenX, y: screenY, capped };
+  return { x: screenX, y: screenY };
 }

@@ -41,4 +41,20 @@ export function buildDemoScene() {
   // ...and a 2-node mesh sharing its apex (split cone).
   const purpleEnd = createNode({ x: px + 30, y: py - 200, z: -110 }, 22);
   createMesh([pyrApex, purpleEnd], '#ce93d8');
+
+  // A bridge between the closest pair of nodes, one from the pyramid and one
+  // from the other 2-node meshes: a joint at its 2-node end, a split cone at
+  // the pyramid end.
+  const pyramidIds = [...pyrBase, pyrApex];
+  const otherIds = [blueEnd, jointNode, orangeEnd, purpleEnd];
+  const dist = (a, b) => Math.hypot(nodes[a].center.x - nodes[b].center.x, nodes[a].center.y - nodes[b].center.y, nodes[a].center.z - nodes[b].center.z);
+  let bridge = null;
+  const linked = (a, b) => Object.values(meshes).some(m => m.nodeIds.includes(a) && m.nodeIds.includes(b));
+  otherIds.forEach(o => pyramidIds.forEach(p => {
+    if (!linked(o, p) && (!bridge || dist(o, p) < bridge.d)) bridge = { o, p, d: dist(o, p) };
+  }));
+  createMesh([bridge.o, bridge.p], '#fff176');
+
+  // The split-cone figure, for the debug view to center on.
+  return [...pyrBase, pyrApex, purpleEnd];
 }
