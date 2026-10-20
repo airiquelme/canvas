@@ -12,7 +12,7 @@ http://localhost:8000. The page uses ES modules, so opening the file directly
 ## Modules
 | File | Contents |
 |---|---|
-| `config.js` | Design size, `debug` state, `SEAM_PX`, `MIN_CRESCENT_PX` |
+| `config.js` | Design size, `debug` state, `SEAM_PX`, split-cone strip settings |
 | `geometry.js` | Pure math: vectors, angles, capsule tangents, hulls, segment/circle hits, 3D signed distances and root finding |
 | `camera.js` | Orbit camera, view basis, projection (`makeProjector`) |
 | `scene.js` | `nodes` / `meshes` stores, `createNode` / `createMesh`, the demo scene |
@@ -21,7 +21,6 @@ http://localhost:8000. The page uses ES modules, so opening the file directly
 | `splitRing.js` | Split cone geometry in 3D: tangent cone, host solid SDF, `findSplitRing` |
 | `jointCurve.js` | Real 3D split of a joint: touch points and the planar joint ring (cone/cone intersection + back circle) |
 | `jointSplit.js` | Screen-space terminator from the ring (visible part, clipped to the node circle) |
-| `jointDebug.js` | Debug button's joint overlay: the ring's touch points, intersection curve and back circle |
 | `coneDebug.js` | Debug button's cone overlay: split cone ∩ host mesh curves |
 | `main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
 
@@ -43,30 +42,95 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
 - **Joint ring** (`jointCurve.js`, `jointSplit.js`). Each cone of a joint is the
   tangent hull of the node sphere and its far sphere, so it touches the sphere
   along a circle (`u . axis = sinT`). The two circles meet at the **touch
-  points**, where the cones touch each other. The color split is one closed
-  **planar ring**: every point lies in a single plane through the node's center.
-  - *front*: the cones' real intersection curve, touch point to touch point
-    (found by marching cone A's generatrices against cone B's sdf; it stays
-    within ~1.1-1.3 radii of the node), moved into the plane;
-  - *back*: the circle where that plane cuts the sphere, from touch point to
-    touch point around the exposed back (through `M = -(dA + dB)`, the point
-    farthest from both cones);
-  - the plane is the least-squares plane through the center fitted to the
-    intersection curve, with the touch points weighted so the ring starts at
-    them. The intersection is exactly planar only for equal cones: here it is
-    off its best plane by 3.9% (blue/orange) and 8.9% (orange/yellow, unequal
-    radii) of the radius, so the planar ring stays within ~1-2% of the radius of
-    both cone surfaces. Two independently built curves (a circle through the
-    touch points, and the intersection) are NOT coplanar: the circle's plane was
-    5 degrees off at orange/yellow, and through two nearly opposite touch points
-    (small `sinT`) it is undetermined and came out rotated 90 degrees;
+  points**, where the cones touch each other. The color split is one closed ring
+  through them, **in a single plane**:
+  - two cones tangent to the same sphere intersect in plane conics (Monge), and
+    the plane contains both touch points. It does NOT pass through the node
+    center unless the cones are equal (3.2% / 8.7% of the radius off at the two
+    demo joints); forcing it through the center is what made the ring non-planar
+    before. The plane is exact, not fitted: a cone tangent to the sphere
+    S = |X-c|^2 - r^2 along the circle L = (X-c).axis - r sinT = 0 satisfies
+    S = k L^2 (k constant), so the intersection S = kA LA^2 = kB LB^2 is the pair of
+    planes sqrt(kA) LA = +-sqrt(kB) LB. The one that separates the cones (their far
+    centers on opposite sides) is the ring's. An earlier fit to marched points swung
+    the plane by ~30 degrees for a single frame whenever the marched set changed by
+    a few points, and the back arc with it;
+  - *front*: the intersection, touch point to touch point, in closed form: each
+    generatrix of cone A meets the ring's plane at one point, and those beyond the
+    tangent circle, within cone A and on cone B's frustum form the ring (within
+    ~1.1-1.3 radii of the node); it ends exactly at the touch points. Computed in
+    the flat solid below, recomputed each frame. Marching A's generatrices out of
+    B's sdf instead (and taking the longest run) flipped to the other crossing conic
+    for single frames when the two were almost equally long (the ring went off
+    course, e.g. at 2.904 in the focus view) and lost its ends near the touch points;
+  - *back*: where that plane cuts the sphere (a circle through both touch
+    points), the stretch around the exposed back (toward `M = -(dA + dB)`);
   - no touch points (arms far apart): the bisector great circle only.
+  **Flat solid** (`flatView`, `computeJoints` in `render.js`). The renderer draws
+  nodes as flat circles at their own projected radius and cones as the hull of two
+  such circles, so the ring is computed in exactly that solid: every node is a
+  sphere at (projected x, projected y, z = -depth * the joint node's px per world
+  unit) with its projected radius, and the camera looks along -z orthographically.
+  The orthographic silhouette of the cones there IS the flat capsules and the
+  cone edges (the common tangents of the flat circles), so the ring matches them to the pixel: the back arc stays
+  inside the disc (never beyond the rim), the touch points are on the rim, the
+  intersection stays within ~0.01 px of every cone outline, and a
+  planar ring projects to an exact ellipse. Earlier attempts projected a 3D ring
+  in perspective (even with an affine fit to the disc) or blended a billboard
+  projection with perspective; none could agree with the flat shapes, leaving a
+  bump at the rim and a twist. Trade-off: the curve is recomputed every frame
+  (~0.25 ms per joint), not one fixed 3D curve; it differs from the true 3D one by a
+  few percent of the radius. Views where no ring point faces the camera (an arm
+  pointing at it) give a plain disc.
   Only the part of the ring that faces the camera separates the colors (a
   crease point must face on both cones), so `projectJointSplit` takes the
   longest visible run, clips it to the node circle, and closes the dominant
   region with the rim arc on the dominant mesh's side (the side of the
-  terminator that holds that mesh's far node). With no usable run (e.g. one arm
-  points straight at the camera, phase ~ +-1) the disc is the dominant color.
+  terminator that holds that mesh's far node). With no usable run the disc is the
+  dominant color. The crescent is drawn at any thickness (below a pixel it
+  antialiases to partial coverage and fades in as the ring leaves the rim; the
+  dominant region's underlap is clamped to half the crescent so it can't spill
+  over the rim). A cutoff at 1 px made a whole 1 px crescent appear at once.
+  **Cone bodies stop at the ring.** The ring's plane separates the two cones, so
+  the cone on the camera's side of it is the *front* one (`frontIsA` in
+  `computeJoints`; this also picks the disc's dominant color). Each cone is drawn
+  in its own color as the convex hull (`drawAtJoints`) of its other end's circle
+  and, at the joint, the two points where its edges STOP: where the edge touches
+  the ring (the contact point, `edgeContacts`, exact) or, if it doesn't, where it meets
+  the node's circle. Each edge ends exactly at its stop (any extra hull point, e.g.
+  the node's rim, makes the hull join the stop to it with a chord that runs on past
+  it as a thin tail). The hull's closing chord between the two stops is routed
+  through a point inside both the ring and the node circle (`joint.inner`, the
+  touch points' midpoint), so the closing path lies entirely in what is cut out
+  next. Two things are then cut out of that hull to get the body's outline
+  (`drawJointBody`):
+  - the joint's flat node circle (`subtractDisc`, `geometry.js`: the boundary
+    outside it plus the circle's own arc, pulled in by the seam underlap so the
+    body still reaches under the disc's antialiased rim); the joint disc draws
+    that area;
+  - the ring's projected interior (`subtractPolygon`, `geometry.js`: the boundary
+    outside it plus the ring's own boundary). For the back cone the cut is
+    inset by the seam underlap, so it reaches under the front cone's edge along
+    the ring (rule 1).
+  This applies to every cone arriving at a joint, including a split cone whose far
+  end is a joint: its own part (split ring to joint) takes the same body, with the
+  split ring's circle in place of the other end (`drawAtJoints` in `render.js`).
+  The split ring is projected in perspective but the joint works in the flat model
+  (its edges are the tangents of the flat circles), so the ring's points are first
+  clamped into the flat capsule and given a copy on each flat tangent line
+  (`alignToFlatCone`); otherwise the hull's edge to the contact is slightly off the
+  line and runs past the contact as a thin tail. The exact edge/ring contacts are
+  hull points too, so the outline leaves each edge at its contact.
+  So the outline follows the ring where the ring leaves the node, the flat rim
+  elsewhere, and the cone edges to where they touch either. The front cone also
+  fills the ring's interior (minus the node disc), in the same path as its body
+  (one nonzero fill, rule 3). That interior is the lens where the two cones
+  overlap past the disc, and it lies inside the front mesh's silhouette. The back
+  cone and the disc are drawn under it; `orderJointBodies` makes sure the front
+  body sorts after the back one, split cones included (a split cone keeps its
+  layered key, so the other body moves to the right side of it). Without that the
+  two bodies, which also overlap a little outside the ring, could paint in the
+  wrong order for some angles. No cuts, clips or chords are needed.
   This replaced an older design: a phase-based terminator ellipse, with a seam
   line from the capsules' edge crossing tangent to it driving a capsule cut, a
   seam band and a crescent trim. That needed constant patching of the tangent
@@ -114,7 +178,7 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
    edges. Strokes or patches drawn on top create visible steps.
 2. **A joint's dominant region reaches under the crescent's inner edge, not its
    rim.** The crescent's AA edge then blends over solid color, and the rim isn't
-   drawn twice (rule 3).
+   drawn twice (rule 3). The reach is at most half the crescent.
 3. **Same-color coincident edges bulge.** Two AA edges on the same outline
    stack (`1-(1-α)^n`), so the outline looks thicker and darker. Trace the
    pieces into one path and fill once, and don't refill circles that a cap
@@ -129,8 +193,6 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
 - Shared nodes involving 3+ node meshes, beyond the split cone, aren't
   handled. Joints are limited to exactly two 2-node meshes (`findJointNodeIds`).
 - Only the first shared node of a 2-node mesh is split.
-- The joint ring is planar: for cones of unequal radius it is an approximation of
-  their intersection (see "Joint ring").
 - Batching only merges *consecutive* same-mesh primitives in depth order.
 - `projectToScreen` flips world y: larger y appears higher on screen.
 
@@ -143,8 +205,8 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
 
 ## Debugging
 - The **Debug** button turns all the debug views on and off together
-  (`debug.on` in `config.js`, off at load; `debug.gap` / `cone` / `joint`
-  choose which views it shows):
+  (`debug.on` in `config.js`, off at load; `debug.gap` / `cone` choose which
+  views it shows):
   - gap: paints the background magenta, which makes seam gaps show up;
   - cone (`coneDebug.js`): draws, on top of the frame, where each split cone's
     surface meets its host mesh in 3D (root-found along the cone's
@@ -153,10 +215,12 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
     capsules, red = cone ∩ the host's flat faces (planes tangent to three
     spheres), pink = cone ∩ other host spheres. Dotted = buried in the host;
     otherwise solid = near side of the cone, dashed = far side;
-  - joint (`jointDebug.js`): at each moon-phase joint, the ring that splits its
-    colors: touch points (magenta dots), the cones' intersection curve (cyan) and
-    the circle across the back (green); solid where it faces the camera, dashed
-    where it faces away. The phase is printed under the joint.
+- The **Angle** slider at the bottom picks the camera's orbit angle (it pauses the
+  orbit; while it runs the slider follows it). Use its value to report an angle.
+- The **Focus** button (`focus` in `config.js`, off at load) draws only the meshes
+  with the listed colors (orange and yellow), centers the camera on one joint and
+  magnifies it, to inspect a joint closely. Everything is still computed with all
+  the meshes.
 - The **Dark mode** button swaps the background between white and black.
   Light gaps show on black, dark ones on white.
 - The browser can't be seen from Claude Code. Geometry is verified with

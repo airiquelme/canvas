@@ -9,7 +9,7 @@ export const camera = {
   orbitAngle: 0,
   height: 0, // world-y offset from the target
   fov: Math.PI / 3,
-  zoom: 1, // magnifies everything about the screen center
+  zoom: 1.7, // magnifies everything about the screen center
 };
 
 export function getCameraPosition() {

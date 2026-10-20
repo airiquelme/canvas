@@ -31,12 +31,9 @@ function longestCyclicRun(flags, weight) {
   return best && best.idx;
 }
 
-// curve: buildJointCurve's result; center / radius: the projected node circle;
-// view: { camPos, projectPoint }; dominantFar: screen center of the dominant
-// mesh's far node (it tells which side of the terminator is dominant).
-// Returns { terminator: [{x, y}], th0, th1, domIncreasing, span } or null when
-// the curve gives no usable split (the caller falls back to the ellipse).
-export function projectJointSplit(curve, center, radius, view, dominantFar) {
+// The ring's points on screen with whether each faces the camera, and the
+// longest visible run of them as screen points (null when there is none).
+function visibleRun(curve, view) {
   let loop = curve.loop;
   if (loop.length > 2) {
     const a = loop[0].p, b = loop[loop.length - 1].p;
@@ -44,12 +41,21 @@ export function projectJointSplit(curve, center, radius, view, dominantFar) {
   }
   const pts = loop.map(q => {
     const s = view.projectPoint(q.p);
-    return { x: s.x, y: s.y, facing: facesCamera(q, view.camPos) };
+    return { x: s.x, y: s.y, facing: facesCamera(q, view.viewDirAt(q.p)) };
   });
   const segLen = (i) => Math.hypot(pts[(i + 1) % pts.length].x - pts[i].x, pts[(i + 1) % pts.length].y - pts[i].y);
   const run = longestCyclicRun(pts.map(q => q.facing), segLen);
-  if (!run || run.length < 2) return null;
-  const T = run.map(i => pts[i]);
+  return run && run.length >= 2 ? run.map(i => pts[i]) : null;
+}
+
+// curve: buildJointCurve's result; center / radius: the projected node circle;
+// view: { viewDirAt, projectPoint } (render.js flatView); dominantFar: screen center of the dominant
+// mesh's far node (it tells which side of the terminator is dominant).
+// Returns { terminator: [{x, y}], th0, th1, domIncreasing, span } or null when
+// the curve gives no usable split (the caller falls back to one color).
+export function projectJointSplit(curve, center, radius, view, dominantFar) {
+  const T = visibleRun(curve, view);
+  if (!T) return null;
 
   // Clip to the node circle: the longest stretch of T inside it.
   const inside = T.map(q => Math.hypot(q.x - center.x, q.y - center.y) <= radius);

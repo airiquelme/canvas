@@ -1,5 +1,5 @@
 // Canvas drawing primitives. Layering rules and terms: see CLAUDE.md.
-import { SEAM_PX, MIN_CRESCENT_PX, SPLIT_STRIP_FRAC } from './config.js';
+import { SEAM_PX, SPLIT_STRIP_FRAC } from './config.js';
 import {
   vecSub, vecCross, vecDot, vecNormalize, circleRimPoint,
   capsuleTangentPoints, convexHull,
@@ -120,13 +120,18 @@ export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColo
   outline.forEach((p, i) => { const q = outline[(i + 1) % outline.length]; area += p.x * q.y - q.x * p.y; });
   const chordLen = Math.hypot(e1.x - e0.x, e1.y - e0.y);
   const thickness = Math.abs(area / 2) / Math.max(chordLen, radius * crescentSpan, 1e-6);
-  if (thickness * pxPerUnit < MIN_CRESCENT_PX) {
+  // A crescent grows from nothing as the ring leaves the rim, so it is drawn at
+  // any thickness: below a pixel it antialiases to partial coverage, which fades
+  // it in. (A cutoff at 1 px made a whole 1 px crescent appear at once.) Only a
+  // crescent that could not cover 2% of a pixel is skipped.
+  if (thickness * pxPerUnit < 0.02) {
     fillCircle(ctx, center, radius, dominantColor);
     return;
   }
 
-  // Push the terminator toward the crescent by the underlap (not its ends).
-  const underlap = seamUnderlap(ctx);
+  // Push the terminator toward the crescent by the underlap (not its ends), but
+  // never past half the crescent, or the dominant region would spill over the rim.
+  const underlap = Math.min(seamUnderlap(ctx), 0.5 * thickness);
   const mid = crescentAt(0.5);
   let nx = -(e1.y - e0.y) / (chordLen || 1), ny = (e1.x - e0.x) / (chordLen || 1);
   if (nx * Math.cos(mid) + ny * Math.sin(mid) < 0) { nx = -nx; ny = -ny; }
@@ -154,6 +159,26 @@ export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColo
 // SPLIT CONE (2-node mesh sharing a node with a 3+ node mesh)
 // ---------------------------------------------------------
 
+// A cone of a joint, cut off at the joint ring: `polys` (lists of screen points)
+// are its outline pieces, with the ring's projected interior among them where this
+// mesh is the front one. One nonzero path, filled once, so their shared edge along
+// the ring doesn't stack (CLAUDE.md rule 3).
+export function drawJointBody(ctx, polys, color) {
+  const sign = (pts) => pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p.x * q.y - q.x * p.y; }, 0) >= 0 ? 1 : -1;
+  const first = polys.find(pts => pts.length >= 3);
+  if (!first) return;
+  ctx.beginPath();
+  polys.forEach(pts => {
+    if (pts.length < 3) return;
+    const ordered = sign(pts) === sign(first) ? pts : pts.slice().reverse();
+    ordered.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    ctx.closePath();
+  });
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+
 // The cone's axis frame: unit axis, length, and a radial direction per angle.
 export function coneFrame(node, other) {
   const dir = vecNormalize(vecSub(other.center, node.center));
@@ -178,6 +203,11 @@ function projectAxialCircle(center, radius, frame, n, projectPoint) {
     pts.push(projectPoint({ x: center.x + r.x * radius, y: center.y + r.y * radius, z: center.z + r.z * radius }));
   }
   return pts;
+}
+
+// A split ring's circle, projected: the hull points of the cone's own part at the ring.
+export function splitRingPoints(ring, projectPoint) {
+  return projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
 }
 
 // The far color's strip just past the split ring, minus the ring's own
