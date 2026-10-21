@@ -173,24 +173,68 @@ export function pointInPolygon(p, poly) {
   return inside;
 }
 
+// A polygon's edges with their bounding boxes, for quick rejection in the crossing tests.
+function edgeIndex(poly) {
+  const n = poly.length, box = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity }, e = new Float64Array(n * 4);
+  for (let k = 0; k < n; k++) {
+    const c = poly[k], d = poly[(k + 1) % n];
+    e[4 * k] = Math.min(c.x, d.x); e[4 * k + 1] = Math.max(c.x, d.x); e[4 * k + 2] = Math.min(c.y, d.y); e[4 * k + 3] = Math.max(c.y, d.y);
+    box.minX = Math.min(box.minX, e[4 * k]); box.maxX = Math.max(box.maxX, e[4 * k + 1]);
+    box.minY = Math.min(box.minY, e[4 * k + 2]); box.maxY = Math.max(box.maxY, e[4 * k + 3]);
+  }
+  return { poly, e, box };
+}
+
+// The parameters t in (0, 1), ascending, where the segment a -> b crosses the boundary
+// of the indexed polygon `cut` (edgeIndex).
+function segmentPolygonCrossings(a, b, cut) {
+  const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x), y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y), bx = cut.box;
+  if (x1 < bx.minX || x0 > bx.maxX || y1 < bx.minY || y0 > bx.maxY) return [];
+  const pts = cut.poly, e = cut.e, rx = b.x - a.x, ry = b.y - a.y, ts = [];
+  for (let k = 0; k < pts.length; k++) {
+    if (x1 < e[4 * k] || x0 > e[4 * k + 1] || y1 < e[4 * k + 2] || y0 > e[4 * k + 3]) continue;
+    const c = pts[k], d = pts[(k + 1) % pts.length], sx = d.x - c.x, sy = d.y - c.y, den = rx * sy - ry * sx;
+    if (Math.abs(den) < 1e-18) continue;
+    const t = ((c.x - a.x) * sy - (c.y - a.y) * sx) / den, u = ((c.x - a.x) * ry - (c.y - a.y) * rx) / den;
+    if (t > 0 && t < 1 && u >= 0 && u <= 1) ts.push(t);
+  }
+  return ts.sort((p, q) => p - q);
+}
+
+// The parameters t in (0, 1), ascending, where the segment a -> b crosses a circle.
+function segmentCircleCrossings(a, b, center, radius) {
+  const dx = b.x - a.x, dy = b.y - a.y, fx = a.x - center.x, fy = a.y - center.y;
+  const A = dx * dx + dy * dy, B = 2 * (fx * dx + fy * dy), C = fx * fx + fy * fy - radius * radius;
+  const disc = B * B - 4 * A * C;
+  if (disc <= 0 || A <= 1e-12) return [];
+  const q = Math.sqrt(disc);
+  return [(-B - q) / (2 * A), (-B + q) / (2 * A)].filter(t => t > 0 && t < 1);
+}
+
 // The polygon `poly` with the polygon `cut` cut out of it, as a list of polygons
 // (the cut can split it). Same idea as subtractDisc: the boundary of `poly`
 // outside `cut`, and wherever it enters `cut` the boundary of `cut` itself (against
 // poly's turning direction) up to the next point where poly's boundary leaves.
-// `cut` may be any simple polygon; it is walked at its own scale (1/32 of its size).
+// `cut` may be any simple polygon.
 export function subtractPolygon(poly, cut) {
   const dedupe = (pts) => pts.filter((p, i) => { const q = pts[(i + 1) % pts.length]; return Math.hypot(p.x - q.x, p.y - q.y) > 1e-9; });
   poly = dedupe(poly); cut = dedupe(cut);
   const n = poly.length, qn = cut.length;
   if (n < 3 || qn < 3) return [poly];
-  const xs = cut.map(p => p.x), ys = cut.map(p => p.y);
-  const size = Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) || 1;
+  // The walk is poly's vertices plus, on an edge that crosses the cut's boundary,
+  // a point between each two consecutive crossings (exact crossings, no resampling),
+  // so consecutive walk points are separated by at most one crossing.
+  const index = edgeIndex(cut), box = index.box;
   const walk = [];
   for (let i = 0; i < n; i++) {
-    const a = poly[i], b = poly[(i + 1) % n], steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / (size / 32)));
-    for (let k = 0; k < steps; k++) walk.push({ x: a.x + ((b.x - a.x) * k) / steps, y: a.y + ((b.y - a.y) * k) / steps });
+    const a = poly[i], b = poly[(i + 1) % n], ts = segmentPolygonCrossings(a, b, index);
+    walk.push(a);
+    for (let j = 0; j + 1 < ts.length; j++) {
+      const t = (ts[j] + ts[j + 1]) / 2;
+      walk.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
   }
-  const m = walk.length, flags = walk.map(p => pointInPolygon(p, cut));
+  const m = walk.length, flags = walk.map(p => p.x >= box.minX && p.x <= box.maxX && p.y >= box.minY && p.y <= box.maxY && pointInPolygon(p, cut));
   if (!flags.some(Boolean)) return [poly];
   if (flags.every(Boolean)) return [];
   // The cut's boundary with cumulative lengths.
@@ -266,18 +310,23 @@ export function subtractPolygon(poly, cut) {
 // The polygon with the disc cut out of it, as a list of polygons (the cut can
 // split it): each is made of the original boundary outside the disc plus the
 // circle's own arc wherever the disc bites in, so no area inside the disc is left.
-// The boundary is walked in steps of 1/16 of the radius, so the cut follows the
-// circle at any scale. A polygon with no part in the disc is returned as is.
+// A polygon with no part in the disc is returned as is.
 // Where the boundary enters the disc it follows the circle (against the polygon's
 // own turning direction) to the next point where the boundary leaves it.
 export function subtractDisc(poly, center, radius) {
   const n = poly.length;
   if (n < 3) return [poly];
   const inDisc = (p) => Math.hypot(p.x - center.x, p.y - center.y) < radius;
+  // The walk is the vertices plus, on an edge that crosses the circle, the point
+  // between its two crossings (exact crossings, no resampling).
   const walk = [];
   for (let i = 0; i < n; i++) {
-    const a = poly[i], b = poly[(i + 1) % n], steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / (radius / 16)));
-    for (let k = 0; k < steps; k++) walk.push({ x: a.x + ((b.x - a.x) * k) / steps, y: a.y + ((b.y - a.y) * k) / steps });
+    const a = poly[i], b = poly[(i + 1) % n], ts = segmentCircleCrossings(a, b, center, radius);
+    walk.push(a);
+    if (ts.length === 2) {
+      const t = (ts[0] + ts[1]) / 2;
+      walk.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
   }
   const flags = walk.map(inDisc), m = walk.length;
   if (!flags.some(Boolean)) return [poly];

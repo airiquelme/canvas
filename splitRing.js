@@ -96,10 +96,15 @@ export function buildHostSdf(hostMesh, sharedId) {
 // largest. Camera-independent, so cached. Returns
 // { s, dir, surface, ringRadius, frame, cone, touch } -- `touch` is the point
 // where the ring meets the host.
+// One entry per cone (shared, far, host), compared by the numbers of the nodes it was
+// computed from, so any change of a node (however it is made) recomputes it.
 const ringCache = new Map();
+const snapshot = (...ns) => ns.flatMap(n => [n.id, n.center.x, n.center.y, n.center.z, n.radius]);
 export function findSplitRing(shared, far, hostMesh) {
-  const key = JSON.stringify([shared, far, hostMesh.nodeIds.map(id => nodes[id])]);
-  if (ringCache.has(key)) return ringCache.get(key);
+  const id = `${shared.id}:${far.id}:${hostMesh.id}`;
+  const snap = snapshot(shared, far, ...hostMesh.nodeIds.map(nid => nodes[nid]));
+  const hit = ringCache.get(id);
+  if (hit && hit.snap.length === snap.length && hit.snap.every((v, i) => v === snap[i])) return hit.ring;
   const frame = coneFrame(shared, far);
   const cone = tangentCone(shared, far, frame);
   const { s, touch } = firstContact(shared, hostMesh, frame, cone);
@@ -116,7 +121,7 @@ export function findSplitRing(shared, far, hostMesh) {
     tangentRadius: cone.radA,
     touch,
   };
-  ringCache.set(key, ring);
+  ringCache.set(id, { snap, ring });
   return ring;
 }
 
@@ -248,7 +253,18 @@ function firstContact(shared, hostMesh, frame, cone) {
 // farthest out; this is the one whose entry is nearest the shared node. Equal
 // entries (an arc of generatrices all reaching the sphere) resolve to the middle
 // of the longest run. Returns { s, angle, point, onSphere }.
+const lastCache = new Map();
 export function findLastContact(shared, far, hostMesh) {
+  const id = `${shared.id}:${far.id}:${hostMesh.id}`;
+  const snap = snapshot(shared, far, ...hostMesh.nodeIds.map(nid => nodes[nid]));
+  const hit = lastCache.get(id);
+  if (hit && hit.snap.length === snap.length && hit.snap.every((v, i) => v === snap[i])) return hit.contact;
+  const contact = computeLastContact(shared, far, hostMesh);
+  lastCache.set(id, { snap, contact });
+  return contact;
+}
+
+function computeLastContact(shared, far, hostMesh) {
   const frame = coneFrame(shared, far);
   const cone = tangentCone(shared, far, frame);
   const hostSdf = buildHostSdf(hostMesh, shared.id);

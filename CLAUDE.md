@@ -60,7 +60,14 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
     generatrix of cone A meets the ring's plane at one point, and those beyond the
     tangent circle, within cone A and on cone B's frustum form the ring (within
     ~1.1-1.3 radii of the node); it ends exactly at the touch points. Computed in
-    the flat solid below, recomputed each frame. Marching A's generatrices out of
+    the flat solid below, recomputed each frame. With the plane fixed, the point on
+    generatrix th is at t = -(al0 + radA w) / (nd + slope w), w = nu cos th + nv sin th,
+    so every change between on-the-ring and off it (t = 0: the touch points; t at the
+    cone's end; the pole of t; the two ends of cone B's frustum, which is linear in
+    cos/sin once multiplied by the denominator) is at an angle given by
+    a + b cos th + c sin th = 0. The ring is the run of arcs between those angles that
+    ends at touch points on both sides (else the longest), cut into chords within
+    `CURVE_TOL_PX` of the curve (`render.js`), not sampled at fixed angles. Marching A's generatrices out of
     B's sdf instead (and taking the longest run) flipped to the other crossing conic
     for single frames when the two were almost equally long (the ring went off
     course, e.g. at 2.904 in the focus view) and lost its ends near the touch points;
@@ -218,11 +225,30 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
 - `projectToScreen` flips world y: larger y appears higher on screen.
 
 ## Optimization backlog (these change pixels; verify each with the AA sim)
-- Drop `drawTriangle`'s 1px same-color stroke. It's an on-top patch (rule 1),
-  and the joint capsules still use it.
 - Batch joint capsules and the split cone into unions too (rule 3).
 - `drawSplitShared`/`drawSplitFar` sample 128 points per circle and ring, then takes their
-  hull. An analytic outline (tangent lines + arcs) would be cheaper and exact.
+  hull. An analytic outline (tangent lines + arcs, a projected circle is an ellipse)
+  would be cheaper and exact. Small in the profile now (`convexHull` ~3%).
+- `firstContact`'s capsule between two non-shared host spheres still scans 360 angles
+  and refines with a golden section (cached, so it only runs when a node moves).
+
+## Performance notes
+Per frame, normal view, about half the time of the previous version (profile with a
+Node harness, see Debugging). What is closed form or cached now:
+- `findSplitRing` / `findLastContact` are cached per cone against a snapshot of the
+  numbers of the nodes they use (one entry per cone, so no growth when nodes move).
+- Joint cone edges (`edgeContacts`) come from `a = psi +- acos(-axis.z tanT / Wz)`, not
+  a 720-angle scan; the ring's range and its chords are described under "Joint ring".
+  The second cone's normal along the ring is its generatrix normal, not a
+  finite difference of the frustum sdf.
+- `subtractDisc` / `subtractPolygon` walk the polygon's vertices plus its exact
+  crossings with the cut (no resampling), with bounding-box rejection against the cut.
+- `alignToFlatCone` uses the capsule's closed form (two tangent segments, two arcs)
+  instead of hulls of 180-point rims. The crescent's area is exact (polygon + circular segment).
+- cos/sin tables for the 128-point circles; `seamUnderlap` is read from the
+  transform once per frame (`frame.pxPerUnit`); `findSplit` once per mesh per frame.
+- A 2-node mesh's fill triangle is flat (centroid on the line between its centers) and
+  is not traced. `drawTriangle` / `drawPairCapsule` were unreachable and are gone.
 
 ## Debugging
 - The **Debug** button turns all the debug views on and off together
@@ -264,4 +290,5 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
   `vm` with a stubbed canvas context, and sampled over the camera orbit. Use a
   point-sampled raster to diff against a reference copy, and a
   coverage-composited rasterizer for AA effects. A refactor should show
-  0 differing samples.
+  0 differing samples; a change from sampling to closed form should differ only
+  within a pixel or two of an edge (check there are no differences in flat areas).

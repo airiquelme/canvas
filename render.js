@@ -6,13 +6,16 @@ import { projectJointSplit } from './jointSplit.js';
 import { findSplitRing } from './splitRing.js';
 import { buildConeDebugCurves, drawConeDebugCurves } from './coneDebug.js';
 import { drawJointDebug } from './jointDebug.js';
-import { vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, circleRimPoint, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
+import { vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from './camera.js';
 import { nodes, meshes } from './scene.js';
 import {
-  seamUnderlap, fillCircle, drawTriangle, traceCapsule, traceCircle, traceTriangle,
-  drawPairCapsule, drawJointBody, drawJointSplitFromCurve, drawSplitShared, drawSplitFar, splitRingPoints,
+  pixelScale, seamUnderlap, fillCircle, circlePoints, traceCapsule, traceCircle, traceTriangle,
+  drawJointBody, drawJointSplitFromCurve, drawSplitShared, drawSplitFar, splitRingPoints,
 } from './shapes.js';
+
+// How far a polyline of a joint curve may stray from the curve, in device pixels.
+const CURVE_TOL_PX = 0.02;
 
 function applyDesignSpaceTransform(ctx, canvas) {
   const scale = Math.min(canvas.width / DESIGN_WIDTH, canvas.height / DESIGN_HEIGHT);
@@ -65,22 +68,30 @@ function alignToFlatCone(points, c1, c2) {
   const t = capsuleTangentPoints(c1.center, c1.radius, c2.center, c2.radius);
   const lines = [[t.p1a, t.p1b], [t.p2b, t.p2a]];
   if (![t.p1a, t.p1b, t.p2a, t.p2b].every(p => p && isFinite(p.x) && isFinite(p.y))) return points;
-  const ring = (c) => Array.from({ length: 180 }, (_, i) => circleRimPoint(c.center, c.radius, (i / 180) * Math.PI * 2));
-  const capsule = convexHull(ring(c1).concat(ring(c2)));
+  // The capsule (hull of the two circles) in closed form: inside test and nearest
+  // boundary point from its two tangent segments and the two outer arcs. On circle 1
+  // the exposed arc is the directions with u . e <= k, on circle 2 those with u . e >= k
+  // (e = unit c1 -> c2, k = (r1 - r2) / d, the cosine of the tangent points' angle to e).
+  const ex = c2.center.x - c1.center.x, ey = c2.center.y - c1.center.y, d = Math.hypot(ex, ey);
+  const k = (c1.radius - c2.radius) / d;
+  const quad = [t.p1a, t.p1b, t.p2a, t.p2b];
+  const inCapsule = (p) => Math.hypot(p.x - c1.center.x, p.y - c1.center.y) <= c1.radius
+    || Math.hypot(p.x - c2.center.x, p.y - c2.center.y) <= c2.radius
+    || pointInPolygon(p, quad);
   const nearestOnSegment = (p, a, b) => {
     const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy || 1;
-    const k = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
-    return { x: a.x + dx * k, y: a.y + dy * k };
+    const f = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
+    return { x: a.x + dx * f, y: a.y + dy * f };
   };
-  const clamped = points.map(p => {
-    if (pointInPolygon(p, capsule)) return p;
-    let best = null, bestD = Infinity;
-    capsule.forEach((a, i) => {
-      const q = nearestOnSegment(p, a, capsule[(i + 1) % capsule.length]), d = Math.hypot(q.x - p.x, q.y - p.y);
-      if (d < bestD) { bestD = d; best = q; }
+  const nearestOnBoundary = (p) => {
+    const cands = lines.map(([a, b]) => nearestOnSegment(p, a, b));
+    [[c1, -1], [c2, 1]].forEach(([c, sign]) => {
+      const dx = p.x - c.center.x, dy = p.y - c.center.y, l = Math.hypot(dx, dy);
+      if (l > 1e-12 && sign * ((dx * ex + dy * ey) / (l * d) - k) >= 0) cands.push({ x: c.center.x + (dx / l) * c.radius, y: c.center.y + (dy / l) * c.radius });
     });
-    return best;
-  });
+    return cands.reduce((best, q) => (Math.hypot(q.x - p.x, q.y - p.y) < Math.hypot(best.x - p.x, best.y - p.y) ? q : best));
+  };
+  const clamped = points.map(p => (inCapsule(p) ? p : nearestOnBoundary(p)));
   const feet = lines.map(([a, b]) => {
     const dx = b.x - a.x, dy = b.y - a.y, l = Math.hypot(dx, dy) || 1;
     const across = (p) => Math.abs(((p.x - a.x) * dy - (p.y - a.y) * dx) / l);
@@ -103,7 +114,7 @@ function insetPolygon(poly, d) {
 // Each joint: its ring (jointCurve.js), which mesh is in front of it (frontIsA:
 // the cone on the camera's side of the ring plane) and its phase, the depth sign
 // of the axis between the two meshes' directions in camera space.
-function computeJoints(jointNodeIds, owners, projected, camPos, basis, projectPoint) {
+function computeJoints(jointNodeIds, owners, projected, camPos, basis, tol) {
   const joints = {};
   jointNodeIds.forEach(nodeId => {
     const [meshA, meshB] = owners[nodeId].map(id => meshes[id]);
@@ -118,7 +129,7 @@ function computeJoints(jointNodeIds, owners, projected, camPos, basis, projectPo
     const farNode = (mesh) => nodes[mesh.nodeIds.find(id => id !== nodeId)];
     const pz = projected[nodeId].radius / nodes[nodeId].radius;
     const flat = (id) => ({ center: { ...projected[id].center, z: -projected[id].depth * pz }, radius: projected[id].radius });
-    const curve = buildJointCurve(flat(nodeId), flat(farNode(meshA).id), flat(farNode(meshB).id));
+    const curve = buildJointCurve(flat(nodeId), flat(farNode(meshA).id), flat(farNode(meshB).id), tol);
     // The ring's plane separates the two cones, so the cone on the camera's side
     // of it is the front one (the phase says the same, except in edge-on views).
     let frontIsA = axis.z / axisLen >= 0;
@@ -193,8 +204,9 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
   // A cone ending at a joint stops at the joint ring: its body is the hull of
   // the other end's circle and the ring's front arc; where it is the front mesh
   // it also fills the whole ring's interior (CLAUDE.md "Joint ring").
-  const discRadius = (joint) => Math.max(joint.radius - seamUnderlap(ctx), 0.5 * joint.radius);
-  const circlePoints = (c) => Array.from({ length: 64 }, (_, i) => circleRimPoint(c.center, c.radius, (i / 64) * Math.PI * 2));
+  const underlap = frame.underlap;
+  const discRadius = (joint) => Math.max(joint.radius - underlap, 0.5 * joint.radius);
+  const rimPoints = (c) => circlePoints(c.center, c.radius, 64);
   // A cone's body where it ends at joints (every cone arriving at a 2-to-2 shared
   // node, split cone or not): `basePoints` are the hull points of the rest of the
   // cone, `joints` the joints it ends at. The cone truncated at a ring is convex:
@@ -213,7 +225,7 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
       // The back cone is cut a little inside the ring, so it reaches under the
       // front cone's antialiased edge along the ring (rule 1); the front cone's
       // fill and outline share the ring's exact edge in one path.
-      cutLoops.push(isFront ? joint.loop : insetPolygon(joint.loop, seamUnderlap(ctx)));
+      cutLoops.push(isFront ? joint.loop : insetPolygon(joint.loop, underlap));
       // The cone's two edges STOP at a known point each: where it touches the ring
       // (the green dot, exact) or, if it doesn't, where it meets the node's circle.
       // Those two stopping points are the only hull points at this end, so each edge
@@ -263,23 +275,21 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
       const joints = [], basePoints = [];
       [a, b].forEach(end => {
         const joint = frame.joints[end.id];
-        if (joint && joint.frontArc) joints.push(joint); else basePoints.push(...circlePoints(end));
+        if (joint && joint.frontArc) joints.push(joint); else basePoints.push(...rimPoints(end));
       });
       drawAtJoints(basePoints, joints);
       return;
     }
-    drawTriangle(ctx, screenCentroid,
-      closestPointOnCircle(a.center, a.radius, screenCentroid),
-      closestPointOnCircle(b.center, b.radius, screenCentroid), color);
-    drawPairCapsule(ctx, a.center, a.radius, b.center, b.radius, color, sharedA, sharedB);
-    if (sharedA) fillCircle(ctx, a.center, a.radius, color);
-    if (sharedB) fillCircle(ctx, b.center, b.radius, color);
   };
 
+  // The fill triangle of a 2-node mesh is flat (its centroid is on the line between the
+  // two centers, and so are both of its other corners), so it is only traced for bigger meshes.
   const tracePath = (split || touchesJoint) ? null : () => {
-    traceTriangle(ctx, screenCentroid,
-      closestPointOnCircle(a.center, a.radius, screenCentroid),
-      closestPointOnCircle(b.center, b.radius, screenCentroid));
+    if (mesh.nodeIds.length > 2) {
+      traceTriangle(ctx, screenCentroid,
+        closestPointOnCircle(a.center, a.radius, screenCentroid),
+        closestPointOnCircle(b.center, b.radius, screenCentroid));
+    }
     traceCapsule(ctx, a.center, a.radius, b.center, b.radius, sharedA, sharedB);
     // A split node's disc belongs to its cone (drawSplitShared), which clips it to the ring plane.
     if (sharedA && !splitNodeIds.has(a.id)) traceCircle(ctx, a.center, a.radius);
@@ -348,7 +358,7 @@ function buildJointPrimitive(frame, nodeId) {
     depth: jointDepth(frame, nodeId),
     // No usable ring in view (e.g. one arm points at the camera): one color.
     draw: () => (split
-      ? drawJointSplitFromCurve(ctx, joint.center, joint.radius, split, dominantColor, crescentColor)
+      ? drawJointSplitFromCurve(ctx, joint.center, joint.radius, split, dominantColor, crescentColor, frame.pxPerUnit)
       : fillCircle(ctx, joint.center, joint.radius, dominantColor)),
   };
 }
@@ -394,10 +404,13 @@ export function render(ctx, canvas, { darkMode }) {
   const owners = buildOwnership();
   const sharedNodeIds = new Set(Object.keys(owners).filter(id => owners[id].length >= 2).map(Number));
   const jointNodeIds = findJointNodeIds(owners);
+  const pxPerUnit = pixelScale(ctx);
+  const splitOf = {};      // mesh id -> its split (findSplit) or null
+  Object.values(meshes).forEach(m => { splitOf[m.id] = findSplit(m, owners); });
   const frame = {
-    ctx, camPos, basis, projectPoint, projected, owners, sharedNodeIds, jointNodeIds,
-    splitNodeIds: new Set(Object.values(meshes).map(m => findSplit(m, owners)).filter(Boolean).map(s => s.splitNodeId)),
-    joints: computeJoints(jointNodeIds, owners, projected, camPos, basis, projectPoint),
+    ctx, pxPerUnit, underlap: seamUnderlap(pxPerUnit), camPos, basis, projectPoint, projected, owners, sharedNodeIds, jointNodeIds,
+    splitNodeIds: new Set(Object.values(splitOf).filter(Boolean).map(s => s.splitNodeId)),
+    joints: computeJoints(jointNodeIds, owners, projected, camPos, basis, CURVE_TOL_PX / pxPerUnit),
     coneDepths: {},          // split cone mesh id -> sort key, for joints at their far end
     jointBodies: {},         // joint node id -> the two meshes' bodies there (draw order)
     extraPrimitives: [],     // split cones' host-colored parts, sorted with the rest
@@ -409,7 +422,7 @@ export function render(ctx, canvas, { darkMode }) {
   Object.values(meshes).forEach(mesh => {
     if (!isShown(mesh)) return;
     const screenCentroid = projectPoint(centroid(mesh.nodeIds.map(id => nodes[id].center)));
-    const split = findSplit(mesh, owners);
+    const split = splitOf[mesh.id];
     const pNodes = mesh.nodeIds.map(id => projected[id]);
     for (let i = 0; i < pNodes.length; i++) {
       for (let j = i + 1; j < pNodes.length; j++) {
@@ -439,7 +452,7 @@ export function render(ctx, canvas, { darkMode }) {
 
   if (debug.on && debug.cone && !focus.on) {
     Object.values(meshes).forEach(mesh => {
-      const split = findSplit(mesh, owners);
+      const split = splitOf[mesh.id];
       if (split) drawConeDebugCurves(ctx, buildConeDebugCurves(split, mesh, split.hostMesh, camPos, projectPoint));
     });
   }

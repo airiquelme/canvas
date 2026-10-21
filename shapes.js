@@ -1,14 +1,19 @@
 // Canvas drawing primitives. Layering rules and terms: see CLAUDE.md.
 import { SEAM_PX } from './config.js';
 import {
-  vecSub, vecCross, vecDot, vecNormalize, circleRimPoint,
+  vecSub, vecCross, vecDot, vecNormalize,
   capsuleTangentPoints, convexHull,
 } from './geometry.js';
 
-// SEAM_PX / 2 device pixels, in the current transform's units.
-export function seamUnderlap(ctx) {
+// Device pixels per drawing unit under the current transform (read once per frame).
+export function pixelScale(ctx) {
   const t = ctx.getTransform();
-  return (SEAM_PX / 2) / Math.hypot(t.a, t.b);
+  return Math.hypot(t.a, t.b);
+}
+
+// SEAM_PX / 2 device pixels, in drawing units.
+export function seamUnderlap(pxPerUnit) {
+  return (SEAM_PX / 2) / pxPerUnit;
 }
 
 export function fillPolygon(ctx, pts, color) {
@@ -24,20 +29,6 @@ export function fillCircle(ctx, center, radius, color) {
   ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
   ctx.fillStyle = color;
   ctx.fill();
-}
-
-// Fills a triangle plus a 1px stroke of the same color.
-export function drawTriangle(ctx, p1, p2, p3, color) {
-  ctx.beginPath();
-  ctx.moveTo(p1.x, p1.y);
-  ctx.lineTo(p2.x, p2.y);
-  ctx.lineTo(p3.x, p3.y);
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1;
-  ctx.stroke();
 }
 
 // ---------------------------------------------------------
@@ -74,24 +65,6 @@ export function traceTriangle(ctx, p1, p2, p3) {
 }
 
 // ---------------------------------------------------------
-// JOINT CAPSULES
-// ---------------------------------------------------------
-
-// A capsule with optional skipped caps (a skipped cap is closed by a chord:
-// the shared node's circle is drawn separately).
-export function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, skipCap2 = false) {
-  const { t1Angle, t2Angle, p1a, p1b, p2a, p2b } = capsuleTangentPoints(c1, r1, c2, r2);
-  ctx.beginPath();
-  ctx.moveTo(p1a.x, p1a.y);
-  ctx.lineTo(p1b.x, p1b.y);
-  if (skipCap2) ctx.lineTo(p2a.x, p2a.y); else ctx.arc(c2.x, c2.y, r2, t1Angle, t2Angle, true);
-  ctx.lineTo(p2b.x, p2b.y);
-  if (skipCap1) ctx.lineTo(p1a.x, p1a.y); else ctx.arc(c1.x, c1.y, r1, t2Angle, t1Angle, true);
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill();
-}
-
 // ---------------------------------------------------------
 // JOINT NODE (moon-phase split circle)
 // ---------------------------------------------------------
@@ -100,26 +73,22 @@ export function drawPairCapsule(ctx, c1, r1, c2, r2, color, skipCap1 = false, sk
 // (jointSplit.js): the dominant region (terminator + the rim arc on its side)
 // goes first, reaching `underlap` under the crescent's inner edge but not its
 // rim; the crescent goes on top. `split` = projectJointSplit's result.
-export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColor, crescentColor) {
+export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColor, crescentColor, pxPerUnit) {
   const { terminator, th0, th1, domIncreasing, span } = split;
-  const t = ctx.getTransform();
-  const pxPerUnit = Math.hypot(t.a, t.b);
   const e0 = terminator[0], e1 = terminator[terminator.length - 1];
   // The crescent arc runs from e1 to e0: increasing angle if the dominant arc
   // is th0 -> th1, decreasing otherwise.
   const crescentSpan = domIncreasing ? 2 * Math.PI - span : span;
   const crescentAt = (f) => th1 + (domIncreasing ? 1 : -1) * crescentSpan * f;
 
-  // Thickness of the crescent: its area over the longer of chord and rim arc.
-  const outline = terminator.slice();
-  for (let k = 1; k <= 16; k++) {
-    const a = crescentAt(k / 16);
-    outline.push({ x: center.x + radius * Math.cos(a), y: center.y + radius * Math.sin(a) });
-  }
+  // Thickness of the crescent: its area over the longer of chord and rim arc. The area is
+  // the terminator polygon (closed by its chord) plus the circular segment between that
+  // chord and the rim arc, r^2/2 (span - sin span), signed by the arc's direction.
   let area = 0;
-  outline.forEach((p, i) => { const q = outline[(i + 1) % outline.length]; area += p.x * q.y - q.x * p.y; });
+  terminator.forEach((p, i) => { const q = terminator[(i + 1) % terminator.length]; area += p.x * q.y - q.x * p.y; });
+  area = area / 2 + (domIncreasing ? 1 : -1) * 0.5 * radius * radius * (crescentSpan - Math.sin(crescentSpan));
   const chordLen = Math.hypot(e1.x - e0.x, e1.y - e0.y);
-  const thickness = Math.abs(area / 2) / Math.max(chordLen, radius * crescentSpan, 1e-6);
+  const thickness = Math.abs(area) / Math.max(chordLen, radius * crescentSpan, 1e-6);
   // A crescent grows from nothing as the ring leaves the rim, so it is drawn at
   // any thickness: below a pixel it antialiases to partial coverage, which fades
   // it in. (A cutoff at 1 px made a whole 1 px crescent appear at once.) Only a
@@ -131,7 +100,7 @@ export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColo
 
   // Push the terminator toward the crescent by the underlap (not its ends), but
   // never past half the crescent, or the dominant region would spill over the rim.
-  const underlap = Math.min(seamUnderlap(ctx), 0.5 * thickness);
+  const underlap = Math.min(seamUnderlap(pxPerUnit), 0.5 * thickness);
   const mid = crescentAt(0.5);
   let nx = -(e1.y - e0.y) / (chordLen || 1), ny = (e1.x - e0.x) / (chordLen || 1);
   if (nx * Math.cos(mid) + ny * Math.sin(mid) < 0) { nx = -nx; ny = -ny; }
@@ -191,16 +160,39 @@ export function coneFrame(node, other) {
     y: u.y * Math.cos(a) + v.y * Math.sin(a),
     z: u.z * Math.cos(a) + v.z * Math.sin(a),
   });
-  return { dir, len, radial };
+  return { dir, len, radial, u, v };
+}
+
+// cos / sin of i/n of a turn, i = 0..n-1, computed once per n (same values
+// as evaluating them at (i / n) * 2 PI each time).
+const unitCircles = new Map();
+export function unitCircle(n) {
+  let t = unitCircles.get(n);
+  if (!t) {
+    t = { cos: new Float64Array(n), sin: new Float64Array(n) };
+    for (let i = 0; i < n; i++) { const a = (i / n) * Math.PI * 2; t.cos[i] = Math.cos(a); t.sin[i] = Math.sin(a); }
+    unitCircles.set(n, t);
+  }
+  return t;
+}
+
+// n points evenly spaced on a screen circle, starting at angle 0.
+export function circlePoints(center, radius, n) {
+  const { cos, sin } = unitCircle(n);
+  return Array.from({ length: n }, (_, i) => ({ x: center.x + radius * cos[i], y: center.y + radius * sin[i] }));
 }
 
 // A circle perpendicular to the cone axis (from findSplitRing,
 // splitRing.js), projected.
 function projectAxialCircle(center, radius, frame, n, projectPoint) {
-  const pts = [];
+  const pts = [], { cos, sin } = unitCircle(n), { u, v } = frame;
   for (let i = 0; i < n; i++) {
-    const r = frame.radial((i / n) * Math.PI * 2);
-    pts.push(projectPoint({ x: center.x + r.x * radius, y: center.y + r.y * radius, z: center.z + r.z * radius }));
+    const c = cos[i], sn = sin[i];
+    pts.push(projectPoint({
+      x: center.x + (u.x * c + v.x * sn) * radius,
+      y: center.y + (u.y * c + v.y * sn) * radius,
+      z: center.z + (u.z * c + v.z * sn) * radius,
+    }));
   }
   return pts;
 }
@@ -218,11 +210,8 @@ export function splitRingPoints(ring, projectPoint) {
 export function drawSplitShared(ctx, sharedProj, ring, axisCam, color, projectPoint) {
   const ringPts = projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
   const tangentPts = projectAxialCircle(ring.tangentCenter, ring.tangentRadius, ring.frame, 128, projectPoint);
-  const rim = Array.from({ length: 128 }, (_, i) => circleRimPoint(sharedProj.center, sharedProj.radius, (i / 128) * Math.PI * 2));
-  const sharedSide = rim.filter((_, i) => {
-    const th = (i / 128) * Math.PI * 2;
-    return Math.cos(th) * axisCam.x - Math.sin(th) * axisCam.y <= ring.cone.sinT + 1e-9;
-  });
+  const rim = circlePoints(sharedProj.center, sharedProj.radius, 128), { cos, sin } = unitCircle(128);
+  const sharedSide = rim.filter((_, i) => cos[i] * axisCam.x - sin[i] * axisCam.y <= ring.cone.sinT + 1e-9);
   fillPolygon(ctx, convexHull(sharedSide.concat(tangentPts, ringPts)), color);
 }
 
@@ -239,7 +228,7 @@ function chordOffArc(hull, arc) {
 // separately and the part ends in a chord.
 export function drawSplitFar(ctx, farProj, ring, color, projectPoint, opts = {}) {
   const ringPts = projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
-  const farCircle = Array.from({ length: 128 }, (_, i) => circleRimPoint(farProj.center, farProj.radius, (i / 128) * Math.PI * 2));
+  const farCircle = circlePoints(farProj.center, farProj.radius, 128);
   let hull = convexHull(ringPts.concat(farCircle));
   if (opts.farIsJoint) hull = chordOffArc(hull, new Set(farCircle));
   fillPolygon(ctx, hull, color);

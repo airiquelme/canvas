@@ -13,7 +13,8 @@ function resizeCanvas() {
   canvas.height = window.innerHeight;
 }
 resizeCanvas();
-window.addEventListener('resize', resizeCanvas);
+// Resizing clears the canvas; redraw so a paused view doesn't stay blank.
+window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 
 buildDemoScene();
 

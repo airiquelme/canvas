@@ -14,11 +14,14 @@
 // sphere's center by a few percent of the radius when the cones differ). The
 // back circle is where that plane cuts the sphere. Pure 3D; every
 // point carries its outward normal so a view can tell which parts face it.
-import { vecSub, vecDot, vecCross, vecNormalize, sdfFrustum } from './geometry.js';
+import { vecSub, vecDot, vecCross, vecNormalize } from './geometry.js';
 import { coneFrame } from './shapes.js';
 import { tangentCone, coneSurface } from './splitRing.js';
 
-const THETA_STEPS = 240, ARC_STEPS = 48;
+// Chord tolerance (in the units of the spheres' coordinates) when a curve is cut into
+// segments, and the fewest segments of any arc.
+const DEFAULT_TOL = 0.05, MIN_STEPS = 8;
+const TWO_PI = Math.PI * 2;
 // A generatrix meets the ring's plane at least this far (in radii) past its tangent
 // circle to count as part of the ring (the touch points themselves are added).
 const ON_SPHERE_EPS = 0.002;
@@ -30,6 +33,13 @@ const len = (a) => Math.hypot(a.x, a.y, a.z);
 // Unit vector u on the sphere -> a curve point with its outward normal.
 const spherePoint = (node, u) => ({ p: add(node.center, scale(u, node.radius)), n: u });
 
+// Segments needed to cut an arc of `span` radians of a circle of radius `rho` with
+// chords no farther than `tol` from it (the chord's sagitta is rho (1 - cos(step/2))).
+function arcSteps(span, rho, tol) {
+  const step = rho > tol ? 2 * Math.acos(1 - tol / rho) : Math.PI;
+  return Math.max(MIN_STEPS, Math.ceil(Math.abs(span) / step));
+}
+
 // Points e1 cos(phi) + e2 sin(phi) on the sphere, phi from a to b.
 function arc(node, e1, e2, a, b, steps) {
   const out = [];
@@ -38,23 +48,6 @@ function arc(node, e1, e2, a, b, steps) {
     out.push(spherePoint(node, add(scale(e1, Math.cos(phi)), scale(e2, Math.sin(phi)))));
   }
   return out;
-}
-
-// Longest cyclic run of true values in `flags`: { start, count } or null.
-function longestRun(flags) {
-  const n = flags.length;
-  if (flags.every(Boolean) || !flags.some(Boolean)) return null;
-  const first = flags.findIndex(f => !f);          // start just after a false
-  let best = null, runStart = -1, run = 0;
-  for (let k = 1; k <= n; k++) {
-    const i = (first + k) % n;
-    if (flags[i]) { if (run === 0) runStart = i; run++; }
-    if (!flags[i] || k === n) {
-      if (run > 0 && (!best || run > best.count)) best = { start: runStart, count: run };
-      run = 0;
-    }
-  }
-  return best;
 }
 
 // Does a curve point face the camera, whose direction (unit, toward the
@@ -75,11 +68,11 @@ export function facesCamera(q, viewDir) {
 //  loop   front followed by back, closed;
 //  plane  the unit normal of the ring's plane (not through the node center
 //         unless the cones are equal).
-export function buildJointCurve(node, farA, farB) {
-  return computeJointCurve(node, farA, farB);
+export function buildJointCurve(node, farA, farB, tol = DEFAULT_TOL) {
+  return computeJointCurve(node, farA, farB, tol);
 }
 
-function computeJointCurve(node, farA, farB) {
+function computeJointCurve(node, farA, farB, tol) {
   const frameA = coneFrame(node, farA), frameB = coneFrame(node, farB);
   const coneA = tangentCone(node, farA, frameA), coneB = tangentCone(node, farB, frameB);
   const dA = frameA.dir, dB = frameB.dir;
@@ -100,7 +93,7 @@ function computeJointCurve(node, farA, farB) {
     const m = len(vecSub(dA, dB)) > 1e-6 ? vecNormalize(vecSub(dA, dB)) : vecNormalize(vecCross(dA, { x: 0, y: 1, z: 0 }));
     const sum = add(dA, dB);
     const e1 = len(sum) > 1e-6 ? vecNormalize(sum) : vecNormalize(vecCross(m, { x: 0, y: 1, z: 0 }));
-    const back = arc(node, e1, vecCross(m, e1), 0, 2 * Math.PI, ARC_STEPS * 2);
+    const back = arc(node, e1, vecCross(m, e1), 0, TWO_PI, arcSteps(TWO_PI, node.radius, tol));
     return { hasTouch: false, touch: null, front: [], back, loop: back, plane: m };
   }
 
@@ -108,8 +101,6 @@ function computeJointCurve(node, farA, farB) {
   const sum = add(dA, dB);
   const backMid = len(sum) > 1e-6 ? scale(sum, -1 / len(sum)) : vecNormalize(vecCross(n, dA));
   const rawTouch = [add(base, scale(n, gamma)), add(base, scale(n, -gamma))];    // unit vectors
-
-  const sdfB = (p) => sdfFrustum(p, node.center, node.radius, farB.center, farB.radius);
 
   // The ring's plane. Two cones tangent to the same sphere intersect in plane
   // conics (Monge), so the intersection IS planar; the plane just doesn't pass
@@ -149,27 +140,86 @@ function computeJointCurve(node, farA, farB) {
   const inPlane = (v) => vecSub(v, scale(plane, vecDot(v, plane)));
   const onPlane = (p) => vecSub(p, scale(plane, vecDot(vecSub(p, T0), plane)));
 
-  // The ring itself, in closed form: each generatrix of cone A meets the ring's plane
-  // at one point, and the ones that do so beyond the cone's tangent circle (and within
-  // the cone, and on cone B's frustum) form the ring, from touch point to touch point.
-  // No marching and no choice between branches: it ends exactly where the generatrix
-  // reaches the tangent circle, i.e. at the touch points. (Marching the exits of A out
-  // of B's sdf instead flipped to the other crossing conic when the two were almost
-  // equally long, and lost the ends near the touch points.)
-  const crease = new Array(THETA_STEPS).fill(null);
-  for (let i = 0; i < THETA_STEPS; i++) {
-    const at = coneSurface(node, frameA, coneA, (i / THETA_STEPS) * Math.PI * 2);
-    const p0 = at(coneA.sA).point, dirv = vecSub(at(coneA.sA + 1).point, p0), denom = vecDot(plane, dirv);
-    if (Math.abs(denom) < 1e-12) continue;
-    const t = -vecDot(plane, vecSub(p0, T0)) / denom, s = coneA.sA + t;
-    if (!(t > ON_SPHERE_EPS * node.radius) || s > coneA.sB) continue;
-    const q = at(s);
-    const axialB = vecDot(vecSub(q.point, node.center), dB);
-    if (axialB < coneB.sA || axialB > coneB.sB) continue;            // on cone B's frustum
-    crease[i] = q;
+  // The ring itself, in closed form. Each generatrix of cone A (angle th around its axis)
+  // meets the ring's plane at one point, distance t past its tangent circle:
+  //   t(w) = -(al0 + radA w) / (nd + slope w),  w(th) = nu cos th + nv sin th
+  // (n = the plane's normal, u / v the radial basis; a Moebius function of w). The ring is
+  // the stretch of th where t > 0 (past the tangent circle), t <= sB - sA (within the cone)
+  // and the point is on cone B's frustum. t = 0 holds exactly at the touch points (the plane
+  // meets the tangent circle there), t = tMax and the poles of t are linear in w, and
+  // w = W cos(th - phiW), so every change between valid and invalid is at a known angle:
+  // no marching, no sampling, and the ring ends exactly at the touch points.
+  const nd = vecDot(plane, dA), nu = vecDot(plane, frameA.u), nv = vecDot(plane, frameA.v);
+  const al0 = vecDot(plane, vecSub(add(node.center, scale(dA, coneA.sA)), T0));
+  const Wm = Math.hypot(nu, nv), phiW = Math.atan2(nv, nu), tMax = coneA.sB - coneA.sA;
+  const tAt = (th) => {
+    const den = nd + coneA.slope * (nu * Math.cos(th) + nv * Math.sin(th));
+    return Math.abs(den) < 1e-12 ? NaN : -(al0 + coneA.radA * (nu * Math.cos(th) + nv * Math.sin(th))) / den;
+  };
+  // The ring point on generatrix th (after the plane test), with both cones' normals.
+  const ringPoint = (th, t) => {
+    const q = coneSurface(node, frameA, coneA, th)(coneA.sA + t);
+    const d = vecSub(q.point, node.center), ax = vecDot(d, dB);
+    const radB = vecNormalize(vecSub(d, scale(dB, ax)));
+    return { point: q.point, outward: q.outward, axialB: ax, n2: add(scale(radB, coneB.cosT), scale(dB, coneB.sinT)) };
+  };
+  const onRing = (th) => {
+    const t = tAt(th);
+    if (!(t > 0) || t > tMax) return false;
+    const ax = ringPoint(th, t).axialB;
+    return ax >= coneB.sA && ax <= coneB.sB;
+  };
+  const events = [];
+  const addEvent = (w, atTouch) => {
+    if (!Number.isFinite(w) || Math.abs(w) >= Wm) return;
+    const a = Math.acos(w / Wm);
+    events.push({ a: phiW + a, atTouch }, { a: phiW - a, atTouch });
+  };
+  addEvent(-al0 / coneA.radA, true);
+  addEvent(-(al0 + tMax * nd) / (coneA.radA + tMax * coneA.slope), false);
+  if (Math.abs(coneA.slope) > 1e-12) addEvent(-nd / coneA.slope, false);
+  // The ends of cone B's frustum: the axial coordinate along B's axis of the generatrix
+  // point is g (sA + t) + (radA + slope t) q(th), with g = dA . dB and q = r(th) . dB. Times
+  // the denominator (nd + slope w) it is linear in w and q, so axialB = S is
+  // K0 + Kw w + Kq q = 0, i.e. a + b cos th + c sin th = 0 (and the touch points are where
+  // it equals B's tangent circle, S = sA of B).
+  const bu = vecDot(frameA.u, dB), bv = vecDot(frameA.v, dB);
+  const Kq = coneA.radA * nd - coneA.slope * al0;
+  [[coneB.sA, true], [coneB.sB, false]].forEach(([S, atTouch]) => {
+    const K0 = g * (coneA.sA * nd - al0) - S * nd, Kw = g * (coneA.sA * coneA.slope - coneA.radA) - S * coneA.slope;
+    const Pc = Kw * nu + Kq * bu, Ps = Kw * nv + Kq * bv, Pm = Math.hypot(Pc, Ps);
+    if (Pm < 1e-12 || Math.abs(K0) >= Pm) return;
+    const a = Math.acos(-K0 / Pm), phiP = Math.atan2(Ps, Pc);
+    events.push({ a: phiP + a, atTouch }, { a: phiP - a, atTouch });
+  });
+  // Sorted, with events closer than the arc test can resolve merged into one.
+  const sorted = events.map(e => ({ a: ((e.a % TWO_PI) + TWO_PI) % TWO_PI, atTouch: e.atTouch })).sort((p, q) => p.a - q.a);
+  const cuts = [];
+  sorted.forEach(e => {
+    const last = cuts[cuts.length - 1];
+    if (last && e.a - last.a < 1e-7) last.atTouch = last.atTouch || e.atTouch; else cuts.push({ ...e });
+  });
+  if (cuts.length > 1 && cuts[0].a + TWO_PI - cuts[cuts.length - 1].a < 1e-7) { cuts[0].atTouch = cuts[0].atTouch || cuts.pop().atTouch; }
+  // Arcs between consecutive change angles (each remembers whether its two ends are at
+  // touch points); the ring is the cyclic run of valid ones that ends at a touch point on
+  // both sides, else the longest run.
+  const arcs = cuts.length
+    ? cuts.map((c, i) => ({ a: c.a, span: (i + 1 < cuts.length ? cuts[i + 1].a : cuts[0].a + TWO_PI) - c.a, from: c.atTouch, to: cuts[(i + 1) % cuts.length].atTouch }))
+    : [{ a: 0, span: TWO_PI, from: false, to: false }];
+  const valid = arcs.map(r => r.span > 1e-9 && onRing(r.a + r.span / 2));
+  let run = null;
+  if (valid.some(Boolean) && !valid.every(Boolean)) {
+    const first = valid.indexOf(false), rank = (r) => (r.from && r.to ? 1 : 0);
+    for (let k = 1, cur = null; k <= arcs.length; k++) {
+      const i = (first + k) % arcs.length;
+      if (valid[i]) cur = cur ? { ...cur, span: cur.span + arcs[i].span, to: arcs[i].to } : { theta0: arcs[i].a, span: arcs[i].span, from: arcs[i].from, to: arcs[i].to };
+      if ((!valid[i] || k === arcs.length) && cur) {
+        if (!run || rank(cur) > rank(run) || (rank(cur) === rank(run) && cur.span > run.span)) run = cur;
+        cur = null;
+      }
+    }
+    if (run) run = { theta0: run.theta0, span: run.span };
   }
-  const run = longestRun(crease.map(Boolean));
-  const pts = run ? Array.from({ length: run.count }, (_, k) => crease[(run.start + k) % THETA_STEPS]) : [];
 
   // The circle where the plane cuts the sphere: it passes through both touch
   // points. The back arc is its stretch between them through the back.
@@ -196,26 +246,31 @@ function computeJointCurve(node, farA, farB) {
   for (const cand of [phi[1], phi[1] + 2 * Math.PI, phi[1] - 2 * Math.PI]) {
     if (through0(cand) && (!through0(phiEnd) || Math.abs(cand - phi[0]) < Math.abs(phiEnd - phi[0]))) phiEnd = cand;
   }
-  const back = [touch[0], ...circle(e1, e2, phi[0], phiEnd, ARC_STEPS).slice(1, -1), touch[1]];
+  const back = [touch[0], ...circle(e1, e2, phi[0], phiEnd, arcSteps(phiEnd - phi[0], rho, tol)).slice(1, -1), touch[1]];
 
   let front;
   if (run) {
-    const near = (a, b) => len(vecSub(a, b));
-    const startsAtPlus = near(pts[0].point, touch[0].p) <= near(pts[0].point, touch[1].p);
-    // A crease point lies on both cones: it faces the camera only if both normals do.
-    const h = 1e-3 * node.radius;
-    const gradB = (p) => vecNormalize({
-      x: sdfB({ x: p.x + h, y: p.y, z: p.z }) - sdfB({ x: p.x - h, y: p.y, z: p.z }),
-      y: sdfB({ x: p.x, y: p.y + h, z: p.z }) - sdfB({ x: p.x, y: p.y - h, z: p.z }),
-      z: sdfB({ x: p.x, y: p.y, z: p.z + h }) - sdfB({ x: p.x, y: p.y, z: p.z - h }),
-    });
-    const exact = pts.map(q => ({ p: onPlane(q.point), n: q.outward, n2: gradB(q.point) }));
-    front = [startsAtPlus ? touch[0] : touch[1], ...exact, startsAtPlus ? touch[1] : touch[0]];
+    // Cut the arc into chords no farther than tol from it: halve a segment until its
+    // middle is within tol of the chord (never fewer than 4 segments of the arc).
+    const at = (th) => { const q = ringPoint(th, tAt(th)); return { p: onPlane(q.point), n: q.outward, n2: q.n2 }; };
+    const dist = (a, b) => len(vecSub(a, b));
+    const pts = [];
+    const split = (th0, p0, th1, p1, depth) => {
+      const thm = (th0 + th1) / 2, pm = at(thm), chordMid = scale(add(p0.p, p1.p), 0.5);
+      if (depth < 12 && (depth < 2 || dist(pm.p, chordMid) > tol)) split(th0, p0, thm, pm, depth + 1);
+      pts.push(pm);
+      if (depth < 12 && (depth < 2 || dist(pm.p, chordMid) > tol)) split(thm, pm, th1, p1, depth + 1);
+    };
+    const th0 = run.theta0, th1 = run.theta0 + run.span;
+    const eStart = at(th0), eEnd = at(th1);
+    split(th0, eStart, th1, eEnd, 0);
+    const startsAtPlus = dist(eStart.p, touch[0].p) <= dist(eStart.p, touch[1].p);
+    front = [startsAtPlus ? touch[0] : touch[1], ...pts, startsAtPlus ? touch[1] : touch[0]];
   } else {
     // The surfaces never leave each other past the sphere: use the other half
     // of the circle so the ring still closes.
     const other = phiEnd > phi[0] ? phiEnd - 2 * Math.PI : phiEnd + 2 * Math.PI;
-    front = [touch[0], ...circle(e1, e2, phi[0], other, ARC_STEPS).slice(1, -1), touch[1]];
+    front = [touch[0], ...circle(e1, e2, phi[0], other, arcSteps(other - phi[0], rho, tol)).slice(1, -1), touch[1]];
   }
 
   // Close the ring: front runs P_start -> P_end, so the back must run P_end -> P_start.
@@ -223,7 +278,7 @@ function computeJointCurve(node, farA, farB) {
   const backBack = frontStartsAtPlus ? back.slice().reverse() : back;
   const loop = [...front, ...backBack.slice(1)];
   // The ring is the crease of cone A's generatrices over this cyclic angle range.
-  const ringRange = run ? { theta0: (run.start / THETA_STEPS) * Math.PI * 2, span: (run.count / THETA_STEPS) * Math.PI * 2 } : null;
+  const ringRange = run;
   return { hasTouch: true, touch, front, back, loop, plane, ringRange };
 }
 
@@ -245,18 +300,19 @@ export function edgeContacts(node, farA, farB, curve) {
     const d = vecSub(p, node.center), r = vecSub(d, scale(frameA.dir, vecDot(d, frameA.dir)));
     const th = Math.atan2(vecDot(r, rv), vecDot(r, ru));
     const rel = (((th - ringRange.theta0) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
-    return rel <= ringRange.span + (2 * Math.PI) / THETA_STEPS;
+    return rel <= ringRange.span + 1e-9;
   };
   return [farA, farB].map((far) => {
     const frame = coneFrame(node, far), cone = tangentCone(node, far, frame);
-    const nz = (th) => coneSurface(node, frame, cone, th)(cone.sA).outward.z;
+    // The silhouette generatrices: the outward normal r(a) cosT + axis sinT has z = 0
+    // where r.z = u.z cos a + v.z sin a = Wz cos(a - psi) equals -axis.z tanT, so
+    // a = psi +- acos(-axis.z tanT / Wz) (none when |.| >= 1: no silhouette).
+    const Wz = Math.hypot(frame.u.z, frame.v.z), psi = Math.atan2(frame.v.z, frame.u.z);
+    const c = Wz > 1e-12 ? -frame.dir.z * (cone.sinT / cone.cosT) / Wz : Infinity;
     const out = [];
-    const N = 720;
-    for (let i = 0; i < N && out.length < 2; i++) {
-      let t0 = (i / N) * Math.PI * 2, t1 = ((i + 1) / N) * Math.PI * 2, f0 = nz(t0);
-      if (f0 * nz(t1) > 0 || f0 === 0) continue;
-      for (let it = 0; it < 50; it++) { const m = (t0 + t1) / 2, fm = nz(m); if (f0 * fm <= 0) t1 = m; else { t0 = m; f0 = fm; } }
-      const at = coneSurface(node, frame, cone, (t0 + t1) / 2);
+    const angles = Math.abs(c) < 1 ? [psi + Math.acos(c), psi - Math.acos(c)].map(a => ((a % TWO_PI) + TWO_PI) % TWO_PI).sort((a, b) => a - b) : [];
+    for (const th of angles) {
+      const at = coneSurface(node, frame, cone, th);
       const p0 = at(cone.sA).point, p1 = at(cone.sA + 1).point;
       const dirv = vecSub(p1, p0), denom = vecDot(plane, dirv);
       let contact = null;
