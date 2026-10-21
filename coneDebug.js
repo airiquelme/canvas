@@ -2,10 +2,10 @@
 // projected. Drawn on top of the frame; buried parts dotted, far side dashed.
 import { bisectRoot, hullPlanes, insideHull, vecSub, vecDot } from './geometry.js';
 import { nodes } from './scene.js';
-import { tangentCone, coneSurface, hostElements, findSplitRing } from './splitRing.js';
+import { tangentCone, coneSurface, hostElements, findSplitRing, findLastContact } from './splitRing.js';
 
 const ANGLES = 96, STEPS = 48;
-const COLORS = { face: '#ff1744', sphere: '#ec407a', frustum: '#0097a7', shared: '#1e88e5', ring: '#ffb300' };
+const COLORS = { sphere: '#ec407a', ring: '#ffb300', last: '#76ff03' };
 
 // Is p buried in the host mesh: inside any element other than `skip` (the
 // one the curve lies on), or inside the hull of the node centers (the faces).
@@ -15,7 +15,9 @@ function isBuried(p, els, skip, planes) {
 }
 
 // curves: [{ kind, closed, points: [{ x, y, front, inside }] }]. Kind 'ring'
-// is the split circle the split cone uses; 'touch' is where it meets the host.
+// is the split circle the split cone uses; 'touch' is where it meets the host,
+// 'last' the cone's last contact with it (findLastContact; hollow when that is
+// the tangent point on the shared sphere).
 export function buildConeDebugCurves(split, mesh, hostMesh, camPos, projectPoint) {
   const shared = nodes[split.splitNodeId];
   const far = nodes[mesh.nodeIds.find(id => id !== split.splitNodeId)];
@@ -35,7 +37,8 @@ export function buildConeDebugCurves(split, mesh, hostMesh, camPos, projectPoint
   for (let i = 0; i < ANGLES; i++) {
     const at = coneSurface(shared, frame, cone, (i / ANGLES) * Math.PI * 2);
     els.forEach((el, e) => {
-      if (el === sharedEl) return; // its curve is the tangent circle below
+      // Not drawn: the shared sphere, the capsules and the faces (too busy).
+      if (el === sharedEl || el.kind === 'frustum' || el.kind === 'face') return;
       const f = (s) => el.sdf(at(s).point);
       let prev = f(cone.sA), k = 0;
       for (let j = 1; j <= STEPS; j++) {
@@ -53,21 +56,22 @@ export function buildConeDebugCurves(split, mesh, hostMesh, camPos, projectPoint
   }
 
   const curves = [];
+
   els.forEach((el, e) => roots[e].forEach(points => {
     if (points.some(Boolean)) curves.push({ kind: el.kind, closed: points.every(Boolean), points });
   }));
 
-  // Cone / shared sphere: the tangent circle.
   const circleAt = (s, skip) => Array.from({ length: ANGLES }, (_, i) => {
     const { point, outward } = coneSurface(shared, frame, cone, (i / ANGLES) * Math.PI * 2)(s);
     return screenPoint(point, outward, skip);
   });
-  curves.push({ kind: 'shared', closed: true, points: circleAt(cone.sA, sharedEl) });
 
   // The split circle, slid out until it clears the host, and its touch point.
   curves.push({ kind: 'ring', closed: true, points: circleAt(ring.s, sharedEl) });
   const touch = projectPoint(ring.touch);
   curves.push({ kind: 'touch', closed: false, points: [{ x: touch.x, y: touch.y }] });
+  const last = findLastContact(shared, far, hostMesh), lastAt = projectPoint(last.point);
+  curves.push({ kind: 'last', closed: false, hollow: last.onSphere, points: [{ x: lastAt.x, y: lastAt.y }] });
   return curves;
 }
 
@@ -79,13 +83,24 @@ export function drawConeDebugCurves(ctx, curves) {
   ctx.lineCap = 'round';
   // One path per run of same-style segments, so the dash pattern flows
   // instead of restarting on every short segment.
-  curves.forEach(({ kind, closed, points }) => {
-    if (kind === 'touch') {
+  curves.forEach(({ kind, closed, hollow, points }) => {
+    if (kind === 'touch' || kind === 'last') {
       ctx.setLineDash([]);
-      ctx.fillStyle = COLORS.ring;
-      ctx.strokeStyle = '#000000';
       ctx.beginPath();
       ctx.arc(points[0].x, points[0].y, 4, 0, Math.PI * 2);
+      if (hollow) {
+        // A ring: black under the color, so it reads on any background.
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#000000';
+        ctx.stroke();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = COLORS[kind];
+        ctx.stroke();
+        ctx.lineWidth = 1.5;
+        return;
+      }
+      ctx.fillStyle = kind === 'touch' ? COLORS.ring : COLORS[kind];
+      ctx.strokeStyle = '#000000';
       ctx.fill();
       ctx.stroke();
       return;

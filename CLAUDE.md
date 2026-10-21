@@ -12,16 +12,17 @@ http://localhost:8000. The page uses ES modules, so opening the file directly
 ## Modules
 | File | Contents |
 |---|---|
-| `config.js` | Design size, `debug` state, `SEAM_PX`, split-cone strip settings |
+| `config.js` | Design size, `debug` state, `SEAM_PX`, focus view |
 | `geometry.js` | Pure math: vectors, angles, capsule tangents, hulls, segment/circle hits, 3D signed distances and root finding |
 | `camera.js` | Orbit camera, view basis, projection (`makeProjector`) |
 | `scene.js` | `nodes` / `meshes` stores, `createNode` / `createMesh`, the demo scene |
 | `shapes.js` | Canvas drawing primitives (capsules, joint disc, split cone, traced pieces) |
 | `render.js` | Assembles one frame |
-| `splitRing.js` | Split cone geometry in 3D: tangent cone, host solid SDF, `findSplitRing` |
+| `splitRing.js` | Split cone geometry in 3D: tangent cone, host first contact (`findSplitRing`), host SDF (debug) |
 | `jointCurve.js` | Real 3D split of a joint: touch points and the planar joint ring (cone/cone intersection + back circle) |
 | `jointSplit.js` | Screen-space terminator from the ring (visible part, clipped to the node circle) |
 | `coneDebug.js` | Debug button's cone overlay: split cone ∩ host mesh curves |
+| `jointDebug.js` | Debug button's joint overlay: joint rings, touch points, cone edge stops |
 | `main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
 
 **Frame pipeline (`render`):** project nodes → ownership map (node → meshes) →
@@ -128,7 +129,13 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
   overlap past the disc, and it lies inside the front mesh's silhouette. The back
   cone and the disc are drawn under it; `orderJointBodies` makes sure the front
   body sorts after the back one, split cones included (a split cone keeps its
-  layered key, so the other body moves to the right side of it). Without that the
+  layered key, so the other body moves to the right side of it). All joints are
+  settled together, not one at a time: a cone between two joints is one
+  primitive, and settling the joints one by one let the second undo the first
+  (orange drawn over blue at the blue/orange joint, 1.75-1.84 and 4.53-4.72,
+  because the orange/yellow joint had put orange right after the yellow split
+  cone). A back body that is itself the front at another joint stays put and
+  the front body moves instead; each disc is kept after its (moved) bodies. Without that the
   two bodies, which also overlap a little outside the ring, could paint in the
   wrong order for some angles. No cuts, clips or chords are needed.
   This replaced an older design: a phase-based terminator ellipse, with a seam
@@ -140,10 +147,26 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
   dropping it changes at most ~40 sliver pixels per frame.
 - **Split cone.** A 2-node mesh sharing a node with a 3+ node mesh, drawn by
   `drawSplitShared` / `drawSplitFar`. The cone is the tangent hull of its two spheres, and its
-  color changes at a *split ring*: the circle perpendicular to the axis that
-  `findSplitRing` (`splitRing.js`) slides out from the shared node until the
-  whole circle is clear of the host mesh (spheres, capsules, faces), so it
-  touches the host's edge. This is camera-independent.
+  color changes at a *split ring*: the circle perpendicular to the axis at the
+  host's *first contact* (`findSplitRing`, `splitRing.js`): the largest axial
+  distance at which the cone's circle still meets the host. The host is its
+  spheres, the true tangent cones between each pair (its capsules) and its faces
+  (planes tangent to three spheres); `firstContact` takes each element's last
+  contact and the largest wins:
+  - sphere: the circle point nearest its center is in the center's radial
+    direction, so contact is a quadratic in s;
+  - capsule from the shared node: it and the split cone are both tangent to the
+    shared sphere, so they meet in a plane (as at a joint); along each generatrix
+    the plane's distance is a Mobius function of one scalar w = n.r(a), so its
+    largest valid value is at w = +-W or a pole: closed form;
+  - face: the circle's deepest point toward the plane is linear in s; kept if
+    it lands on the face's triangle;
+  - capsule between two other spheres: each generatrix's exit is a quadratic
+    root, maximized over the generatrices numerically (rare: the cone must run
+    along the host).
+  Camera-independent and cached. It replaced sliding a 128-point circle out in
+  64 steps against an approximate host sdf (ring within ~0.03 units of the old
+  one; the old one also missed cones pointing into the host).
   - the part from the shared node to the ring takes the host mesh's color;
   - the rest keeps its own color;
   - each part is the convex hull of the projected ring and its end circle,
@@ -161,13 +184,11 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
     each points at the camera;
   - if the far node is a joint, the far part has no cap there (chord instead)
     and the joint disc is drawn after it;
-  - **Strip.** The host's silhouette bulges slightly past the ring plane beside
-    the touching point, and the cone's far part is in front of that bulge. A
-    per-primitive painter order can't express that, so when the cone is drawn
-    before the host and the ring is nearly edge-on (|cos| < `SPLIT_STRIP_MAX_FLAT`),
-    `drawSplitStrip` lays a thin far-colored strip (`SPLIT_STRIP_FRAC` of the ring
-    radius, minus the ring's ellipse) after the host. Gated because from above
-    the host really is in front, and the strip would paint over it.
+  - no edge-on strip: a band of the far color laid over the host past the ring
+    (when the far part is drawn first and the ring nearly edge-on) used to paint
+    over the host's bulge beside the touch point. It was a fixed-width guess that
+    popped on and off at its cutoff, and was dropped; near edge-on the host may
+    show a small bite past the ring.
 - **Batching.** Plain pieces (no joint end, not split) are *traced* into one
   path and filled once per run of consecutive same-mesh primitives, as a
   nonzero union. Every subpath must wind anticlockwise on screen.
@@ -205,16 +226,31 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
 
 ## Debugging
 - The **Debug** button turns all the debug views on and off together
-  (`debug.on` in `config.js`, off at load; `debug.gap` / `cone` choose which
-  views it shows):
+  (`debug.on` in `config.js`, off at load; `debug.gap` / `cone` / `joint`
+  choose which views it shows):
   - gap: paints the background magenta, which makes seam gaps show up;
   - cone (`coneDebug.js`): draws, on top of the frame, where each split cone's
     surface meets its host mesh in 3D (root-found along the cone's
     generatrices): amber = the split ring the split cone uses (dot = where it
-    touches the host), blue = true cone ∩ shared sphere, teal = cone ∩ host
-    capsules, red = cone ∩ the host's flat faces (planes tangent to three
-    spheres), pink = cone ∩ other host spheres. Dotted = buried in the host;
-    otherwise solid = near side of the cone, dashed = far side;
+    touches the host), pink = cone ∩ other host spheres (the curves on the
+    capsules and faces aren't drawn). Dotted = buried in the host;
+    otherwise solid = near side of the cone, dashed = far side. Lime dot = the
+    cone's *last* contact (`findLastContact`): walking each generatrix from the
+    far node inward, its entry is where it first goes into the host; the amber
+    dot is the generatrix whose entry is farthest out, the lime one the
+    generatrix whose entry is nearest the shared node. A hollow lime ring means
+    that generatrix never enters the host and reaches the shared sphere at its
+    tangent point. (Splitting the colors at a ring tilted through both dots was
+    tried, with the ring rebuilt in the flat solid, a front-arc split and the
+    host clipped at the ring, and dropped: in 3D the host covers parts of a
+    tilted ring at some angles, so any 2D border there clips awkwardly.)
+  - joint (`jointDebug.js`): each 2-to-2 joint's ring in the flat solid:
+    magenta = touch points, cyan = the cones' intersection (front of the ring),
+    green = the plane's circle across the sphere's back; solid where it faces
+    the camera, dashed where it faces away. Each cone edge's stop
+    (`joint.contacts`): black dot = where it touches the ring, hollow ring =
+    where it ends on the node circle instead. The label gives the phase and the
+    front mesh's color;
 - The **Angle** slider at the bottom picks the camera's orbit angle (it pauses the
   orbit; while it runs the slider follows it). Use its value to report an angle.
 - The **Focus** button (`focus` in `config.js`, off at load) draws only the meshes

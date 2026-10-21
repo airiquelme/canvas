@@ -1,5 +1,5 @@
 // Canvas drawing primitives. Layering rules and terms: see CLAUDE.md.
-import { SEAM_PX, SPLIT_STRIP_FRAC } from './config.js';
+import { SEAM_PX } from './config.js';
 import {
   vecSub, vecCross, vecDot, vecNormalize, circleRimPoint,
   capsuleTangentPoints, convexHull,
@@ -208,24 +208,6 @@ function projectAxialCircle(center, radius, frame, n, projectPoint) {
 // A split ring's circle, projected: the hull points of the cone's own part at the ring.
 export function splitRingPoints(ring, projectPoint) {
   return projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
-}
-
-// The far color's strip just past the split ring, minus the ring's own
-// ellipse (the shared part owns that), drawn after the host (CLAUDE.md "Split cone").
-export function drawSplitStrip(ctx, ring, color, projectPoint) {
-  const d = Math.min(SPLIT_STRIP_FRAC * ring.ringRadius, ring.cone.sB - ring.s);
-  const shiftedCenter = {
-    x: ring.surface.x + ring.dir.x * d, y: ring.surface.y + ring.dir.y * d, z: ring.surface.z + ring.dir.z * d,
-  };
-  const ringPts = projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
-  const shifted = projectAxialCircle(shiftedCenter, ring.ringRadius + ring.cone.slope * d, ring.frame, 128, projectPoint);
-  ctx.beginPath();
-  convexHull(ringPts.concat(shifted)).forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-  ctx.closePath();
-  ringPts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill('evenodd');
 }
 
 // The host-colored part, from the shared node to the ring: the hull of the

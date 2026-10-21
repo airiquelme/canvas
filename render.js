@@ -1,16 +1,17 @@
 // Frame assembly: project -> ownership -> joints -> primitives -> depth
 // sort -> batched draw. Terms (joint, joint ring, split cone): see CLAUDE.md.
-import { DESIGN_WIDTH, DESIGN_HEIGHT, debug, focus, SPLIT_STRIP_MAX_FLAT } from './config.js';
+import { DESIGN_WIDTH, DESIGN_HEIGHT, debug, focus } from './config.js';
 import { buildJointCurve, edgeContacts } from './jointCurve.js';
 import { projectJointSplit } from './jointSplit.js';
 import { findSplitRing } from './splitRing.js';
 import { buildConeDebugCurves, drawConeDebugCurves } from './coneDebug.js';
+import { drawJointDebug } from './jointDebug.js';
 import { vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, circleRimPoint, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from './camera.js';
 import { nodes, meshes } from './scene.js';
 import {
   seamUnderlap, fillCircle, drawTriangle, traceCapsule, traceCircle, traceTriangle,
-  drawPairCapsule, drawJointBody, drawJointSplitFromCurve, drawSplitShared, drawSplitFar, drawSplitStrip, splitRingPoints,
+  drawPairCapsule, drawJointBody, drawJointSplitFromCurve, drawSplitShared, drawSplitFar, splitRingPoints,
 } from './shapes.js';
 
 function applyDesignSpaceTransform(ctx, canvas) {
@@ -187,13 +188,6 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
       depth: hostMax + 0.0005,
       draw: () => drawSplitShared(ctx, sharedProj, splitRing, axisCam, split.hostMesh.color, projectPoint),
     });
-    // Drawn before the host, edge-on: lay the far color over the host's bulge.
-    if (facing <= 0 && -facing < SPLIT_STRIP_MAX_FLAT) {
-      frame.extraPrimitives.push({
-        depth: hostMin - 0.002,
-        draw: () => drawSplitStrip(ctx, splitRing, color, projectPoint),
-      });
-    }
   }
 
   // A cone ending at a joint stops at the joint ring: its body is the hull of
@@ -308,17 +302,36 @@ function jointDepth(frame, nodeId) {
 // The front mesh's body (the one on the camera's side of the ring) must draw
 // after the back one, over the lens where they overlap. The sort key (depth of a
 // capsule's farther node) can tie or order them wrongly when both arms point at
-// the camera, so settle it here. A split cone keeps its own layered key.
-function orderJointBodies(frame, nodeId) {
-  const joint = frame.joints[nodeId], bodies = frame.jointBodies[nodeId];
-  if (!bodies || bodies.length !== 2) return;
-  const frontId = joint.frontIsA ? joint.meshA.id : joint.meshB.id;
-  const front = bodies.find(body => body.meshId === frontId), back = bodies.find(body => body !== front);
-  if (!front || !back || back.prim.depth >= front.prim.depth + 0.0005) return;
-  // A split cone keeps its layered key (it is sorted around its host), so the other
-  // body moves to the right side of it; two plain bodies: the back one moves.
-  if (!back.isSplit) back.prim.depth = front.prim.depth + 0.0005;
-  else if (!front.isSplit) front.prim.depth = back.prim.depth - 0.0005;
+// the camera, so settle it here. A split cone keeps its own layered key. A body
+// can sit at two joints (a cone between two joints is one primitive), so all the
+// joints are settled together: settling them one by one let the last joint undo
+// the first (orange drawn over blue at the blue/orange joint because the
+// orange/yellow joint put orange right after the yellow split cone). The back body
+// moves to be drawn earlier, unless it is a split cone or is itself the front body
+// at another joint; then the front body moves to be drawn later.
+const ORDER_EPS = 0.0005;
+function orderJointBodies(frame) {
+  const pairs = [];
+  Object.keys(frame.joints).forEach(key => {
+    const joint = frame.joints[key], bodies = frame.jointBodies[key];
+    if (!bodies || bodies.length !== 2) return;
+    const frontId = joint.frontIsA ? joint.meshA.id : joint.meshB.id;
+    const front = bodies.find(body => body.meshId === frontId), back = bodies.find(body => body !== front);
+    if (front && back) pairs.push({ front, back });
+  });
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
+    pairs.forEach(pair => {
+      const { front, back } = pair;
+      if (back.prim.depth >= front.prim.depth + ORDER_EPS) return;
+      const backLeadsElsewhere = pairs.some(p => p !== pair && p.front.prim === back.prim);
+      if (!back.isSplit && !backLeadsElsewhere) back.prim.depth = front.prim.depth + ORDER_EPS;
+      else if (!front.isSplit) front.prim.depth = back.prim.depth - ORDER_EPS;
+      else return;
+      changed = true;
+    });
+    if (!changed) break;
+  }
 }
 
 function buildJointPrimitive(frame, nodeId) {
@@ -387,7 +400,7 @@ export function render(ctx, canvas, { darkMode }) {
     joints: computeJoints(jointNodeIds, owners, projected, camPos, basis, projectPoint),
     coneDepths: {},          // split cone mesh id -> sort key, for joints at their far end
     jointBodies: {},         // joint node id -> the two meshes' bodies there (draw order)
-    extraPrimitives: [],     // split-cone strips, sorted with the rest
+    extraPrimitives: [],     // split cones' host-colored parts, sorted with the rest
   };
 
   const primitives = [];
@@ -404,17 +417,25 @@ export function render(ctx, canvas, { darkMode }) {
       }
     }
   });
+  const jointPrims = {};
   Object.keys(frame.joints).forEach(key => {
     const joint = frame.joints[key];
     if (!isShown(joint.meshA) || !isShown(joint.meshB)) { delete frame.joints[key]; return; }
-    primitives.push(buildJointPrimitive(frame, Number(key)));
-    orderJointBodies(frame, Number(key));
+    primitives.push(jointPrims[key] = buildJointPrimitive(frame, Number(key)));
+  });
+  orderJointBodies(frame);
+  // A joint's disc stays after its bodies, wherever the ordering moved them.
+  Object.keys(jointPrims).forEach(key => {
+    const bodies = frame.jointBodies[key] || [];
+    jointPrims[key].depth = Math.min(jointPrims[key].depth, ...bodies.map(b => b.prim.depth - 0.0001));
   });
   primitives.push(...frame.extraPrimitives);
 
   drawPrimitives(ctx, primitives);
 
   lastFrame = frame;
+
+  if (debug.on && debug.joint) drawJointDebug(ctx, frame.joints);
 
   if (debug.on && debug.cone && !focus.on) {
     Object.values(meshes).forEach(mesh => {
