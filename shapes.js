@@ -2,8 +2,12 @@
 import { SEAM_PX } from './config.js';
 import {
   vecSub, vecCross, vecDot, vecNormalize,
-  capsuleTangentPoints, convexHull,
+  capsuleTangentPoints, convexHull, ellipseHullArcs, ellipsePoint, ellipseParam, supportH,
+  hullOutline, projectedCircleEllipse, ellipsePolygon,
 } from './geometry.js';
+
+// A projected node as an ellipse object: { center, a, b, angle }.
+export const nodeEllipse = (p) => ({ center: p.center, a: p.ellipse.a, b: Math.max(p.ellipse.b, 1e-6), angle: p.ellipse.angle });
 
 // Device pixels per drawing unit under the current transform (read once per frame).
 export function pixelScale(ctx) {
@@ -45,6 +49,42 @@ export function traceCapsule(ctx, c1, r1, c2, r2, skipCap1 = false, skipCap2 = f
   ctx.lineTo(p2b.x, p2b.y);
   if (skipCap1) ctx.lineTo(p1a.x, p1a.y);
   else ctx.arc(c1.x, c1.y, r1, t2Angle, t1Angle, true);
+  ctx.closePath();
+}
+
+// The hull of two ellipses (the capsule of squashed nodes): the common tangent segments and
+// the arcs between them, anticlockwise on screen like traceCapsule. skip1 / skip2 leave out
+// the arcs of that ellipse (its cap), joining the tangents by a chord instead.
+export function traceEllipseCapsule(ctx, e1, e2, skip1 = false, skip2 = false) {
+  const es = [e1, e2], skips = [skip1, skip2];
+  const { whole, arcs } = ellipseHullArcs(e1, e2);
+  if (whole) {
+    const { k } = arcs[0];
+    if (!skips[k]) traceEllipse(ctx, es[k]);
+    return;
+  }
+  const start = ellipsePoint(es[arcs[0].k], arcs[0].from);
+  ctx.moveTo(start.x, start.y);
+  arcs.forEach(arc => {
+    const e = es[arc.k];
+    if (skips[arc.k]) {
+      // No cap: the tangent line comes in to the arc's start and a chord runs to its end (like
+      // traceCapsule's lineTo p1b, lineTo p2a), so both tangent lines of this end are kept.
+      const p0 = ellipsePoint(e, arc.from), p1 = ellipsePoint(e, arc.to);
+      ctx.lineTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      return;
+    }
+    ctx.ellipse(e.center.x, e.center.y, e.a, e.b, e.angle, ellipseParam(e, arc.from), ellipseParam(e, arc.to), true);
+  });
+  ctx.closePath();
+}
+
+// A whole ellipse, anticlockwise on screen.
+export function traceEllipse(ctx, e) {
+  const p = ellipsePoint(e, e.angle);
+  ctx.moveTo(p.x, p.y);
+  ctx.ellipse(e.center.x, e.center.y, e.a, e.b, e.angle, 0, -Math.PI * 2, true);
   ctx.closePath();
 }
 
@@ -182,54 +222,146 @@ export function circlePoints(center, radius, n) {
   return Array.from({ length: n }, (_, i) => ({ x: center.x + radius * cos[i], y: center.y + radius * sin[i] }));
 }
 
-// A circle perpendicular to the cone axis (from findSplitRing,
-// splitRing.js), projected.
-function projectAxialCircle(center, radius, frame, n, projectPoint) {
-  const pts = [], { cos, sin } = unitCircle(n), { u, v } = frame;
-  for (let i = 0; i < n; i++) {
-    const c = cos[i], sn = sin[i];
-    pts.push(projectPoint({
-      x: center.x + (u.x * c + v.x * sn) * radius,
-      y: center.y + (u.y * c + v.y * sn) * radius,
-      z: center.z + (u.z * c + v.z * sn) * radius,
-    }));
-  }
-  return pts;
+// ---------------------------------------------------------
+// OUTLINES (geometry.js hullOutline): corners, straight tangents and exact elliptical arcs
+// ---------------------------------------------------------
+
+const TWO_PI = Math.PI * 2;
+
+// Appends the outline to the path: a corner is a lineTo, an arc is ctx.ellipse for its range (a chord between its ends
+// when `skip`), the tangent segments between them come from the path's own connecting lines. Anticlockwise on screen.
+export function traceOutline(ctx, ops) {
+  let started = false;
+  const go = (p) => { if (started) ctx.lineTo(p.x, p.y); else { ctx.moveTo(p.x, p.y); started = true; } };
+  ops.forEach(op => {
+    if (op.k === 'p') { go(op.p); return; }
+    const e = op.e, p0 = ellipsePoint(e, op.from), p1 = ellipsePoint(e, op.to);
+    go(p0);
+    if (op.skip) { go(p1); return; }
+    const start = ellipseParam(e, op.from);
+    ctx.ellipse(e.center.x, e.center.y, e.a, e.b, e.angle, start, op.from - op.to >= TWO_PI - 1e-9 ? start - TWO_PI : ellipseParam(e, op.to), true);
+  });
+  ctx.closePath();
 }
 
-// A split ring's circle, projected: the hull points of the cone's own part at the ring.
-export function splitRingPoints(ring, projectPoint) {
-  return projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
+export function fillOutline(ctx, ops, color) {
+  ctx.beginPath();
+  traceOutline(ctx, ops);
+  ctx.fillStyle = color;
+  ctx.fill();
 }
 
-// The host-colored part, from the shared node to the ring: the hull of the
-// projected ring, the tangent circle, and the shared sphere's rim. The sphere
-// only counts up to its tangent circle: past it, the sphere is inside the
-// cone, so its rim points there (axial coordinate above sinT * r, with
-// axisCam the axis in camera space) are left out.
+// ---------------------------------------------------------
+// SPLIT CONE (round nodes): every curve is an exact ellipse
+// ---------------------------------------------------------
+
+// A split ring's circle (or the cone's tangent circle on the shared sphere) projected: an exact ellipse (the
+// perspective image of a circle is a conic).
+const ringEllipse = (ring, projectPoint) => projectedCircleEllipse(ring.surface, ring.ringRadius, ring.frame, projectPoint);
+
+// A split ring's circle as polygon points (chords within tol), the hull points of a cone's own part at a joint.
+export function splitRingPoints(ring, projectPoint, tol) {
+  return ellipsePolygon(ringEllipse(ring, projectPoint), tol);
+}
+
+// The host-colored part, from the shared node to the ring: the hull of the projected ring, the tangent circle, and
+// the shared sphere's rim. The sphere only counts up to its tangent circle: past it, the sphere is inside the cone,
+// so its rim points there (axial coordinate above sinT * r, axisCam the axis in camera space: n . axis = R cos(theta +
+// delta) <= sinT for the rim point at angle theta) are left out: the rim is an arc, from acos(sinT / R) - delta around
+// to 2 PI - acos(sinT / R) - delta.
 export function drawSplitShared(ctx, sharedProj, ring, axisCam, color, projectPoint) {
-  const ringPts = projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
-  const tangentPts = projectAxialCircle(ring.tangentCenter, ring.tangentRadius, ring.frame, 128, projectPoint);
-  const rim = circlePoints(sharedProj.center, sharedProj.radius, 128), { cos, sin } = unitCircle(128);
-  const sharedSide = rim.filter((_, i) => cos[i] * axisCam.x - sin[i] * axisCam.y <= ring.cone.sinT + 1e-9);
-  fillPolygon(ctx, convexHull(sharedSide.concat(tangentPts, ringPts)), color);
+  const rim = { center: sharedProj.center, a: sharedProj.radius, b: sharedProj.radius, angle: 0 };
+  const items = [{ e: ringEllipse(ring, projectPoint) }, { e: projectedCircleEllipse(ring.tangentCenter, ring.tangentRadius, ring.frame, projectPoint) }];
+  const R = Math.hypot(axisCam.x, axisCam.y), sinT = ring.cone.sinT;
+  if (R < 1e-12) { if (sinT >= -1e-9) items.push({ e: rim }); }
+  else {
+    const q = sinT / R;
+    if (q >= 1) items.push({ e: rim });
+    else if (q > -1) { const c = Math.acos(q), delta = Math.atan2(axisCam.y, axisCam.x); items.push({ e: rim, th0: c - delta, th1: TWO_PI - c - delta }); }
+  }
+  fillOutline(ctx, hullOutline(items), color);
 }
 
-// Drops the interior of a hull's run of `arc` points, keeping the run's two
-// ends: the far end of the cone gets a chord instead of its cap.
-function chordOffArc(hull, arc) {
-  const n = hull.length, on = hull.map(p => arc.has(p));
-  if (!on.some(Boolean) || on.every(Boolean)) return hull;
-  return hull.filter((p, i) => !on[i] || !on[(i + n - 1) % n] || !on[(i + 1) % n]);
-}
-
-// The cone's own part, from the ring to the far node. When the far node is a
-// joint (opts.farIsJoint) this part has no cap there: the joint circle is drawn
-// separately and the part ends in a chord.
+// The cone's own part, from the ring to the far node. When the far node is a joint (opts.farIsJoint) this part has no
+// cap there: the joint circle is drawn separately and the part ends in a chord.
 export function drawSplitFar(ctx, farProj, ring, color, projectPoint, opts = {}) {
-  const ringPts = projectAxialCircle(ring.surface, ring.ringRadius, ring.frame, 128, projectPoint);
-  const farCircle = circlePoints(farProj.center, farProj.radius, 128);
-  let hull = convexHull(ringPts.concat(farCircle));
-  if (opts.farIsJoint) hull = chordOffArc(hull, new Set(farCircle));
-  fillPolygon(ctx, hull, color);
+  const farCircle = { center: farProj.center, a: farProj.radius, b: farProj.radius, angle: 0 };
+  fillOutline(ctx, hullOutline([{ e: ringEllipse(ring, projectPoint) }, { e: farCircle, skip: !!opts.farIsJoint }]), color);
+}
+
+// ---------------------------------------------------------
+// SPLIT CONE WITH SQUASHED NODES (splitRing.js findGeneralSplitRing)
+// ---------------------------------------------------------
+
+// A world point q on a node's side of the cone, on the screen by that node's own linear map.
+function screenOf(node, proj, q) {
+  const dx = q.x - node.center.x, dy = q.y - node.center.y, dz = q.z - node.center.z, { right, up } = proj.axes;
+  return {
+    x: proj.center.x + proj.scale * (dx * right.x + dy * right.y + dz * right.z),
+    y: proj.center.y - proj.scale * (dx * up.x + dy * up.y + dz * up.z),
+  };
+}
+
+// The split ring's screen polygon and the cone's tangent curve on the shared node (the generatrices'
+// shared ends). A ring point is its generatrix' two ends, each mapped by its own node's linear map
+// (so they lie on the nodes' drawn ellipses), interpolated at the ring's parameter.
+export function splitScreenPoints(ring, sharedNode, sharedProj, farNode, farProj) {
+  const { cone, tStar } = ring.general, ringPts = [], tangentPts = [];
+  cone.gens.forEach((gen, i) => {
+    const a = screenOf(sharedNode, sharedProj, gen.pA), b = screenOf(farNode, farProj, gen.pB), t = tStar[i];
+    tangentPts.push(a);
+    ringPts.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+  });
+  return { ringPts, tangentPts };
+}
+
+// The rim directions (screen normal angles) where the shared body reaches farther than the far body: the shared side
+// of the cone. A rim point with screen normal (cx, cy) has the world normal cx right - cy up (the node's own linear
+// map); the sphere test n . axis <= sinT is exactly supportH(shared) >= supportH(far). Returns 'full', null or
+// { th0, th1 } (increasing): the longest run of directions where it holds, its ends found by bisection.
+function sharedSideRange(sharedNode, farNode, sharedProj) {
+  const { right, up } = sharedProj.axes;
+  const f = (th) => {
+    const c = Math.cos(th), s = Math.sin(th);
+    const n = { x: c * right.x - s * up.x, y: c * right.y - s * up.y, z: c * right.z - s * up.z };
+    return supportH(sharedNode, n) - supportH(farNode, n);
+  };
+  const N = 96, vals = Array.from({ length: N }, (_, i) => f((i / N) * TWO_PI));
+  if (vals.every(v => v >= 0)) return 'full';
+  if (vals.every(v => v < 0)) return null;
+  const edge = (a, b) => {            // the sign change between angles a and b
+    let lo = a, hi = b, flo = f(a) >= 0;
+    for (let it = 0; it < 40; it++) { const m = (lo + hi) / 2; if ((f(m) >= 0) === flo) lo = m; else hi = m; }
+    return (lo + hi) / 2;
+  };
+  let best = null;
+  const start = vals.findIndex(v => v < 0);
+  for (let k = 1; k <= N; k++) {
+    const i = (start + k) % N;
+    if (vals[i] < 0) continue;
+    let j = i, len = 1;
+    while (vals[(j + 1) % N] >= 0 && len < N) { j = (j + 1) % N; len++; }
+    if (!best || len > best.len) best = { i, j, len };
+    k += len - 1;
+  }
+  const iPrev = (best.i - 1 + N) % N, jNext = (best.j + 1) % N;
+  const th0 = edge((iPrev / N) * TWO_PI, (best.i / N) * TWO_PI);
+  let th1 = edge((best.j / N) * TWO_PI, (jNext === 0 ? N : jNext) / N * TWO_PI);
+  if (th1 < th0) th1 += TWO_PI;
+  return { th0, th1 };
+}
+
+// The host-colored part, from the shared node to the ring: the hull of the ring, the tangent curve (polygons, they are
+// curves of generatrices) and the arc of the shared node's rim ellipse on the shared side of the cone.
+export function drawSplitSharedGeneral(ctx, sharedNode, sharedProj, farNode, pts, color) {
+  const items = [{ pts: pts.tangentPts.concat(pts.ringPts) }], range = sharedSideRange(sharedNode, farNode, sharedProj);
+  if (range === 'full') items.push({ e: nodeEllipse(sharedProj) });
+  else if (range) items.push({ e: nodeEllipse(sharedProj), th0: range.th0, th1: range.th1 });
+  fillOutline(ctx, hullOutline(items), color);
+}
+
+// The cone's own part, from the ring to the far node (a chord instead of the cap there when the far
+// node is a joint).
+export function drawSplitFarGeneral(ctx, farProj, ringPts, color, opts = {}) {
+  fillOutline(ctx, hullOutline([{ pts: ringPts }, { e: nodeEllipse(farProj), skip: !!opts.farIsJoint }]), color);
 }

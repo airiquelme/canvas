@@ -3,9 +3,11 @@
 // perpendicular to its axis at the host's first contact (findSplitRing), found
 // per host element in closed form. Pure 3D, independent of the camera.
 import {
-  vecSub, vecDot, sdfSphere, sdfFrustum, bisectRoot, hullPlanes, pointInTriangle, sphereFace,
+  vecSub, vecDot, sdfSphere, sdfFrustum, bisectRoot, hullPlanes, pointInTriangle, sphereFace, supportPoint,
 } from './geometry.js';
 import { coneFrame } from './shapes.js';
+import { buildHullCone, hullNormal } from './hullCone.js';
+import { buildHostHull, hostProbe } from './hostHull.js';
 import { nodes } from './scene.js';
 
 const RING_SAMPLES = 128, SLIDE_STEPS = 64;
@@ -99,16 +101,27 @@ export function buildHostSdf(hostMesh, sharedId) {
 // One entry per cone (shared, far, host), compared by the numbers of the nodes it was
 // computed from, so any change of a node (however it is made) recomputes it.
 const ringCache = new Map();
-const snapshot = (...ns) => ns.flatMap(n => [n.id, n.center.x, n.center.y, n.center.z, n.radius]);
+const snapshot = (...ns) => ns.flatMap(n => [n.id, n.center.x, n.center.y, n.center.z, n.radius, n.shape.ra, n.shape.rp, n.shape.axis.x, n.shape.axis.y, n.shape.axis.z]);
 export function findSplitRing(shared, far, hostMesh) {
   const id = `${shared.id}:${far.id}:${hostMesh.id}`;
   const snap = snapshot(shared, far, ...hostMesh.nodeIds.map(nid => nodes[nid]));
   const hit = ringCache.get(id);
   if (hit && hit.snap.length === snap.length && hit.snap.every((v, i) => v === snap[i])) return hit.ring;
+  const hostNodes = hostMesh.nodeIds.map(nid => nodes[nid]);
+  // Any squashed node among the cone's ends and the host: the uniform closed form (all the same shape) or the
+  // general numeric ring (below); round everywhere: the closed forms of the sphere cone.
+  const general = [shared, far, ...hostNodes].some(n => !n.shape.isSphere);
+  const ring = (general && (findUniformSplitRing(shared, far, hostNodes) || findGeneralSplitRing(shared, far, hostNodes))) || sphereSplitRing(shared, far, hostNodes);
+  ringCache.set(id, { snap, ring });
+  return ring;
+}
+
+// The split ring of a cone of spheres (the nodes are { id, center, radius }, the host's among them): closed forms.
+export function sphereSplitRing(shared, far, hostNodes) {
   const frame = coneFrame(shared, far);
   const cone = tangentCone(shared, far, frame);
-  const { s, touch } = firstContact(shared, hostMesh, frame, cone);
-  const ring = {
+  const { s, touch } = firstContact(shared, hostNodes, frame, cone);
+  return {
     s, frame, cone, dir: frame.dir,
     surface: {
       x: shared.center.x + frame.dir.x * s, y: shared.center.y + frame.dir.y * s, z: shared.center.z + frame.dir.z * s,
@@ -121,8 +134,6 @@ export function findSplitRing(shared, far, hostMesh) {
     tangentRadius: cone.radA,
     touch,
   };
-  ringCache.set(id, { snap, ring });
-  return ring;
 }
 
 // The cone's circle at axial s has radius R(s) = R0 + k s and points
@@ -146,8 +157,8 @@ export function findSplitRing(shared, far, hostMesh) {
 //    from the cone is a quadratic root (closed form); its largest value over the
 //    generatrices is found numerically (CAPSULE_ANGLES, then golden section).
 // The shared sphere touches the cone at sA. Returns { s, touch }, s in [sA, sB].
-const CAPSULE_ANGLES = 360;
-function firstContact(shared, hostMesh, frame, cone) {
+const CAPSULE_ANGLES = 72;
+function firstContact(shared, hostNodes, frame, cone) {
   const o = shared.center, d = frame.dir, u = frame.radial(0), v = frame.radial(Math.PI / 2);
   const k = cone.slope, R0 = cone.radA - k * cone.sA;
   const at = (a, s) => coneSurface(shared, frame, cone, a)(s).point;
@@ -155,7 +166,6 @@ function firstContact(shared, hostMesh, frame, cone) {
   const add = (p, q, t = 1) => ({ x: p.x + q.x * t, y: p.y + q.y * t, z: p.z + q.z * t });
   let best = { s: cone.sA, a: 0 };
   const consider = (s, a) => { if (Number.isFinite(s) && s > best.s) best = { s, a }; };
-  const hostNodes = hostMesh.nodeIds.map(id => nodes[id]);
 
   // Spheres.
   hostNodes.forEach(n => {
@@ -215,20 +225,22 @@ function firstContact(shared, hostMesh, frame, cone) {
       });
       return cands.length ? Math.max(...cands) : -Infinity;
     };
-    let bestA = 0, bestS = -Infinity;
-    for (let i = 0; i < CAPSULE_ANGLES; i++) {
-      const a = (i / CAPSULE_ANGLES) * Math.PI * 2, s = exitAt(a);
-      if (s > bestS) { bestS = s; bestA = a; }
-    }
-    if (bestS === -Infinity) return;
-    let lo = bestA - Math.PI * 2 / CAPSULE_ANGLES, hi = bestA + Math.PI * 2 / CAPSULE_ANGLES;
-    const g = (Math.sqrt(5) - 1) / 2;
-    for (let it = 0; it < 60; it++) {
-      const m1 = hi - g * (hi - lo), m2 = lo + g * (hi - lo);
-      if (exitAt(m1) >= exitAt(m2)) hi = m2; else lo = m1;
-    }
-    const aStar = (lo + hi) / 2, sStar = Math.max(exitAt(aStar), bestS);
-    consider(sStar, exitAt(aStar) >= bestS ? aStar : bestA);
+    // The scan only seeds: the two best local maxima of exitAt over CAPSULE_ANGLES angles are each refined by a golden
+    // section to rounding error (exitAt is smooth between its kinks, so a peak between seeds is found from the seed beside it).
+    const seeds = Array.from({ length: CAPSULE_ANGLES }, (_, i) => exitAt((i / CAPSULE_ANGLES) * Math.PI * 2));
+    const peaks = seeds.map((v, i) => ({ v, i })).filter(({ v, i }) => v > -Infinity && v >= seeds[(i + CAPSULE_ANGLES - 1) % CAPSULE_ANGLES] && v >= seeds[(i + 1) % CAPSULE_ANGLES])
+      .sort((p, q) => q.v - p.v).slice(0, 2);
+    const g = (Math.sqrt(5) - 1) / 2, stepA = Math.PI * 2 / CAPSULE_ANGLES;
+    peaks.forEach(({ v, i }) => {
+      const bestA = i * stepA;
+      let lo = bestA - stepA, hi = bestA + stepA;
+      for (let it = 0; it < 60; it++) {
+        const m1 = hi - g * (hi - lo), m2 = lo + g * (hi - lo);
+        if (exitAt(m1) >= exitAt(m2)) hi = m2; else lo = m1;
+      }
+      const aStar = (lo + hi) / 2, sStar = Math.max(exitAt(aStar), v);
+      consider(sStar, exitAt(aStar) >= v ? aStar : bestA);
+    });
   }));
 
   // Faces.
@@ -295,4 +307,130 @@ function computeLastContact(shared, far, hostMesh) {
   }
   const angle = ((best.start + (best.count - 1) / 2) / RING_SAMPLES) * Math.PI * 2;
   return { s: min, angle, point: coneSurface(shared, frame, cone, angle)(min).point, onSphere: min === cone.sA };
+}
+
+// ---------------------------------------------------------
+// SPLIT RING WITH SQUASHED NODES
+// ---------------------------------------------------------
+// The ring is where the cone's cross-section by a *slicing plane* last meets the host. The planes are
+// { (p - c_shared) . w = const } with w = Q_shared^-1 d (d the unit axis, Q = S^2 of the shared node), scaled so that
+// the constant is the axial distance of the point where the plane crosses the axis. For a round shared node w = d (planes
+// perpendicular to the axis, as always); in general these are exactly the planes perpendicular to the axis once the
+// shared body is a sphere (the linear map S^-1), which is what makes the uniform closed form below the same ring.
+
+// The inverse of a symmetric 3 x 3 matrix (9 numbers, row-major).
+function inv3(Q) {
+  const [a, b, c, , e, f, , , i] = Q;
+  const A = e * i - f * f, B = c * f - b * i, C = b * f - c * e, det = a * A + b * B + c * C;
+  return [A / det, B / det, C / det, B / det, (a * i - c * c) / det, (b * c - a * f) / det, C / det, (b * c - a * f) / det, (a * e - b * b) / det];
+}
+
+// The slicing plane normal w (see above), as a function ell(p) = (p - c_shared) . w, and w.
+function slicingPlanes(shared, dir) {
+  const Qi = inv3(shared.shape.Q);
+  const w = { x: Qi[0] * dir.x + Qi[1] * dir.y + Qi[2] * dir.z, y: Qi[3] * dir.x + Qi[4] * dir.y + Qi[5] * dir.z, z: Qi[6] * dir.x + Qi[7] * dir.y + Qi[8] * dir.z };
+  const k = 1 / (w.x * dir.x + w.y * dir.y + w.z * dir.z), o = shared.center;
+  w.x *= k; w.y *= k; w.z *= k;
+  return { w, ell: (p) => (p.x - o.x) * w.x + (p.y - o.y) * w.y + (p.z - o.z) * w.z };
+}
+
+// The general numeric ring. The cone is the hull cone of the two bodies (hullCone.js) and the host the convex hull of its
+// bodies (hostHull.js). Along each generatrix pN + t (pF - pN) the host distance is convex in t and <= 0 at t = 0 (the
+// shared body is in the host), so it leaves the host at its largest t with distance <= 0: Newton from t = 1 (the table's
+// slope is the best normal . the line's direction). Its slicing-plane constant is ell(pN) + t (ell(pF) - ell(pN)), and the
+// ring is at the largest over the generatrices (the last plane at which the cone's cross-section still meets the host),
+// refined in azimuth for a grazing contact, kept where every generatrix crosses. Returns the fields render.js reads (s,
+// dir, surface, touch, frame) and `general = { cone, tStar }`: the cone and, per generatrix, its parameter t at the ring,
+// so the ring's points are the generatrices' points at tStar.
+const SPLIT_GENS = 96;
+export function findGeneralSplitRing(shared, far, hostNodes) {
+  const host = buildHostHull(hostNodes);
+  const cone = buildHullCone(shared, far, SPLIT_GENS);
+  if (cone.degenerate) return null;
+  const { frame, gens } = cone, dir = frame.dir, o = shared.center, { ell } = slicingPlanes(shared, dir);
+  const exitT = (pN, d) => {
+    const at = (t) => hostProbe(host, { x: pN.x + d.x * t, y: pN.y + d.y * t, z: pN.z + d.z * t });
+    let t = 1, probe = at(t);
+    if (probe.value <= 0) return 1;
+    for (let it = 0; it < 40; it++) {
+      const slope = vecDot(probe.n, d);
+      if (!(slope > 1e-12)) return 0;
+      const next = t - probe.value / slope;
+      if (next <= 0) return 0;
+      t = next;
+      probe = at(t);
+      if (Math.abs(probe.value) < 1e-9) break;
+    }
+    return t;
+  };
+  const lA = gens.map(g => ell(g.pA)), lB = gens.map(g => ell(g.pB));
+  const ts = gens.map(g => exitT(g.pA, vecSub(g.pB, g.pA)));
+  const ss = gens.map((g, i) => lA[i] + ts[i] * (lB[i] - lA[i]));
+  let bi = 0;
+  ss.forEach((v, i) => { if (v > ss[bi]) bi = i; });
+  // Refine the maximum over the azimuth around the best generatrix.
+  const sAt = (psi) => {
+    const h = hullNormal(shared, far, frame, psi);
+    if (h.none) return -Infinity;
+    const pN = supportPoint(shared, h.n), pF = supportPoint(far, h.n), t = exitT(pN, vecSub(pF, pN));
+    const a = ell(pN);
+    return a + t * (ell(pF) - a);
+  };
+  const step = (Math.PI * 2) / gens.length;
+  let lo = gens[bi].psi - step, hi = gens[bi].psi + step, sBest = ss[bi], psiBest = gens[bi].psi;
+  const gr = (Math.sqrt(5) - 1) / 2;
+  for (let it = 0; it < 24; it++) {
+    const p1 = hi - gr * (hi - lo), p2 = lo + gr * (hi - lo), f1 = sAt(p1), f2 = sAt(p2);
+    if (f1 > sBest) { sBest = f1; psiBest = p1; }
+    if (f2 > sBest) { sBest = f2; psiBest = p2; }
+    if (f1 >= f2) hi = p2; else lo = p1;
+  }
+  // Only where every generatrix crosses the plane is the cross-section a closed curve.
+  const sMin = Math.max(...lA), sMax = Math.min(...lB);
+  const s = sMin < sMax ? Math.max(sMin, Math.min(sMax, sBest)) : (sMin + sMax) / 2;
+  const tStar = gens.map((g, i) => Math.max(0, Math.min(1, (s - lA[i]) / (lB[i] - lA[i]))));
+  const hb = hullNormal(shared, far, frame, psiBest), touch = (() => {
+    if (hb.none) return { x: o.x + dir.x * s, y: o.y + dir.y * s, z: o.z + dir.z * s };
+    const pN = supportPoint(shared, hb.n), pF = supportPoint(far, hb.n), a = ell(pN), t = Math.max(0, Math.min(1, (s - a) / (ell(pF) - a)));
+    return { x: pN.x + (pF.x - pN.x) * t, y: pN.y + (pF.y - pN.y) * t, z: pN.z + (pF.z - pN.z) * t };
+  })();
+  return {
+    s, frame, dir,
+    surface: { x: o.x + dir.x * s, y: o.y + dir.y * s, z: o.z + dir.z * s },
+    touch,
+    general: { cone, tStar },
+  };
+}
+
+// The uniform closed form: when the shared node, the far node and every host node have the same squash and axis
+// (their radii may differ), S_i = r_i T for one linear map T, so under T^-1 they are spheres of radius r_i and the whole
+// problem (cone, host, first contact) is the sphere problem, solved in closed form by sphereSplitRing. The map is
+// affine, so hulls, generatrices and their parameters t carry over and the slicing planes of the mapped problem (perpendicular
+// to the mapped axis) are exactly the slicing planes above. The ring's generatrices are T of the sphere cone's (analytic, no
+// Newton) and the constant is s = s' / |T^-1 d|. null when the nodes are not uniform or the sphere cone is degenerate.
+export function findUniformSplitRing(shared, far, hostNodes) {
+  const all = [shared, far, ...hostNodes], first = shared.shape;
+  const sq = (n) => n.shape.ra / n.radius;
+  if (!all.every(n => !n.shape.isSphere && Math.abs(sq(n) - sq(shared)) < 1e-12 && Math.abs(vecDot(n.shape.axis, first.axis)) > 1 - 1e-12)) return null;
+  const q = sq(shared), a = first.axis, rq = Math.sqrt(q);
+  const T = (v) => { const k = (q - 1 / rq) * vecDot(a, v); return { x: v.x / rq + k * a.x, y: v.y / rq + k * a.y, z: v.z / rq + k * a.z }; };
+  const Ti = (v) => { const k = (1 / q - rq) * vecDot(a, v); return { x: v.x * rq + k * a.x, y: v.y * rq + k * a.y, z: v.z * rq + k * a.z }; };
+  const mk = (n) => ({ id: n.id, center: Ti(n.center), radius: n.radius });
+  const shM = mk(shared), frM = mk(far), hostM = hostNodes.map(mk);
+  const frameM = coneFrame(shM, frM), coneM = tangentCone(shM, frM, frameM);
+  if (!Number.isFinite(coneM.sinT) || !Number.isFinite(coneM.cosT) || coneM.cosT < 1e-9) return null;
+  const ringM = sphereSplitRing(shM, frM, hostM);
+  const frame = coneFrame(shared, far), dir = frame.dir, o = shared.center;
+  const dm = Ti(dir), s = ringM.s / Math.hypot(dm.x, dm.y, dm.z);
+  const t = Math.max(0, Math.min(1, (ringM.s - coneM.sA) / (coneM.sB - coneM.sA)));
+  const gens = Array.from({ length: SPLIT_GENS }, (_, i) => {
+    const psi = (i / SPLIT_GENS) * Math.PI * 2, at = coneSurface(shM, frameM, coneM, psi);
+    return { psi, pA: T(at(coneM.sA).point), pB: T(at(coneM.sB).point) };
+  });
+  return {
+    s, frame, dir,
+    surface: { x: o.x + dir.x * s, y: o.y + dir.y * s, z: o.z + dir.z * s },
+    touch: T(ringM.touch),
+    general: { cone: { gens, degenerate: null }, tStar: gens.map(() => t) },
+  };
 }

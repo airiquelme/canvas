@@ -5,7 +5,8 @@ export const DESIGN_WIDTH = 1000, DESIGN_HEIGHT = 800;
 //   gap   paints the background magenta so antialiasing seam gaps stand out
 //   cone  split cone / host mesh intersection curves (coneDebug.js)
 //   joint 2-to-2 joint rings and cone edge stops (jointDebug.js)
-export const debug = { on: false, gap: true, cone: true, joint: true };
+//   shape squashed nodes' screen ellipses (shapeDebug.js)
+export const debug = { on: false, gap: true, cone: true, joint: true, shape: true };
 
 // Where two separately filled pieces meet, the lower one reaches
 // SEAM_PX / 2 device pixels under the upper one (see CLAUDE.md).

@@ -9,25 +9,152 @@ seam gaps, no on-top stroke artifacts, no bulges.
 http://localhost:8000. The page uses ES modules, so opening the file directly
 (file://) won't work.
 
+## Working preferences
+Keep verification minimal: check that the code loads and runs (an import / compile check, or one headless
+frame with no NaN or exceptions) and stop there. Leave the visual checks to the user, who can judge them at a
+glance in seconds, or run them only when asked. Do not build or run raster / ground-truth comparisons, long
+orbit sweeps or timing studies on your own initiative (a single 3D-reference run took the better part of 30
+minutes); the tools in `tools/` are for when the user asks for them. This overrides the "verify with the AA
+sim" notes elsewhere in this file.
+
 ## Modules
 | File | Contents |
 |---|---|
 | `config.js` | Design size, `debug` state, `SEAM_PX`, focus view |
-| `geometry.js` | Pure math: vectors, angles, capsule tangents, hulls, segment/circle hits, 3D signed distances and root finding |
+| `geometry.js` | Pure math: vectors, angles, capsule tangents, hulls, segment/circle hits, 3D signed distances and root finding; node shapes (spheroid `Q`, `ex` / `ux` principal frame, `ellipsoidShape`); exact ellipse math: tangents from a point (`pointEllipseTangents`) and common tangents of two ellipses (`ellipseTangentAngles`, a quartic), the hull of ellipses / arcs / polygons as an outline (`hullOutline`, `outlinePolygon`, `ellipsePolygon`) and the exact ellipse of a projected circle (`projectedCircleEllipse`) |
 | `camera.js` | Orbit camera, view basis, projection (`makeProjector`) |
 | `scene.js` | `nodes` / `meshes` stores, `createNode` / `createMesh`, the demo scene |
 | `shapes.js` | Canvas drawing primitives (capsules, joint disc, split cone, traced pieces) |
 | `render.js` | Assembles one frame |
-| `splitRing.js` | Split cone geometry in 3D: tangent cone, host first contact (`findSplitRing`), host SDF (debug) |
+| `splitRing.js` | Split cone geometry in 3D: tangent cone, host first contact (`findSplitRing`; `findGeneralSplitRing` when a node is squashed), host SDF (debug) |
 | `jointCurve.js` | Real 3D split of a joint: touch points and the planar joint ring (cone/cone intersection + back circle) |
 | `jointSplit.js` | Screen-space terminator from the ring (visible part, clipped to the node circle) |
 | `coneDebug.js` | Debug button's cone overlay: split cone ∩ host mesh curves |
 | `jointDebug.js` | Debug button's joint overlay: joint rings, touch points, cone edge stops |
+| `hullCone.js` | Cone between two nodes (spheroids or the flat solid's general ellipsoids) as the boundary of the hull of their bodies, from support functions: generatrices (`buildHullCone`), axial cross-section (`crossSection`), signed distance to the hull with its surface normal (`hullSigned`, `hullProbe`) |
+| `jointCurveGeneral.js` | The joint ring for joints with a squashed node (`buildJointCurveGeneral`, `edgeContactsGeneral`): same result shape as `jointCurve.js`, from hull cones instead of closed forms |
+| `hostHull.js` | A split cone's host mesh as the convex hull of its node bodies (hosts with squashed nodes): exact signed distance (`hostProbe`): a table of 4096 normals only says which bodies are in play, then the candidates (each body's nearest-point normal, each pair's ruled curve, each triple's face normal) are evaluated with the true support |
+| `shapeDebug.js` | Debug button's overlay: dashed screen ellipse + axes of every squashed node |
 | `main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
+| `tools/` | Headless Node checks (copy the modules first, they need `"type":"module"`): `trace.mjs` records the canvas calls over the orbit to diff two copies (`SPHERES=1` makes every node round), `shapeCheck.mjs` spheroid math, `hullCheck.mjs` ellipse capsule vs brute-force hull, `orientCheck`/`perspectiveCheck`/`silhouetteCheck` node ellipses vs the 3D body, `coneCheck.mjs` / `ellipsoidCheck.mjs` `hullCone.js` vs the sphere cone and a brute-force hull, `jointParity.mjs` the general joint ring with spheres vs the closed form, `jointCheck.mjs` its invariants and timing on squashed bodies, `jointSweep.mjs` frame-to-frame continuity of the demo's joint over the orbit, `jointRef.mjs` painted colors of a squashed V vs an exact ray cast of its flat solid (`STEP=4 node tools/jointRef.mjs <dir> all 6 <png-prefix>` writes drawn | reference | mismatch images), `meshCheck.mjs` rasterizes the squashed meshes' fills in real frames and compares them with the hull of their node ellipses, `outlineCheck.mjs` the exact ellipse / outline / conic math against brute force, `hostCheck.mjs` `hostProbe` against a brute-force hill climb, `splitCheck.mjs` the uniform closed form and the numeric split ring against each other and the sphere closed form, `frameTime.mjs` ms per `render()` of the demo (`SPHERES=1`: all round) |
+
+## Squashed nodes
+A node is a spheroid: `createNode(center, radius, { squash, axis })`; `node.shape` (`makeShape`,
+`geometry.js`) has semi-axis `radius * squash` along `axis` and `radius / sqrt(squash)` across (same volume).
+`projectNode` gives its screen shadow `ellipse` `{a, b, angle}` (closed form, `shadowEllipse`) and `round`
+(true for squash === 1, which keeps every circle code path bit-identical). Supported so far: **plain
+pieces only** (`buildPairPrimitive`'s `tracePath`): the capsule is the hull of the two ellipses
+(`ellipseHullArcs` finds where the support functions cross; `traceEllipseCapsule` draws the arcs and
+common tangents). The Debug overlay (`shapeDebug.js`) also draws the shape's **cut**: the fixed 3D
+meridian ellipse through both poles (semi-axes `ra` along `axis`, `rp` along `shape.cutDir`, a direction
+across the axis, default world +x; `createNode`'s `cut` option picks another). `projectNode` returns it as
+`cut`; unlike the rendered silhouette it collapses to a line when its plane is edge-on (orange; the
+silhouette is dashed purple). Both are projected with the projection's Jacobian at the node (`projectNode`),
+a linear map: a node off the view axis shows its top or underside, and the shapes stay exact ellipses with
+no lens distortion (the cut always lies inside the silhouette). Spheres keep the plain camera basis, so
+they stay circles.
+
+**Joints with squashed nodes** (`computeJoints`, `render.js`). If any of a joint's three nodes is
+squashed, its ring is the general one (`jointCurveGeneral.js`); all-round joints keep the closed form
+(bit-identical output). The flat solid gives each node an ellipsoid (`ellipsoidShape`, `flatBody`): its
+projected ellipse as the shadow along z (so the orthographic silhouette is exactly what is drawn) and the
+body's own half-extent along the view (`zRadius`) as the third axis. Cones are `hullCone.js` hulls of the
+joint body and each far body. The ring is not planar any more:
+- touch points: the normals where both cones touch the joint body (hN = hFA = hFB), found on A's contact curve
+  (azimuth psi) where hFB - hN changes sign; the front arc of psi is the one with hFB > hN (A's generatrix
+  starts inside hull B there);
+- front: per psi, the point where A's generatrix leaves hull B. `hullSigned` is convex along a line, so Newton
+  from the far end converges monotonically (slope = probe normal . direction). 31 exact points
+  (cosine-spaced, warm-started), a cubic Hermite spline through them, and an exact point added wherever the
+  spline's midpoint is off by more than half the chord tolerance, then chords within `tol`;
+- back: the plane through both touch points and the centroid of the exact front points cuts the joint
+  ellipsoid in an ellipse (computed on the unit sphere `Sinv (x - c)`); the stretch through the back is the
+  back arc. `curve.plane` is that plane (used for `frontIsA`);
+- edge stops: the silhouette generatrices (n.z = 0) cross the other hull at the contact when their azimuth is in
+  the ring's arc.
+The 2D side of a squashed joint node works in a *unit-circle space* (`ellipseUnitMap`): the screen ellipse is
+mapped by a linear map to a circle of radius b (the long axis shrunk), `projectJointSplit` and the disc
+(`drawJointSplitFromCurve`) run unchanged there with the canvas transform mapping the result back, and the
+cone bodies cut the node out by mapping the polygon, `subtractDisc`, and mapping back (`cutDisc`). The map is
+affine, so hulls, crossings and arcs carry over exactly. A far node that is squashed contributes its ellipse
+rim points (`rimPoints`) to the body's hull. On the joint disc, where both hulls end on the joint body's own
+surface, the color is split by the ring's plane (side holding A's far center = A's color), which is what
+`tools/jointRef.mjs` assumes at ties. Cost: about 3 ms per squashed joint per frame against 0.25 ms for
+the closed form (the exact ring points dominate: ruled-normals-only Newton with interpolated generatrix
+normals, then an exact polish); sphere joints are unaffected.
+Known limitation: the joint disc is drawn over the cone bodies as one flat piece. For spheres a cone only
+comes in front of the node's disc when its arm points at the camera, but a thin flat joint node (squash
+about 0.3 and tilted: `jointFlat` in `jointRef.mjs`) lets a hull bulge in front of the node's rim, and a
+sliver of the disc's color (about 10 x 70 px, 0.2% of the samples in the worst of 6 angles) is painted
+where that cone should be. The demo's squash values (0.7, 1.5) are checked by `jointRef.mjs`'s `demoV`.
+**Split cones with squashed nodes** (`splitRing.js`; used when the shared node, the far node or any host node is squashed,
+else the closed forms below, bit-identical). Three cases, one definition of the ring. The ring is where the cone's
+cross-section by a *slicing plane* last meets the host; the planes are `{ (p - c_shared) . w = const }`, `w = Q_shared^-1 d`
+(d the unit axis, scaled so that the constant is the axial distance where the plane crosses the axis): planes
+perpendicular to the axis once the shared body is a sphere. For a round shared node w = d, the old definition.
+- **uniform shapes** (`findUniformSplitRing`): the shared node, the far node and every host node have the same squash and
+  axis (radii may differ): S_i = r_i T for one linear map T, so under T^-1 it is the sphere problem, solved by the closed
+  forms (`sphereSplitRing`) and mapped back: the generatrices are T of the sphere cone's (analytic, no Newton) and
+  the ring constant is s' / |T^-1 d|. This is what a mesh squashing alike (a bounce) costs per recompute. Joints can't use
+  it: their flat bodies come from each node's own perspective Jacobian, so same-shape nodes are not exact affine copies
+  there (they keep the general ring);
+- **general numeric** (`findGeneralSplitRing`): the cone is the `hullCone.js` hull of the two bodies and the host the convex
+  hull of its bodies (`hostHull.js`, what the sphere code's host sdf amounts to for convex meshes). Along each generatrix
+  pN + t (pF - pN) the host distance is convex in t and <= 0 at t = 0, so it leaves the host at one t (Newton from t = 1,
+  slope = best normal . direction); its plane constant is ell(pN) + t (ell(pF) - ell(pN)) and the ring is at the largest over
+  the generatrices (refined in azimuth for a grazing contact, kept where every generatrix crosses). With round nodes it
+  reproduces the sphere closed form to rounding (`tools/splitCheck.mjs`);
+- the result is cached and camera-independent; it carries `general = { cone, tStar }`.
+On screen (`splitScreenPoints`, `shapes.js`) each generatrix end is mapped by its own node's linear map (`projectNode`'s
+`axes` and `scale`: center + scale (d . right, -d . up), plain camera axes for spheres), and a ring point interpolates the two
+at `tStar`, so the ring and the tangent curve lie on the drawn ellipses. The host-colored part (`drawSplitSharedGeneral`)
+is the hull of the ring and tangent polygons and the arc of the shared node's rim ellipse on the shared side (the
+shared body's support >= the far body's along the rim point's world normal `cx right - cy up`, the sphere test
+`n . axis <= sinT` in general form; its ends by bisection); the far part (`drawSplitFarGeneral`) the hull of the ring and
+the far rim ellipse, with a chord instead of the cap at a joint. Both are `hullOutline`s (exact arcs). A split cone ending
+at a squashed joint aligns its ring to the flat capsule of the two ellipses (`alignToFlatEllipses`, from `ellipseCapsule`).
+The cone debug overlay skips squashed splits. The host is treated as convex. The demo's pyramid, its apex and the orange
+end are squashed.
+
+**Exact outlines** (`hullOutline`, `traceOutline` / `fillOutline`). The split cone parts of round nodes are hulls of
+ellipses and an arc, no sampled points: the projected ring and tangent circle are exact ellipses (`projectedCircleEllipse`:
+the perspective image of a circle is a conic, fitted through five exact projections), the shared rim is the arc where
+`n . axis = R cos(theta + delta) <= sinT`. The hull's support is the largest of the shapes' supports, so the boundary follows
+one shape between the normal angles where two supports are equal (edge normals of the point hull, tangents from a point to
+an ellipse, common tangents of two ellipses, the ends of an arc's range: all closed form) and is drawn as corners and
+`ctx.ellipse` arcs. The quartic for two ellipses' common tangents is ill-conditioned for some pairs (two far-apart, nearly
+parallel ellipses lost all their roots at orbit angles 5.59-5.60: the cone's capsule degenerated to one ellipse and the
+yellow cone vanished), so `ellipseTangentAngles` checks its roots against a 96-angle sign scan and falls back to the
+bisected scan when it finds fewer crossings. Where a polygon is needed (the joint bodies feed the polygon booleans) the rim points are
+chord-tolerance driven (`ellipsePolygon`, 2.5 x `CURVE_TOL_PX`) instead of a fixed 64 / 128.
 
 **Frame pipeline (`render`):** project nodes → ownership map (node → meshes) →
 joint rings → one primitive per node pair (plus one per joint) → sort
 back to front → draw. Consecutive traced primitives of one mesh are batched.
+
+**Layering (depth strata, `slabsOf` / `drawPrimitives` in `render.js`).** One sort key per piece cannot order
+pieces that are nearer at one end and farther at the other (or that overlap cyclically), so pieces are cut
+at fixed global depth strata (`DEPTH_BIN` = 16 world units). A piece with a depth ramp (`makeSlice`: the screen
+axis between its two end nodes and their depths; plain pairs, joint bodies, split cone far parts) gets one
+slab per stratum it spans; slabs are drawn farthest stratum first and, inside a stratum, by the piece's own
+key (`depth`), so every rule that works on piece keys (the layered split cone keys, `orderJointBodies`, the
+joint disc after its bodies) still holds inside a stratum. Pieces without a ramp (joint discs, the split
+node's shared part) sit in the stratum of `binDepth`. A piece is drawn whole, exactly as an uncut piece
+(batched, no clip, no seam), when its slabs can be put together: only pieces whose screen box (`boxOf`)
+overlaps it and that have another color are in the way, so the rest between its slabs don't count. Otherwise
+a run of its slabs is drawn through a clip strip along its slice axis (its outline recorded once and
+replayed), widened by `SEAM_PX` toward each neighboring slab that is drawn LATER so the earlier one reaches
+under the later one (rule 1; strip edges are straight, so rule 4 holds). Strata decide between SEPARATE meshes only.
+Meshes that share a node (the cones of a joint, a split cone and its host; `buildClusters`, `prim.cluster`)
+keep the normal piece-key logic between each other: for two pieces of one cluster whose screen boxes overlap,
+the piece with the larger key draws first, whatever strata their slabs are in (`orderByCluster`: Kahn's
+algorithm on those constraints plus "slabs of one piece in strata order", taking the earliest entry of the
+strata order each time, so an entry that must wait is moved later). That keeps front body after back body, a
+joint disc after its bodies, and a split cone over its host when it faces the camera / under it when it faces
+away; without it, strata interleaved a cone with its host (green strips clipped over the yellow cone, a
+smoothly moving straight edge, at 2.47; the cone popping over/under the host between 0.76 and 1.25). The cut is
+by depth along the piece's axis only: the fill triangle of a 3+ node mesh follows the capsule's ramp
+(approximate).
 
 ## Concepts
 - **Mesh pieces.** Each node pair of a mesh is a *capsule* (two circles joined
@@ -226,11 +353,10 @@ back to front → draw. Consecutive traced primitives of one mesh are batched.
 
 ## Optimization backlog (these change pixels; verify each with the AA sim)
 - Batch joint capsules and the split cone into unions too (rule 3).
-- `drawSplitShared`/`drawSplitFar` sample 128 points per circle and ring, then takes their
-  hull. An analytic outline (tangent lines + arcs, a projected circle is an ellipse)
-  would be cheaper and exact. Small in the profile now (`convexHull` ~3%).
-- `firstContact`'s capsule between two non-shared host spheres still scans 360 angles
-  and refines with a golden section (cached, so it only runs when a node moves).
+- The joint bodies' polygons (ring loops of ~150 points, the polygon booleans) are the largest remaining source of
+  path operations; an outline with arc edges through `subtractDisc` / `subtractPolygon` would remove it.
+- `firstContact`'s capsule between two non-shared host spheres scans 72 angles as seeds and refines the two best peaks
+  by a golden section (cached, so it only runs when a node moves); a closed form is a high-degree polynomial.
 
 ## Performance notes
 Per frame, normal view, about half the time of the previous version (profile with a
@@ -249,6 +375,16 @@ Node harness, see Debugging). What is closed form or cached now:
   transform once per frame (`frame.pxPerUnit`); `findSplit` once per mesh per frame.
 - A 2-node mesh's fill triangle is flat (centroid on the line between its centers) and
   is not traced. `drawTriangle` / `drawPairCapsule` were unreachable and are gone.
+- Squashed joints (demo: 5 of them; 39 ms -> 7 ms per frame): hull cones and probes work on scalars (`shape.Q`, no
+  {x, y, z} objects in the inner loops) and every normal is exact (Newton on g from an interpolated phi, no
+  interpolation used as the answer); the ring is a few exact solves (about 28, was 195) plus a Hermite spline whose tangents
+  are the exact `nA x nB` with lengths `2 L / (1 + T . c)` (exact for a circle), checked by the distance from an exact point
+  to the spline (not by comparing the spline at an equal parameter value, which measures the speed, not the shape); each
+  solve starts from the last frame's `t` / azimuth (`MEMORY` in `jointCurveGeneral.js`, keyed by the joint node) and an
+  unchanged joint returns the same curve and edge stops.
+- Layering: pieces are tested for overlap by capsules along their axes (`piecesOverlap`), not boxes; a clipped pass fills a
+  `Path2D` built once from the piece's recorded path (a plain-object recorder, no Proxy) instead of replaying hundreds of
+  path calls per strip: canvas calls per frame 8.5k -> 2.3k in the demo.
 
 ## Debugging
 - The **Debug** button turns all the debug views on and off together
