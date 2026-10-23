@@ -34,9 +34,22 @@ sim" notes elsewhere in this file.
 | `hullCone.js` | Cone between two nodes (spheroids or the flat solid's general ellipsoids) as the boundary of the hull of their bodies, from support functions: generatrices (`buildHullCone`), axial cross-section (`crossSection`), signed distance to the hull with its surface normal (`hullSigned`, `hullProbe`) |
 | `jointCurveGeneral.js` | The joint ring for joints with a squashed node (`buildJointCurveGeneral`, `edgeContactsGeneral`): same result shape as `jointCurve.js`, from hull cones instead of closed forms |
 | `hostHull.js` | A split cone's host mesh as the convex hull of its node bodies (hosts with squashed nodes): exact signed distance (`hostProbe`): a table of 4096 normals only says which bodies are in play, then the candidates (each body's nearest-point normal, each pair's ruled curve, each triple's face normal) are evaluated with the true support |
-| `shapeDebug.js` | Debug button's overlay: dashed screen ellipse + axes of every squashed node |
+| `shapeDebug.js` | Debug button's overlay: dotted screen outline of every node (+ cut and axes of squashed ones); a skew node shows instead the body's cross-section at that point of the arch (`sectionAt`, `skew.js`) |
 | `main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
 | `tools/` | Headless Node checks (copy the modules first, they need `"type":"module"`): `trace.mjs` records the canvas calls over the orbit to diff two copies (`SPHERES=1` makes every node round), `shapeCheck.mjs` spheroid math, `hullCheck.mjs` ellipse capsule vs brute-force hull, `orientCheck`/`perspectiveCheck`/`silhouetteCheck` node ellipses vs the 3D body, `coneCheck.mjs` / `ellipsoidCheck.mjs` `hullCone.js` vs the sphere cone and a brute-force hull, `jointParity.mjs` the general joint ring with spheres vs the closed form, `jointCheck.mjs` its invariants and timing on squashed bodies, `jointSweep.mjs` frame-to-frame continuity of the demo's joint over the orbit, `jointRef.mjs` painted colors of a squashed V vs an exact ray cast of its flat solid (`STEP=4 node tools/jointRef.mjs <dir> all 6 <png-prefix>` writes drawn | reference | mismatch images), `meshCheck.mjs` rasterizes the squashed meshes' fills in real frames and compares them with the hull of their node ellipses, `outlineCheck.mjs` the exact ellipse / outline / conic math against brute force, `hostCheck.mjs` `hostProbe` against a brute-force hill climb, `splitCheck.mjs` the uniform closed form and the numeric split ring against each other and the sphere closed form, `frameTime.mjs` ms per `render()` of the demo (`SPHERES=1`: all round) |
+
+## Skewed meshes
+`createMesh([a, b], color, { skew: nodeId })` bends a 2-node mesh through a third node (`skew.js`, `buildSkewPrimitives` in
+`render.js`). The skew node is only a point: its radius and shape are ignored. The path is the ellipse with conjugate
+semi-diameters `(B - A) / 2` and `S - M`, so S is the apex even when off-center. The cross-section comes from the two end nodes
+only: each end's `shape.Q` is written in the arch's moving frame (tangent, in-plane normal, plane normal), the two forms are
+mixed with a smoothstep and turned back (`shapeAt`); the whole ellipsoid is swept, so a flat end's extent along the arch makes the band bulge where the arch bends. That is intended: sweeping only the cross-section (tried) leaves the ribbon drifting off the flat end discs, so the arch must start and end on the nodes' own shapes. The Debug view's section (`sectionAt`) is the true cut perpendicular to the arch, so it differs from the drawn bulge. So thickness and width are kept along the arch (no swelling from mixing
+differently oriented shapes in world coordinates). All-round ends use the circle path with a smoothstep radius. On screen the body
+is the union of capsules between consecutive projected circles / ellipses (`archSamples`, refined until in-between ones lie inside
+their neighbors' capsule; `traceEllipseCapsule` for squashed ends), traced into one nonzero path. v1 limits: plain meshes only
+(skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
+(`buildSkewPrimitives`, overlapping by one sample past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
+Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
 A node is a spheroid: `createNode(center, radius, { squash, axis })`; `node.shape` (`makeShape`,

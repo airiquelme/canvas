@@ -1,8 +1,7 @@
 // Entry point: canvas setup, UI buttons, animation loop. See CLAUDE.md.
 import { camera } from './camera.js';
 import { debug, focus } from './config.js';
-import { buildDemoScene } from './scene.js';
-import { nodes } from './scene.js';
+import { buildBasicScene, buildFullScene, nodes } from './scene.js';
 import { render } from './render.js';
 
 const canvas = document.getElementById('game');
@@ -16,13 +15,15 @@ resizeCanvas();
 // Resizing clears the canvas; redraw so a paused view doesn't stay blank.
 window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 
-buildDemoScene();
+// ?scene=full is the squashed-nodes demo; the default is the small skew scene.
+(new URLSearchParams(location.search).get('scene') === 'full' ? buildFullScene : buildBasicScene)();
 
 // Focus view: only some meshes, the camera on one joint, magnified (config.js focus).
 const home = { target: { ...camera.target }, zoom: camera.zoom };
 function applyFocus() {
-  camera.target = focus.on ? { ...nodes[focus.nodeId].center } : { ...home.target };
-  camera.zoom = focus.on ? focus.zoom : home.zoom;
+  const focused = focus.on && nodes[focus.nodeId];
+  camera.target = focused ? { ...nodes[focus.nodeId].center } : { ...home.target };
+  camera.zoom = focused ? focus.zoom : home.zoom;
 }
 applyFocus();
 

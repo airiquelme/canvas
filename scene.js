@@ -16,13 +16,54 @@ export function createNode(center, radius, { squash = 1, axis = { x: 0, y: 1, z:
   return id;
 }
 
-export function createMesh(nodeIds, color) {
+// `skew`: id of a node that is not in `nodeIds`; the 2-node mesh then bends through it (skew.js).
+export function createMesh(nodeIds, color, { skew } = {}) {
   const id = nextMeshId++;
   meshes[id] = { id, nodeIds, color };
+  if (skew !== undefined) {
+    if (nodeIds.length !== 2) throw new Error('a skewed mesh has exactly 2 nodes');
+    meshes[id].skew = skew;
+  }
   return id;
 }
 
-export function buildDemoScene() {
+// Small scene for the skewed meshes (a skew node is only a point the arch passes through), nothing shared (no joints or split cones).
+export function buildBasicScene() {
+  const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2;
+  const pair = (x0, y0, x1, y1, r0, r1, z0 = 0, z1 = 0) =>
+    [createNode({ x: x0, y: y0, z: z0 }, r0), createNode({ x: x1, y: y1, z: z1 }, r1)];
+  // A plain straight mesh, for comparison.
+  createMesh(pair(cx - 330, cy + 190, cx - 150, cy + 190, 24, 24), '#4fc3f7');
+  // Skew above the midpoint (a symmetric arch).
+  createMesh(pair(cx - 330, cy + 40, cx - 90, cy + 40, 24, 24), '#ff8a65',
+    { skew: createNode({ x: cx - 210, y: cy - 90 }, 6) });
+  // Skew off-center and toward the camera's side in z (a sheared, tilted arch).
+  // A flat ribbon whose end nodes are thin grains (prolate, squash > 1) instead of discs: the grain's long axis is the arch
+  // plane's normal, so each end's "square edge" is the grain itself, W long each way, and it is only T thick both along the
+  // arch and across it. With nothing wide along the arch there is no bulge where it bends; the curve is the arch's own.
+  // A node keeps its volume: ra = radius * squash = W (the long semi-axis), rp = radius / sqrt(squash) = T, so
+  // radius = cbrt(W T^2) and squash = W / radius.
+  {
+    const A = { x: cx + 20, y: cy + 40, z: 0 }, B = { x: cx + 330, y: cy + 40, z: 0 }, S = { x: cx + 80, y: cy - 110, z: 120 };
+    const u = { x: B.x - A.x, y: B.y - A.y, z: B.z - A.z }, s = { x: S.x - (A.x + B.x) / 2, y: S.y - (A.y + B.y) / 2, z: S.z - (A.z + B.z) / 2 };
+    const normal = { x: u.y * s.z - u.z * s.y, y: u.z * s.x - u.x * s.z, z: u.x * s.y - u.y * s.x };
+    const W = 24 / Math.sqrt(0.3), T = 0.001, radius = Math.cbrt(W * T * T), shape = { squash: W / radius, axis: normal };
+    createMesh([createNode(A, radius, shape), createNode(B, radius, shape)], '#a5d6a7', { skew: createNode(S, 6) });
+  }
+  // Different end radii. Threaded through the orange arch: its plane (x = const) is perpendicular to the
+  // orange one, the ends are in front of / behind it (z = -150 / 150) below the orange tube, and the apex
+  // passes through the orange arch's opening at z = 0.
+  createMesh(pair(cx - 210, cy + 120, cx - 210, cy + 120, 14, 30, -150, 150), '#f06292',
+    { skew: createNode({ x: cx - 210, y: cy - 10, z: 0 }, 6) });
+  // Oblate (squashed) nodes: flattened ends with tilted axes (the skew node is only a point).
+  createMesh([createNode({ x: cx + 40, y: cy + 230, z: -40 }, 26, { squash: 0.45 }),
+    createNode({ x: cx + 330, y: cy + 230, z: 40 }, 26, { squash: 0.5, axis: { x: 1, y: 1, z: 0 } })], '#ba68c8',
+    { skew: createNode({ x: cx + 185, y: cy + 110 }, 6) });
+}
+
+export function buildDemoScene() { buildFullScene(); }
+
+export function buildFullScene() {
   // Left: two 2-node meshes sharing a joint node (a V). The joint node and the blue end are
   // squashed (the general joint ring, jointCurveGeneral.js), and so is the orange end, the
   // orange/yellow joint whose yellow cone is a split cone into the (squashed) pyramid.

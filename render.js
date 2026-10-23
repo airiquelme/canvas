@@ -8,9 +8,10 @@ import { findSplitRing } from './splitRing.js';
 import { buildConeDebugCurves, drawConeDebugCurves } from './coneDebug.js';
 import { drawJointDebug } from './jointDebug.js';
 import { drawShapeDebug } from './shapeDebug.js';
-import { vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, ellipseRayPoint, ellipsePoint, ellipsoidShape, ellipseCapsule, ellipsePolygon, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
+import { shadowEllipse, vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, ellipseRayPoint, ellipsePoint, ellipsoidShape, ellipseCapsule, ellipsePolygon, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from './camera.js';
 import { nodes, meshes } from './scene.js';
+import { archAt, archSamples, shapeAt } from './skew.js';
 import {
   pixelScale, seamUnderlap, fillCircle, circlePoints, traceCapsule, traceCircle, traceTriangle,
   nodeEllipse, traceEllipseCapsule, traceEllipse, splitScreenPoints, drawSplitSharedGeneral, drawSplitFarGeneral,
@@ -112,6 +113,7 @@ function centroid(points) {
 function buildOwnership() {
   const owners = {};
   Object.values(meshes).forEach(mesh => {
+    if (mesh.skew) return;   // skewed meshes are plain: no joints or split cones, their ends count as unshared
     mesh.nodeIds.forEach(id => { (owners[id] ||= []).push(mesh.id); });
   });
   return owners;
@@ -313,7 +315,7 @@ function buildClusters(owners) {
 }
 
 function findSplit(mesh, owners) {
-  if (mesh.nodeIds.length !== 2) return null;
+  if (mesh.nodeIds.length !== 2 || mesh.skew) return null;
   const isHost = (mid) => meshes[mid].nodeIds.length >= 3;
   const splitNodeId = mesh.nodeIds.find(id => owners[id].some(isHost));
   return splitNodeId === undefined ? null : { splitNodeId, hostMesh: meshes[owners[splitNodeId].find(isHost)] };
@@ -480,6 +482,57 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
   const prim = { cluster: frame.clusterOf[mesh.id], depth, binDepth: Math.max(a.depth, b.depth), slice: makeSlice(a, b), box: boxOf([a, b], mesh.nodeIds.length > 2 ? [screenCentroid] : []), caps, meshId: mesh.id, color, draw, tracePath };
   [a, b].forEach(end => { if (jointNodeIds.has(end.id)) (frame.jointBodies[end.id] ||= []).push({ meshId: mesh.id, prim, isSplit: !!split }); });
   return prim;
+}
+
+// A skewed mesh (CLAUDE.md "Skewed meshes"): the union of capsules between consecutive screen circles along the arch
+// through its skew node, as two traced primitives split at the skew node (A..S and S..B, sharing the apex circle),
+// each with its own depth key (the mean depth of its samples), so another body can pass between the halves.
+function buildSkewPrimitives(frame, mesh) {
+  const { projectPoint } = frame;
+  const [A, B] = mesh.nodeIds.map(id => nodes[id]), S = nodes[mesh.skew];
+  const at = archAt(A, B, S);
+  // With a squashed end node, each sample is the shadow ellipse of the blended spheroid (skew.js shapeAt),
+  // read with the projection's Jacobian at that point like projectNode; all round keeps the circle path.
+  const oblate = !(A.shape.isSphere && B.shape.isSphere), qAt = shapeAt(A, B, S);
+  const project = (t) => {
+    const w = at(t), cam = worldToCamera(w.center, frame.camPos, frame.basis), p = projectPoint(w.center);
+    const out = { x: p.x, y: p.y, r: w.radius * p.scale, depth: cam.z };
+    if (oblate) {
+      const lean = (v, k) => ({ x: v.x - k * frame.basis.forward.x, y: v.y - k * frame.basis.forward.y, z: v.z - k * frame.basis.forward.z });
+      const e = shadowEllipse({ Q: qAt(t) }, lean(frame.basis.right, cam.x / cam.z), lean(frame.basis.up, cam.y / cam.z));
+      out.e = { center: { x: p.x, y: p.y }, a: e.a * p.scale, b: Math.max(e.b * p.scale, 1e-6), angle: -e.angle };
+      out.r = out.e.a;
+    }
+    return out;
+  };
+  const samples = archSamples(project, 5 * frame.tol);
+  const apex = samples.findIndex(s => s.t === 0.5);
+  const half = (list) => {
+    const tracePath = (c = frame.ctx) => {
+      if (oblate) {
+        traceEllipse(c, list[0].c.e);
+        for (let i = 1; i < list.length; i++) traceEllipseCapsule(c, list[i - 1].c.e, list[i].c.e);
+        return;
+      }
+      traceCircle(c, list[0].c, list[0].c.r);
+      for (let i = 1; i < list.length; i++) {
+        const p = list[i - 1].c, q = list[i].c;
+        if (Math.hypot(p.x - q.x, p.y - q.y) <= Math.abs(p.r - q.r)) traceCircle(c, p.r >= q.r ? p : q, Math.max(p.r, q.r));
+        else traceCapsule(c, p, p.r, q, q.r);
+      }
+    };
+    const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    let depth = 0;
+    list.forEach(({ c }) => {
+      box.x0 = Math.min(box.x0, c.x - c.r - 3); box.x1 = Math.max(box.x1, c.x + c.r + 3);
+      box.y0 = Math.min(box.y0, c.y - c.r - 3); box.y1 = Math.max(box.y1, c.y + c.r + 3);
+      depth += c.depth / list.length;
+    });
+    return { cluster: frame.clusterOf[mesh.id], depth, binDepth: depth, slice: null, box, meshId: mesh.id, color: mesh.color, tracePath };
+  };
+  // The halves reach one sample past the apex into each other (same color), so where the apex section is a line (a flat ribbon)
+  // they overlap in a strip instead of only touching along an edge, which lets the background through (rule 1).
+  return [half(samples.slice(0, Math.min(apex + 2, samples.length))), half(samples.slice(Math.max(apex - 1, 0)))];
 }
 
 // Sort key of a joint's disc: just in front of its node, and behind any split
@@ -720,6 +773,7 @@ export function render(ctx, canvas, { darkMode }) {
   const isShown = (mesh) => !focus.on || focus.meshColors.includes(mesh.color);
   Object.values(meshes).forEach(mesh => {
     if (!isShown(mesh)) return;
+    if (mesh.skew) { primitives.push(...buildSkewPrimitives(frame, mesh)); return; }
     const screenCentroid = projectPoint(centroid(mesh.nodeIds.map(id => nodes[id].center)));
     const split = splitOf[mesh.id];
     const pNodes = mesh.nodeIds.map(id => projected[id]);
@@ -748,7 +802,7 @@ export function render(ctx, canvas, { darkMode }) {
   lastFrame = frame;
 
   if (debug.on && debug.joint) drawJointDebug(ctx, frame.joints);
-  if (debug.on && debug.shape) drawShapeDebug(ctx, projected);
+  if (debug.on && debug.shape) drawShapeDebug(ctx, projected, projectPoint);
 
   if (debug.on && debug.cone && !focus.on) {
     Object.values(meshes).forEach(mesh => {
