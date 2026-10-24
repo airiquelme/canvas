@@ -228,7 +228,10 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
   // the terminator (a point of the border, independent of the camera) or the silhouette. Consecutive samples' arcs, cut into the same
   // number of steps, are joined into quads in ONE path (no antialiasing seam between them). The two ends are capped the same way, on
   // rings n = cos(a) n(phi) + sin(a) out (a from 0 to the pole), whose arcs are cos(phi - phiL) >= -tan(a) (out . L) / |L_e|.
-  const buildArch = (samples) => {
+  // `cutAt`: a sample where the surface is always cut into separate sheets (the apex, where a skewed mesh is split into its two halves;
+  // see the sheets below): each half paints the whole arch, so the other half's surface inside its fill (its round end reaches past the
+  // apex) keeps its own shading, and a half hidden behind the other does not shine through.
+  const buildArch = (samples, cutAt = null) => {
     const n = samples.length, Lw = light.dir, cp = camPos;
     const M = 5, RINGS = 10, ARCH_SEAM_PX = 1.5;
     const TWO_PI = 2 * Math.PI;
@@ -269,9 +272,10 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
       if (hL < 1e-9 || hV < 1e-9) return null;
       const ta = Math.tan(a), phiL = Math.atan2(dot(Lw, e2), dot(Lw, e1)), phiV = Math.atan2(dot(v, e2), dot(v, e1));
       const wL = halfWidth(ta * sign * dot(Lw, t) / hL), wV = halfWidth(ta * sign * dot(v, t) / hV);
-      if (wL === null || wV === null) return { arcs: [], phiL, wL };
+      const vis = wV === null ? null : [phiV - wV, phiV + wV];     // the visible arc (lit or not)
+      if (wL === null || wV === null) return { arcs: [], phiL, wL, vis };
       const arcs = meet(phiL, wL, phiV, wV).map(([lo, hi]) => [phiL + lo, phiL + hi]);
-      return { arcs, phiL, wL, phiV, wV };
+      return { arcs, phiL, wL, phiV, wV, vis };
     };
     const at = (i, a, sign, phi) => {
       const { e1, e2, t } = frames[i], ca = Math.cos(a), sa = Math.sin(a) * sign;
@@ -279,10 +283,14 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
       const x = Qm(S[i], nv), k = Math.sqrt(Math.max(dot(nv, x), 1e-300)), c = samples[i].c;
       return { x: c.x + x.x / k, y: c.y + x.y / k, z: c.z + x.z / k };
     };
-    const rows = [];       // rings in order along the surface: cap 0 (pole first), the samples, cap 1
+    // rings in order along the surface: cap 0 (pole first), the samples, cap 1. Each cap ends in a ring at the pole itself (a point; its arc
+    // is all or nothing), so the strip to it closes the cap (the rings used to stop at 79 degrees, leaving a spot of base tone at the pole).
+    const POLE = (Math.PI / 2) * (1 - 1e-4), rows = [];
+    rows.push({ i: 0, a: POLE, sign: -1 });
     for (let k = RINGS - 1; k >= 1; k--) rows.push({ i: 0, a: (Math.PI / 2) * (k - 0.25) / RINGS, sign: -1 });
     for (let i = 0; i < n; i++) rows.push({ i, a: 0, sign: 1 });
     for (let k = 1; k < RINGS; k++) rows.push({ i: n - 1, a: (Math.PI / 2) * (k - 0.25) / RINGS, sign: 1 });
+    rows.push({ i: n - 1, a: POLE, sign: 1 });
     rows.forEach(r => { r.ring = ring(r.i, r.a, r.sign); });
     // An end of an arc that is the silhouette (not the terminator) is pushed out ARCH_SEAM_PX on screen: the drawn outline and the 3D
     // silhouette differ by about a pixel, and a lit part that falls short leaves a thin line of the base tone along the edge (the
@@ -303,17 +311,145 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
       return out;
     };
     const area = (ps) => ps.reduce((acc, p, i) => { const q = ps[(i + 1) % ps.length]; return acc + p[0] * q[1] - q[0] * p[1]; }, 0);
-    const path = new Path2D();
+    // The arch is not convex: where its surface folds over itself on screen (a wide band turning past edge-on at a bend), a lit strip
+    // behind can lie under an unlit one in front, and one lit path would show it through. The visible surface is front-facing everywhere,
+    // so a fold is not a flip of orientation but a contour ACROSS the band: between two rows, a silhouette point (an end of the visible
+    // arc) jumps from one edge of the band to the other instead of moving along with the center. The strips are cut into *sheets* there;
+    // with more than one sheet, they are painted back to front (by their depths where they overlap), each first covering what it hides
+    // in the base tone (`cover`), then its lit part.
+    const strips = [];       // per pair of rows: the visible quad (or null), its signed area, the lit quads
     for (let k = 0; k + 1 < rows.length; k++) {
-      const A = rows[k].ring, B = rows[k + 1].ring;
-      if (!A || !B || A.arcs.length !== B.arcs.length) continue;
+      const A = rows[k].ring, B = rows[k + 1].ring, strip = { k, vis: null, area: 0, lits: [] };
+      strips.push(strip);
+      if (!A || !B) continue;
+      if (A.vis && B.vis) { strip.vis = pts(rows[k], A.vis).concat(pts(rows[k + 1], B.vis).reverse()); strip.area = area(strip.vis); }
+      const push = (poly) => strip.lits.push(area(poly) < 0 ? poly.reverse() : poly);
+      const onScreen = (r, phi) => { const q = projectPoint(at(r.i, r.a, r.sign, phi)); return [q.x, q.y]; };
+      const lerp = (p, q, f) => [p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f];
+      if (A.arcs.length !== B.arcs.length) {
+        // A lit patch that starts between the two rows (none on one, one or more arcs on the other): each arc tapers to a point halfway to
+        // the other row, instead of ending square on its own row.
+        if (A.arcs.length && B.arcs.length) continue;
+        const [R0, R1, arcs, first] = A.arcs.length ? [rows[k], rows[k + 1], A.arcs, true] : [rows[k + 1], rows[k], B.arcs, false];
+        arcs.forEach(arc => {
+          const c = (arc[0] + arc[1]) / 2, tip = lerp(onScreen(R0, c), onScreen(R1, c), 0.5), side = pts(R0, arc);
+          push(first ? side.concat([tip]) : [tip].concat(side));
+        });
+        continue;
+      }
       A.arcs.forEach((arcA, j) => {
-        // two rows whose lit arcs are on different sides of the body (the lit and the visible arcs are almost opposite, so their small overlap
-        // jumps from one end to the other) are not joined: the strip would cross the whole body
-        const arcB = B.arcs[j];
-        if (Math.abs(wrap((arcA[0] + arcA[1] - arcB[0] - arcB[1]) / 2)) > 1) return;
-        const poly = pts(rows[k], arcA).concat(pts(rows[k + 1], B.arcs[j]).reverse());
-        path.addPath(polygon(area(poly) < 0 ? poly.reverse() : poly));
+        const arcB = B.arcs[j], whole = (arc) => arc[1] - arc[0] >= TWO_PI - 1e-6;
+        if (!whole(arcA) && !whole(arcB) && Math.abs(wrap((arcA[0] + arcA[1] - arcB[0] - arcB[1]) / 2)) > 1) {
+          // The two rows' lit arcs are on different sides of the body: the light comes from nearly behind, the lit part is a sliver along
+          // the silhouette, and where the light lines up with the view it shrinks to nothing and comes back on the other side. Joined, the
+          // strip would cross the whole body; each sliver tapers instead to a point on its silhouette, at the fraction of the way where the
+          // widths reach zero (the terminator crosses the silhouette there).
+          if (!A.vis || !B.vis) return;
+          const wA = arcA[1] - arcA[0], wB = arcB[1] - arcB[0], f = wA / (wA + wB || 1);
+          const near = (phi, list) => list.reduce((m, x) => (Math.abs(wrap(x - phi)) < Math.abs(wrap(m - phi)) ? x : m));
+          // an arc's silhouette end is the one on an end of the visible arc (the other is the terminator)
+          const silEnd = (arc, vis) => { const d = (x) => Math.abs(wrap(x - near(x, vis))); return d(arc[0]) <= d(arc[1]) ? arc[0] : arc[1]; };
+          const endA = silEnd(arcA, A.vis), endB = silEnd(arcB, B.vis);
+          push(pts(rows[k], arcA).concat([lerp(onScreen(rows[k], endA), onScreen(rows[k + 1], near(endA, B.vis)), f)]));
+          push([lerp(onScreen(rows[k], near(endB, A.vis)), onScreen(rows[k + 1], endB), f)].concat(pts(rows[k + 1], arcB)));
+          return;
+        }
+        const poly = pts(rows[k], arcA).concat(pts(rows[k + 1], arcB).reverse());
+        push(poly);
+      });
+    }
+    const scr = (r, phi) => { const p = at(r.i, r.a, r.sign, phi), q = projectPoint(p); return { x: q.x, y: q.y, d: dot(sub(p, cp), basis.forward) }; };
+    const sil = rows.map(r => (r.ring && r.ring.vis ? r.ring.vis.map(phi => scr(r, phi)) : null));
+    const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+    const crosses = (k) => {
+      if (rows[k].i === rows[k + 1].i) return false;     // inside an end cap (half of a convex ellipsoid: no fold)
+      const a = sil[k], b = sil[k + 1], step = dist(csc[rows[k].i], csc[rows[k + 1].i]);
+      const jump = Math.max(dist(a[0], b[0]), dist(a[1], b[1])), width = Math.min(dist(a[0], a[1]), dist(b[0], b[1]));
+      return jump > 3 * step + 0.5 * width + 2 * px;
+    };
+    const inside = (pt, poly) => {
+      let c = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > pt[1]) !== (yj > pt[1]) && pt[0] < (xj - xi) * (pt[1] - yi) / (yj - yi) + xi) c = !c;
+      }
+      return c;
+    };
+    // Two strips overlap on screen: a few points of one (its corners and the midpoints across it) inside the other. A tube bending toward
+    // the camera hides its own earlier strips behind later ones without any contour across it (at the apex of the threaded orange arch
+    // at 2.02, a lit rim sliver showed through as a crescent), so a sheet is also cut where a strip overlaps a non-neighbor of its sheet.
+    strips.forEach(st => {
+      if (!st.vis) return;
+      const v = st.vis, h = v.length / 2;
+      st.box = v.reduce((b, [x, y]) => ({ x0: Math.min(b.x0, x), y0: Math.min(b.y0, y), x1: Math.max(b.x1, x), y1: Math.max(b.y1, y) }), { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
+      st.pts = v.concat(Array.from({ length: h - 1 }, (_, m) => [(v[m + 1][0] + v[v.length - 2 - m][0]) / 2, (v[m + 1][1] + v[v.length - 2 - m][1]) / 2]));
+    });
+    const overlaps = (p, q) => {
+      if (p.box.x1 < q.box.x0 || q.box.x1 < p.box.x0 || p.box.y1 < q.box.y0 || q.box.y1 < p.box.y0) return false;
+      const count = (a, b) => a.pts.reduce((acc, pt) => acc + (inside(pt, b.vis) ? 1 : 0), 0);
+      return count(p, q) >= 2 || count(q, p) >= 2;
+    };
+    const sheets = [];
+    let sheet = null;
+    strips.forEach(st => {
+      if (!st.vis) { sheet = null; return; }
+      // the cut at `cutAt` is soft (not a contour): the strips on both sides of it paint no cover, so no line of the base tone is
+      // left across the arch where the later sheet's edge meets the earlier one
+      const soft = cutAt !== null && sheet && rows[st.k].i === cutAt - 1 && rows[st.k + 1].i === cutAt;
+      if (soft) sheet.softEnd = true;
+      const hidden = sheet && sheet.strips.some(o => o.k <= st.k - 3 && overlaps(st, o));
+      if (!sheet || soft || hidden || crosses(st.k)) sheets.push(sheet = { strips: [], softStart: soft });
+      sheet.strips.push(st);
+    });
+    const litPath = (list) => { const path = new Path2D(); list.forEach(st => st.lits.forEach(poly => path.addPath(polygon(poly)))); return path; };
+    let out;
+    if (sheets.length <= 1) out = [{ kind: 'lit', lit: litPath(strips) }];
+    else {
+      // Probe points of each sheet (its visible quads' interiors, with their depth), to order two sheets where they overlap on screen.
+      sheets.forEach(sh => {
+        sh.probes = [];
+        sh.strips.forEach(st => {
+          const A = rows[st.k], B = rows[st.k + 1];
+          for (let m = 1; m < M; m++) {
+            const f = m / M, pa = scr(A, A.ring.vis[0] + (A.ring.vis[1] - A.ring.vis[0]) * f), pb = scr(B, B.ring.vis[0] + (B.ring.vis[1] - B.ring.vis[0]) * f);
+            sh.probes.push({ x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, d: (pa.d + pb.d) / 2, st });
+          }
+        });
+        sh.depth = sh.probes.reduce((acc, q) => acc + q.d, 0) / (sh.probes.length || 1);
+      });
+      // nearer[i][j]: +1 if sheet i is in front of sheet j where they overlap, -1 behind, 0 if they don't overlap.
+      const order = (P, Q) => {
+        let votes = 0;
+        P.probes.forEach(q => {
+          const st = Q.strips.find(s2 => inside([q.x, q.y], s2.vis));
+          if (!st) return;
+          const near = Q.probes.filter(o => o.st === st);
+          const dq = near.length ? near.reduce((acc, o) => acc + o.d, 0) / near.length : Q.depth;
+          votes += q.d < dq ? 1 : -1;
+        });
+        return Math.sign(votes);
+      };
+      // Back to front: repeatedly take, among the sheets left, one that nothing left is behind (ties and cycles: the farthest).
+      const left = sheets.slice(), sorted = [];
+      const rel = new Map();
+      const relOf = (P, Q) => { const key = sheets.indexOf(P) + ',' + sheets.indexOf(Q); if (!rel.has(key)) rel.set(key, order(P, Q) - order(Q, P)); return rel.get(key); };
+      while (left.length) {
+        left.sort((p, q) => q.depth - p.depth);
+        const pick = left.find(P => left.every(Q => Q === P || relOf(P, Q) <= 0)) || left[0];
+        sorted.push(pick); left.splice(left.indexOf(pick), 1);
+      }
+      // A sheet covers what it hides only if it overlaps a sheet painted before it.
+      out = sorted.map((sh, p) => {
+        // `half`: the side of `cutAt` the sheet is on (a skewed mesh's half drawn first paints only its own sheets, render.js), read from
+        // the far row of its first strip (the strip across the cut starts on sample cutAt - 1 but belongs to the sheet after the cut)
+        const half = cutAt === null ? undefined : (rows[sh.strips[0].k + 1].i < cutAt ? 0 : 1);
+        if (!sorted.slice(0, p).some(Q => relOf(sh, Q) !== 0)) return { kind: 'lit', lit: litPath(sh.strips), half };
+        const cover = new Path2D(), last = sh.strips.length - 1;
+        sh.strips.forEach((st, j) => {
+          if ((j === 0 && sh.softStart) || (j === last && sh.softEnd)) return;
+          cover.addPath(polygon(st.area < 0 ? st.vis.slice().reverse() : st.vis));
+        });
+        return { kind: 'lit', lit: litPath(sh.strips), cover, half };
       });
     }
     if (debug.on) {
@@ -333,39 +469,49 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
         flush();
       });
     }
-    return [{ kind: 'lit', lit: path }];
+    return out;
   };
 
   return {
     flat,
-    // A skewed arch by its mesh id and its world samples (buildArch).
-    arch: (key, samples) => cached('a' + key, () => buildArch(samples)),
+    // A skewed arch by its mesh id, its world samples and the sample it is split at (buildArch).
+    arch: (key, samples, cutAt) => cached('a' + key, () => buildArch(samples, cutAt)),
     // The pair of a 2-node mesh (or a split cone): lit as a tube, i.e. by the light's component perpendicular to the axis only, so a
     // generatrix has one tone along its whole length (the cone's border is a straight line) and a node's border is the great circle
     // n . lam = 0 (a plane parallel to the axis), which continues that line across the seam without a corner. Returns the elements
     // [sphere a, sphere b, cone] (nulls where nothing is lit).
-    pair: (pa, pb) => cached('p' + pa.id + ',' + pb.id, () => {
-      const sa = flat(pa), sb = flat(pb), dv = sub(sb, sa), Ln = len(dv);
-      if (Ln < 1e-6) return [];
-      const d = { x: dv.x / Ln, y: dv.y / Ln, z: dv.z / Ln }, k = dot(L, d), perp = { x: L.x - k * d.x, y: L.y - k * d.y, z: L.z - k * d.z };
-      if (len(perp) < 1e-6) return [];
-      const lam = unit(perp);
-      return [buildSphere(sa, lam, [sb], 'n' + pa.id), buildSphere(sb, lam, [sa], 'n' + pb.id), buildCone(sa, sb, lam, [], pa.id + '-' + pb.id)];
-    }),
+    // (Cached by the unordered pair, so a joint disc, a split cone's two parts and a plain piece share one tube.)
+    pair: (pa, pb) => {
+      const swap = pa.id > pb.id, [p0, p1] = swap ? [pb, pa] : [pa, pb];
+      const els = cached('p' + p0.id + ',' + p1.id, () => {
+        const sa = flat(p0), sb = flat(p1), dv = sub(sb, sa), Ln = len(dv);
+        if (Ln < 1e-6) return [];
+        const d = { x: dv.x / Ln, y: dv.y / Ln, z: dv.z / Ln }, k = dot(L, d), perp = { x: L.x - k * d.x, y: L.y - k * d.y, z: L.z - k * d.z };
+        if (len(perp) < 1e-6) return [];
+        const lam = unit(perp);
+        return [buildSphere(sa, lam, [sb], 'n' + p0.id), buildSphere(sb, lam, [sa], 'n' + p1.id), buildCone(sa, sb, lam, [], p0.id + '-' + p1.id)];
+      });
+      return swap && els.length ? [els[1], els[0], els[2]] : els;
+    },
+    // The tangent cone of two nodes lit by the light itself (not as a tube): a split cone's host-colored part, so the whole host
+    // color has one light model and the switch to the tube is on the split ring, a color border.
+    cone: (pa, pb) => cached('c' + pa.id + ',' + pb.id, () => buildCone(flat(pa), flat(pb), L, [], pa.id + '-' + pb.id + 'L')),
     // A 3+ node mesh (buildHull), by its mesh id `key` and its projected nodes `ps`.
     hull: (key, ps) => cached('h' + key, () => {
       const h = buildHull(ps.map(flat), ps.map(p => p.id));
+      // Sphere i also given way to the nodes `fars` (the far ends of the split cones that start there).
+      const given = new Map();
+      const sphereWith = (i, fars) => {
+        if (!given.has(i)) given.set(i, buildSphere(h.flats[i], L, h.partnersOf[i].concat(fars.map(flat))));
+        return given.get(i);
+      };
       return {
-        // All the mesh's elements: its spheres (but those of the node ids `skip` says), its cones, its visible faces. EVERY piece of the
-        // mesh paints all of them over its own fill: a piece drawn after another (separate depth strata) covers that piece's cone with its
-        // own base tone, and would leave it dark where it overlaps.
-        elements: (skip = () => false) => [...h.spheres.filter((s, i) => !skip(ps[i].id)), ...h.cones, ...h.faces],
-        // Node `p`'s sphere, also given way to the node `far` (a split cone starts there).
-        sphereWith: (p, far) => { const i = ps.findIndex(q => q.id === p.id); return buildSphere(h.flats[i], L, h.partnersOf[i].concat(flat(far))); },
+        // All the mesh's elements: its spheres, its cones, its visible faces. EVERY piece of the mesh paints all of them over its own fill:
+        // a piece drawn after another (separate depth strata) covers that piece's elements with its own base tone, and would leave them
+        // dark where it overlaps. `giveWay(id)`: the far nodes of the split cones at node `id` (or null); that sphere gives way to them.
+        elements: (giveWay = () => null) => [...h.spheres.map((s, i) => { const fars = giveWay(ps[i].id); return fars ? sphereWith(i, fars) : s; }), ...h.cones, ...h.faces],
       };
     }),
-    // A sphere lit by the light itself, with no partners (a joint's disc).
-    free: (p) => cached('s' + p.id, () => buildSphere(flat(p), L, [])),
     // The debug view of the shade borders (Debug button): per cone, in its own color, the generatrices where its lit part starts and
     // ends (solid lines) with a dot at each end on the two tangent circles; per node, dashed black, the border of its lit cap; and dotted
     // white, the border between each cone and its nodes (the visible part of the tangent circles). Where a
@@ -436,6 +582,7 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
           ctx.fill(el.footprint);
           ctx.stroke(el.footprint);
         } else {
+          if (el.cover) { ctx.fillStyle = toneColor(color, TWILIGHT); ctx.fill(el.cover); }      // an arch sheet over the ones behind it
           ctx.fillStyle = lit;
           if (el.kind === 'sphere') ctx.fill(el.lit.path, el.lit.rule); else ctx.fill(el.lit);
         }

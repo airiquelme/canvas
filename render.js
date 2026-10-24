@@ -392,12 +392,11 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
         ? () => {
           const hostProj = split.hostMesh.nodeIds.map(id => projected[id]), far = projected[farNodeOf().id];
           // This part is host-colored and painted over the host's own pieces, so it paints the host's whole lit hull (like any of the host's
-          // pieces: its spheres, cones and faces) with the shared node lit like its host but given way to the split cone, then the cone's own
-          // tube-lit part. Without the host's elements its dark base would cover them where they overlap.
-          const [pairSphere, , cone] = frame.shading.pair(sharedProj, far);
-          if (!hostProj.every(p => p.round)) return [pairSphere, cone];
-          const hull = frame.shading.hull(split.hostMesh.id, hostProj);
-          return [...hull.elements(id => id === split.splitNodeId), hull.sphereWith(sharedProj, far), cone];
+          // pieces: its spheres, cones and faces, the shared node given way to the split cones), then the cone lit by the light itself like
+          // the host (the tube light starts at the split ring, where the color changes). Without the host's elements its dark base would
+          // cover them where they overlap.
+          if (!hostProj.every(p => p.round)) { const [pairSphere, , cone] = frame.shading.pair(sharedProj, far); return [pairSphere, cone]; }
+          return [...frame.shading.hull(split.hostMesh.id, hostProj).elements(frame.splitFarsOf), frame.shading.cone(sharedProj, far)];
         } : null,
       draw: (c = ctx) => (splitRing.general
         ? drawSplitSharedGeneral(c, nodes[split.splitNodeId], sharedProj, farNodeOf(), splitScreen(), split.hostMesh.color)
@@ -530,8 +529,9 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
     // The nodes at a joint (its disc is its own piece) or at the split node (its cone owns the disc) are left out.
     if (mesh.nodeIds.length > 2) {
       if (!mesh.nodeIds.every(id => projected[id].round)) return null;
-      // (every piece paints the whole mesh's elements, shading.js hull; the split node's sphere belongs to its cone)
-      return S.hull(mesh.id, mesh.nodeIds.map(id => projected[id])).elements(id => splitNodeIds.has(id));
+      // (every piece paints the whole mesh's elements, shading.js hull, the split node's sphere given way to its cones: a piece
+      // drawn after the cone's host-colored part would otherwise cover that sphere's lit cap with its base tone)
+      return S.hull(mesh.id, mesh.nodeIds.map(id => projected[id])).elements(frame.splitFarsOf);
     }
     const els = [...S.pair(a, b)];
     if (jointNodeIds.has(a.id) || (split && a.id === split.splitNodeId)) els[0] = null;
@@ -600,15 +600,24 @@ function buildSkewPrimitives(frame, mesh) {
   const strokeCut = { trace: strip.tracePath };
   first.owners = [`${mesh.id}.0`]; first.strokeCut = strokeCut;
   second.owners = [`${mesh.id}.1`]; second.strokeCut = strokeCut;
-  // The light engine: the whole arch's lit part (shading.js buildArch), in world space, over each half's own fill.
+  // The light engine: the arch's lit part (shading.js buildArch), in world space, over each half's own fill, cut into sheets at the apex
+  // (and at folds) and painted back to front. The half drawn LATER paints every sheet: its round end reaches well past the apex, and
+  // painting only its own part left that disc in the base tone (a moon-phase look at the skew node). The half drawn first paints only
+  // its own sheets: the other half's sheets are the 3D surface, not its drawn outline, and where they reach past that outline they
+  // stayed on the earlier half (shading past the front half's edge and its border stroke, a band of base tone along the apex).
+  // Its own disc past the apex is the later half's circle at that sample, so the later half covers it.
   if (frame.shading) {
     // The shade border is a smooth 3D curve: its own uniform samples of the arch (the drawn chain is only as fine as its outline needs).
-    const shadeTs = Array.from({ length: 65 }, (_, i) => i / 64);
-    const shade = () => frame.shading.arch(mesh.id, shadeTs.map((t) => {
+    const N = 64, shadeTs = Array.from({ length: N + 1 }, (_, i) => i / N);
+    let worldSamples = null;
+    const samplesOf = () => (worldSamples ||= shadeTs.map((t) => {
       const w = at(t), r2 = 1 / (w.radius * w.radius);
       return { c: w.center, Q: oblate ? inverse(qAt(t)) : [r2, 0, 0, 0, r2, 0, 0, 0, r2] };      // the form of x^T K x = 1 (shape.Q is S^2)
     }));
-    first.shade = shade; second.shade = shade;
+    const all = () => frame.shading.arch(mesh.id, samplesOf(), N / 2);
+    const own = (h) => () => all().filter(e => e.half === undefined || e.half === h);
+    // (draw order between the halves: the larger key first; on a tie the first half, the sort being stable)
+    if (first.depth >= second.depth) { first.shade = own(0); second.shade = all; } else { first.shade = all; second.shade = own(1); }
   }
   return [first, second];
 }
@@ -675,7 +684,12 @@ function buildJointPrimitive(frame, nodeId) {
   return {
     // The disc's fills in order: the dominant region (the front mesh), then the crescent.
     owners: dominantA ? [joint.meshA.id, joint.meshB.id] : [joint.meshB.id, joint.meshA.id],
-    shade: (frame.shading && !map && projected[nodeId].round) ? () => [frame.shading.free(projected[nodeId])] : null,
+    // Each region is lit like the tube it belongs to (the joint sphere and the cone of `pair`, the disc also covers the cone past its
+    // tangent circle), so each cone's straight shade border runs on across the disc; the light changes only on the ring.
+    shade: (frame.shading && !map && projected[nodeId].round) ? () => {
+      const tube = (far) => { if (!far.round) return []; const [sphere, , cone] = frame.shading.pair(projected[nodeId], far); return [sphere, cone]; };
+      return { fills: dominantA ? [tube(joint.farProjA), tube(joint.farProjB)] : [tube(joint.farProjB), tube(joint.farProjA)] };
+    } : null,
     // A split cone ending here must go under the joint circle.
     cluster: frame.clusterOf[joint.meshA.id], depth: jointDepth(frame, nodeId), binDepth: projected[nodeId].depth, box: boxOf([projected[nodeId]]), caps: [capsuleOf(projected[nodeId], projected[nodeId])],
     // No usable ring in view (e.g. one arm points at the camera): one color.
@@ -793,14 +807,16 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
     for (const [m, args] of ops) {
       if (m === '=fillStyle') { color = args; T.fillStyle = args; continue; }
       if (m === 'fill') {
-        const owner = owners[Math.min(fills++, owners.length - 1)], path = new Path2D();
+        const fillIdx = fills++, owner = owners[Math.min(fillIdx, owners.length - 1)], path = new Path2D();
+        // `elements` may be per fill ({ fills: [...] }, a joint disc's two regions), like `owners`.
+        const els = elements && elements.fills ? elements.fills[Math.min(fillIdx, elements.fills.length - 1)] : elements;
         path.addPath(sub, mat);
         if (owner !== undefined && inkColors.has(color) && meshOf(owner).color === color) {
           strokeUnder(owner, color, path, box, strip, cut);
           painted.push({ owner, color, path, box, strip });
         }
-        const shaded = elements && elements.length && !stack.length;
-        if (shaded && T === ctx && elements.every(e => e.kind === 'lit')) {
+        const shaded = els && els.length && !stack.length;
+        if (shaded && T === ctx && els.every(e => e?.kind === 'lit')) {
           // A skewed arch: base and lit part are built on a transparent layer (the lit part source-atop, so it takes the fill's own
           // antialiased alpha) and composited once. Painted directly, the base tone and the lit tone each blend at the fill's edge and
           // leave a dark hairline where one arch's edge crosses another's lit part.
@@ -815,7 +831,7 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
             g.fill(path);
             g.save();
             g.globalCompositeOperation = 'source-atop';
-            shading.paint(g, path, color, elements, true);
+            shading.paint(g, path, color, els, true);
             g.restore();
             ctx.save();
             ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -826,7 +842,7 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
         }
         if (shaded) T.fillStyle = shading.baseColor(color);
         T.fill();
-        if (shaded) shading.paint(T, path, color, elements);
+        if (shaded) shading.paint(T, path, color, els);
         continue;
       }
       if (m === 'beginPath') sub = new Path2D();
@@ -934,7 +950,7 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
       [at(s0, -BIG), at(s1, -BIG), at(s1, BIG), at(s0, BIG)].forEach((q, i) => (i ? strip.lineTo(q.x, q.y) : strip.moveTo(q.x, q.y)));
       strip.closePath();
       const ops = p.tracePath ? [['beginPath', []], ...p.ops, ['=fillStyle', p.color], ['fill', []]] : p.ops, elements = shading && p.shade && p.shade();
-      if (!elements || !elements.length) { paintRecorded(ops, ownersOf(p), p.box, strip); ctx.restore(); return; }
+      if (!elements || (!elements.length && !elements.fills)) { paintRecorded(ops, ownersOf(p), p.box, strip); ctx.restore(); return; }
       // A shaded piece is several layers (its base tone, the tone regions over it). Through the strip's antialiased clip edge each
       // layer would blend over what the neighboring strip already painted and leave a trace of the lower one (a line that slides
       // along the piece as the strata move), so it is built on a transparent layer and composited through the clip once.
@@ -995,6 +1011,13 @@ export function render(ctx, canvas, { darkMode }) {
     clusterOf: buildClusters(owners),
     shading: null,           // the light engine (shading.js), when on
   };
+  // Node id -> the projected far nodes of the split cones starting there (null if none): the host's sphere there gives way to them.
+  const splitFars = {};
+  Object.values(meshes).forEach(m => {
+    const s = splitOf[m.id];
+    if (s) (splitFars[s.splitNodeId] ||= []).push(projected[m.nodeIds.find(id => id !== s.splitNodeId)]);
+  });
+  frame.splitFarsOf = (id) => splitFars[id] || null;
   if (lighting.on && typeof Path2D !== 'undefined') frame.shading = makeShading({ basis, tol: frame.tol, px: 1 / pxPerUnit, camPos, projectPoint: frame.projectPoint });
 
   const primitives = [];
