@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 800"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "[System.Media.SystemSounds]::Exclamation.Play(); Start-Sleep -Milliseconds 800"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,6 +1,7 @@
 // Frame assembly: project -> ownership -> joints -> primitives -> depth
 // sort -> batched draw. Terms (joint, joint ring, split cone): see CLAUDE.md.
-import { DESIGN_WIDTH, DESIGN_HEIGHT, debug, focus } from './config.js';
+import { DESIGN_WIDTH, DESIGN_HEIGHT, debug, focus, strokes, lighting } from './config.js';
+import { makeShading } from './shading.js';
 import { buildJointCurve, edgeContacts } from './jointCurve.js';
 import { buildJointCurveGeneral, edgeContactsGeneral } from './jointCurveGeneral.js';
 import { projectJointSplit } from './jointSplit.js';
@@ -11,7 +12,7 @@ import { drawShapeDebug } from './shapeDebug.js';
 import { shadowEllipse, vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, ellipseRayPoint, ellipsePoint, ellipsoidShape, ellipseCapsule, ellipsePolygon, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from './camera.js';
 import { nodes, meshes } from './scene.js';
-import { archAt, archSamples, shapeAt } from './skew.js';
+import { archAt, archSamples, shapeAt, inverse } from './skew.js';
 import {
   pixelScale, seamUnderlap, fillCircle, circlePoints, traceCapsule, traceCircle, traceTriangle,
   nodeEllipse, traceEllipseCapsule, traceEllipse, splitScreenPoints, drawSplitSharedGeneral, drawSplitFarGeneral,
@@ -33,6 +34,32 @@ function makeSlice(p, q) {
   if (dist < 1 || p.depth === q.depth) return null;
   const ax = dx / dist, ay = dy / dist, s0 = p.center.x * ax + p.center.y * ay;
   return { ax, ay, s0, s1: s0 + dist, d0: p.depth, d1: q.depth };
+}
+// An ink owner is a mesh id, or "id.half" for one half of a skewed mesh that folds over itself.
+const meshOf = (owner) => meshes[typeof owner === 'string' ? parseInt(owner, 10) : owner];
+const boxesMeet = (p, q) => p.x0 <= q.x1 && q.x0 <= p.x1 && p.y0 <= q.y1 && q.y0 <= p.y1;
+// Colors worn by two or more different meshes among the pieces to draw (the ones that get border strokes), or none when
+// strokes are off or the browser lacks Path2D / DOMMatrix / an offscreen canvas.
+function strokeColorsOf(primitives) {
+  const none = new Set();
+  if (!strokes.on || typeof Path2D === 'undefined' || typeof DOMMatrix === 'undefined' || (typeof OffscreenCanvas === 'undefined' && typeof document === 'undefined')) return none;
+  const byColor = new Map();
+  primitives.forEach(p => (p.owners || [p.meshId]).forEach(id => {
+    if (id === undefined) return;
+    const color = meshOf(id).color, set = byColor.get(color) || byColor.set(color, new Set()).get(color);
+    set.add(id);
+  }));
+  return new Set([...byColor].filter(([, ids]) => ids.size > 1).map(([color]) => color));
+}
+// Three scratch canvases (stroke, mask, piece group) the size of the main one, kept between frames.
+let layerCache = null;
+function scratchLayers(ctx) {
+  const { width, height } = ctx.canvas;
+  if (!layerCache || layerCache[0].width !== width || layerCache[0].height !== height) {
+    const make = () => (typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(width, height) : Object.assign(document.createElement('canvas'), { width, height }));
+    layerCache = [make(), make(), make()];
+  }
+  return layerCache;
 }
 // The screen box of some projected nodes (discs or ellipses) and optional extra points, with a margin:
 // what a primitive between those nodes can cover. Used to tell which pieces can overlap.
@@ -346,19 +373,35 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
     // The far part is keyed past the host's whole depth range (so it layers against the host) and
     // past its own far node, so a mesh near that end sorts against the cone by where it really is.
     const farDepth = (a.id === split.splitNodeId ? b : a).depth;
-    depth = (facing > 0 ? Math.min(hostMin, farDepth) - 0.001 : Math.max(hostMax, farDepth) + 0.001) - 1e-4 * facing;
+    // The far part goes over the host only if the cone points at the camera AND its far node is nearer than every host node: with the
+    // far node still behind the host's nearest node, the host's own pieces (e.g. a cone to a nearer node) are in front of it, and drawing
+    // it over them cut the green into the blue (3.406). Otherwise it goes under, and the host's pieces cover it.
+    const overHost = facing > 0 && farDepth < hostMin;
+    depth = (overHost ? Math.min(hostMin, farDepth) - 0.001 : Math.max(hostMax, farDepth) + 0.001) - 1e-4 * facing;
     frame.coneDepths[mesh.id] = depth;
     const sharedProj = projected[split.splitNodeId];
     const axisCam = { x: vecDot(splitRing.dir, basis.right), y: vecDot(splitRing.dir, basis.up) };
-    // (The host-colored shared part belongs to the host: hidden in the focus view.) It is sorted by
+    // (The host-colored shared part belongs to the host: hidden in the focus view unless the host is shown.) It is sorted by
     // the split node's own depth, so other meshes near it (behind or in front of that node) layer
     // against the node; it stays between the cones' far parts (hostMax + 0.001 away from the
     // camera, hostMin - 0.001 toward it), which are keyed past the host's whole depth range.
-    if (!focus.on) frame.extraPrimitives.push({
+    if (!focus.on || focus.meshIds.includes(split.hostMesh.id)) frame.extraPrimitives.push({
       cluster: frame.clusterOf[split.hostMesh.id], depth: sharedProj.depth + 0.0005, binDepth: sharedProj.depth, box: boxOf([sharedProj, projected[farNodeOf().id]]), caps: [capsuleOf(sharedProj, sharedProj, 1.2)],
-      draw: () => (splitRing.general
-        ? drawSplitSharedGeneral(ctx, nodes[split.splitNodeId], sharedProj, farNodeOf(), splitScreen(), split.hostMesh.color)
-        : drawSplitShared(ctx, sharedProj, splitRing, axisCam, split.hostMesh.color, projectPoint)),
+      owners: [split.hostMesh.id],
+      shade: (frame.shading && sharedProj.round && projected[farNodeOf().id].round)
+        ? () => {
+          const hostProj = split.hostMesh.nodeIds.map(id => projected[id]), far = projected[farNodeOf().id];
+          // This part is host-colored and painted over the host's own pieces, so it paints the host's whole lit hull (like any of the host's
+          // pieces: its spheres, cones and faces) with the shared node lit like its host but given way to the split cone, then the cone's own
+          // tube-lit part. Without the host's elements its dark base would cover them where they overlap.
+          const [pairSphere, , cone] = frame.shading.pair(sharedProj, far);
+          if (!hostProj.every(p => p.round)) return [pairSphere, cone];
+          const hull = frame.shading.hull(split.hostMesh.id, hostProj);
+          return [...hull.elements(id => id === split.splitNodeId), hull.sphereWith(sharedProj, far), cone];
+        } : null,
+      draw: (c = ctx) => (splitRing.general
+        ? drawSplitSharedGeneral(c, nodes[split.splitNodeId], sharedProj, farNodeOf(), splitScreen(), split.hostMesh.color)
+        : drawSplitShared(c, sharedProj, splitRing, axisCam, split.hostMesh.color, projectPoint)),
     });
   }
 
@@ -479,7 +522,23 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
 
   const caps = [capsuleOf(a, b, jointNodeIds.has(a.id) ? 1.3 : 1, jointNodeIds.has(b.id) ? 1.3 : 1)];
   if (mesh.nodeIds.length > 2) caps.push(capsuleOf(a, { center: screenCentroid, radius: 0 }), capsuleOf(b, { center: screenCentroid, radius: 0 }));
-  const prim = { cluster: frame.clusterOf[mesh.id], depth, binDepth: Math.max(a.depth, b.depth), slice: makeSlice(a, b), box: boxOf([a, b], mesh.nodeIds.length > 2 ? [screenCentroid] : []), caps, meshId: mesh.id, color, draw, tracePath };
+  // The surfaces this piece shows, for the light engine (shading.js): the spheres at its ends (not at a joint, whose disc is
+  // its own piece, nor at the split node, which the cone's host part owns), the cone between them and, for a plain piece of a
+  // 3+ node mesh, its fill triangle.
+  const S = frame.shading;
+  const shade = (S && a.round && b.round) ? () => {
+    // The nodes at a joint (its disc is its own piece) or at the split node (its cone owns the disc) are left out.
+    if (mesh.nodeIds.length > 2) {
+      if (!mesh.nodeIds.every(id => projected[id].round)) return null;
+      // (every piece paints the whole mesh's elements, shading.js hull; the split node's sphere belongs to its cone)
+      return S.hull(mesh.id, mesh.nodeIds.map(id => projected[id])).elements(id => splitNodeIds.has(id));
+    }
+    const els = [...S.pair(a, b)];
+    if (jointNodeIds.has(a.id) || (split && a.id === split.splitNodeId)) els[0] = null;
+    if (jointNodeIds.has(b.id) || (split && b.id === split.splitNodeId)) els[1] = null;
+    return els;
+  } : null;
+  const prim = { cluster: frame.clusterOf[mesh.id], depth, binDepth: Math.max(a.depth, b.depth), slice: makeSlice(a, b), box: boxOf([a, b], mesh.nodeIds.length > 2 ? [screenCentroid] : []), caps, meshId: mesh.id, color, draw, tracePath, shade };
   [a, b].forEach(end => { if (jointNodeIds.has(end.id)) (frame.jointBodies[end.id] ||= []).push({ meshId: mesh.id, prim, isSplit: !!split }); });
   return prim;
 }
@@ -532,7 +591,26 @@ function buildSkewPrimitives(frame, mesh) {
   };
   // The halves reach one sample past the apex into each other (same color), so where the apex section is a line (a flat ribbon)
   // they overlap in a strip instead of only touching along an edge, which lets the background through (rule 1).
-  return [half(samples.slice(0, Math.min(apex + 2, samples.length))), half(samples.slice(Math.max(apex - 1, 0)))];
+  const first = half(samples.slice(0, Math.min(apex + 2, samples.length))), second = half(samples.slice(Math.max(apex - 1, 0)));
+  // Border strokes between the halves (CLAUDE.md "Border strokes"): each half is its own stroke owner (and its own fill), so
+  // wherever one half is drawn over the other the nearer one gets its edge stroked, growing and shrinking with the overlap.
+  // The strip where the halves reach into each other around the apex is not a border: both strokes leave it out
+  // (`strokeCut`: the body of the samples apex-1 .. apex+1, traced on demand).
+  const strip = half(samples.slice(Math.max(apex - 1, 0), Math.min(apex + 2, samples.length)));
+  const strokeCut = { trace: strip.tracePath };
+  first.owners = [`${mesh.id}.0`]; first.strokeCut = strokeCut;
+  second.owners = [`${mesh.id}.1`]; second.strokeCut = strokeCut;
+  // The light engine: the whole arch's lit part (shading.js buildArch), in world space, over each half's own fill.
+  if (frame.shading) {
+    // The shade border is a smooth 3D curve: its own uniform samples of the arch (the drawn chain is only as fine as its outline needs).
+    const shadeTs = Array.from({ length: 65 }, (_, i) => i / 64);
+    const shade = () => frame.shading.arch(mesh.id, shadeTs.map((t) => {
+      const w = at(t), r2 = 1 / (w.radius * w.radius);
+      return { c: w.center, Q: oblate ? inverse(qAt(t)) : [r2, 0, 0, 0, r2, 0, 0, 0, r2] };      // the form of x^T K x = 1 (shape.Q is S^2)
+    }));
+    first.shade = shade; second.shade = shade;
+  }
+  return [first, second];
 }
 
 // Sort key of a joint's disc: just in front of its node, and behind any split
@@ -591,19 +669,22 @@ function buildJointPrimitive(frame, nodeId) {
   const radius = map ? map.radius : joint.radius;
   const view = map ? { viewDirAt: joint.view.viewDirAt, projectPoint: (w) => map.to(joint.view.projectPoint(w)) } : joint.view;
   const split = projectJointSplit(joint.curve, joint.center, radius, view, map ? map.to(farCenter) : farCenter);
-  const drawDisc = () => (split
-    ? drawJointSplitFromCurve(ctx, joint.center, radius, split, dominantColor, crescentColor, frame.pxPerUnit)
-    : fillCircle(ctx, joint.center, radius, dominantColor));
+  const drawDisc = (c) => (split
+    ? drawJointSplitFromCurve(c, joint.center, radius, split, dominantColor, crescentColor, frame.pxPerUnit)
+    : fillCircle(c, joint.center, radius, dominantColor));
   return {
+    // The disc's fills in order: the dominant region (the front mesh), then the crescent.
+    owners: dominantA ? [joint.meshA.id, joint.meshB.id] : [joint.meshB.id, joint.meshA.id],
+    shade: (frame.shading && !map && projected[nodeId].round) ? () => [frame.shading.free(projected[nodeId])] : null,
     // A split cone ending here must go under the joint circle.
     cluster: frame.clusterOf[joint.meshA.id], depth: jointDepth(frame, nodeId), binDepth: projected[nodeId].depth, box: boxOf([projected[nodeId]]), caps: [capsuleOf(projected[nodeId], projected[nodeId])],
     // No usable ring in view (e.g. one arm points at the camera): one color.
-    draw: () => {
-      if (!map) { drawDisc(); return; }
-      ctx.save();
-      ctx.transform(...map.fromMatrix);
-      drawDisc();
-      ctx.restore();
+    draw: (c = ctx) => {
+      if (!map) { drawDisc(c); return; }
+      c.save();
+      c.transform(...map.fromMatrix);
+      drawDisc(c);
+      c.restore();
     },
   };
 }
@@ -647,7 +728,117 @@ function orderByCluster(entries) {
 // slabs don't count. Then the output is that of an uncut piece (no clip, no seam). Otherwise the run of
 // slabs is drawn through a clip strip along its slice axis, widened by `seam` toward each neighboring slab
 // that is drawn LATER, so the earlier one reaches under the later one (rule 1).
-function drawPrimitives(ctx, primitives, seam) {
+//
+// Border strokes (config.js `strokes`): where a mesh is drawn over another mesh of the SAME color, the edge of what it
+// paints gets a black stroke, centered on the edge but laid down BEFORE the fill, so only its outer half shows. Each
+// fill of such a mesh is first recorded (`paintRecorded`); its outline is stroked on an offscreen canvas, masked to the
+// other same-colored meshes painted so far (never over the background) minus the mesh's own earlier fills (never along
+// its own piece seams), composited, and then the fill is painted over the inner half. Only colors used by two or more
+// meshes take this path; everything else is drawn as before.
+function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
+  const ownersOf = (p) => p.owners || [p.meshId];
+  const inkColors = strokeColorsOf(primitives);
+  const inked = (p) => inkColors.size > 0 && ownersOf(p).some(id => id !== undefined && inkColors.has(meshOf(id).color));
+  // With the light engine on, every piece that has shape elements goes through the recorded path too (its tones are
+  // painted over each fill, `shading.paint`).
+  const recorded = (p) => inked(p) || !!(shading && p.shade);
+  const painted = [];            // every fill of an ink color so far: { owner, color, path, box, strip }
+  const base = (inkColors.size || shading) ? ctx.getTransform() : null;
+  const strokeUnder = (owner, color, path, box, strip, cut) => {
+    const others = painted.filter(q => q.owner !== owner && q.color === color && boxesMeet(q.box, box));
+    if (!others.length) return;
+    const [sl, ml] = scratchLayers(ctx),s = sl.getContext('2d'), m = ml.getContext('2d');
+    const pad = 2 * strokes.px / pxPerUnit + 2 / pxPerUnit;
+    const x0 = Math.max(0, Math.floor(base.a * (box.x0 - pad) + base.e)), y0 = Math.max(0, Math.floor(base.d * (box.y0 - pad) + base.f));
+    const x1 = Math.min(sl.width, Math.ceil(base.a * (box.x1 + pad) + base.e)), y1 = Math.min(sl.height, Math.ceil(base.d * (box.y1 + pad) + base.f));
+    if (x1 <= x0 || y1 <= y0) return;
+    const fillAll = (g, list) => list.forEach(q => {
+      g.save();
+      if (q.strip) g.clip(q.strip);
+      g.fill(q.path);
+      g.restore();
+    });
+    [s, m].forEach(g => { g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = 'source-over'; g.clearRect(x0, y0, x1 - x0, y1 - y0); g.setTransform(base); g.fillStyle = '#000000'; });
+    s.lineWidth = 2 * strokes.px / pxPerUnit;
+    s.lineJoin = 'round';
+    s.strokeStyle = '#000000';
+    s.stroke(path);
+    fillAll(m, others);
+    s.globalCompositeOperation = 'destination-in';
+    s.setTransform(1, 0, 0, 1, 0, 0);
+    s.drawImage(ml, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+    s.globalCompositeOperation = 'destination-out';
+    s.setTransform(base);
+    fillAll(s, painted.filter(q => q.owner === owner && q.color === color && boxesMeet(q.box, box)));
+    if (cut) {
+      if (!cut.path) {
+        cut.path = new Path2D();
+        record(cut.trace).forEach(([m, args]) => { if (PATH_OPS.includes(m)) cut.path[m](...args); });
+      }
+      s.lineWidth = 2 * pad;
+      s.lineJoin = 'round';
+      s.fill(cut.path);
+      s.stroke(cut.path);
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(sl, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+    ctx.restore();
+  };
+  // Replays recorded canvas calls onto `T` (the main canvas, or a piece's group layer); before each fill, the stroke under it
+  // (always on the main canvas), and after it the fill is remembered.
+  const paintRecorded = (ops, owners, box, strip = null, cut = null, elements = null, T = ctx) => {
+    let sub = new Path2D(), mat = new DOMMatrix(), color = null, fills = 0;
+    const stack = [];
+    for (const [m, args] of ops) {
+      if (m === '=fillStyle') { color = args; T.fillStyle = args; continue; }
+      if (m === 'fill') {
+        const owner = owners[Math.min(fills++, owners.length - 1)], path = new Path2D();
+        path.addPath(sub, mat);
+        if (owner !== undefined && inkColors.has(color) && meshOf(owner).color === color) {
+          strokeUnder(owner, color, path, box, strip, cut);
+          painted.push({ owner, color, path, box, strip });
+        }
+        const shaded = elements && elements.length && !stack.length;
+        if (shaded && T === ctx && elements.every(e => e.kind === 'lit')) {
+          // A skewed arch: base and lit part are built on a transparent layer (the lit part source-atop, so it takes the fill's own
+          // antialiased alpha) and composited once. Painted directly, the base tone and the lit tone each blend at the fill's edge and
+          // leave a dark hairline where one arch's edge crosses another's lit part.
+          const pad = 3 / pxPerUnit, gl = scratchLayers(ctx)[2], g = gl.getContext('2d'), b = box;
+          const x0 = Math.max(0, Math.floor(base.a * (b.x0 - pad) + base.e)), y0 = Math.max(0, Math.floor(base.d * (b.y0 - pad) + base.f));
+          const x1 = Math.min(gl.width, Math.ceil(base.a * (b.x1 + pad) + base.e)), y1 = Math.min(gl.height, Math.ceil(base.d * (b.y1 + pad) + base.f));
+          if (x1 > x0 && y1 > y0) {
+            g.setTransform(1, 0, 0, 1, 0, 0);
+            g.clearRect(x0, y0, x1 - x0, y1 - y0);
+            g.setTransform(base);
+            g.fillStyle = shading.baseColor(color);
+            g.fill(path);
+            g.save();
+            g.globalCompositeOperation = 'source-atop';
+            shading.paint(g, path, color, elements, true);
+            g.restore();
+            ctx.save();
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.drawImage(gl, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+            ctx.restore();
+          }
+          continue;
+        }
+        if (shaded) T.fillStyle = shading.baseColor(color);
+        T.fill();
+        if (shaded) shading.paint(T, path, color, elements);
+        continue;
+      }
+      if (m === 'beginPath') sub = new Path2D();
+      else if (PATH_OPS.includes(m)) sub[m](...args);
+      else if (m === 'save') stack.push({ mat, color });
+      else if (m === 'restore') ({ mat, color } = stack.pop());
+      else if (m === 'transform') mat = mat.multiply(new DOMMatrix(args));
+      else if (m === 'translate') mat = mat.translate(...args);
+      else if (m === 'scale') mat = mat.scale(...args);
+      T[m](...args);
+    }
+  };
   let entries = primitives.flatMap(slabsOf);
   entries.sort((p, q) => (q.bin - p.bin) || (q.prim.depth - p.prim.depth));
   entries.forEach((e, i) => { e.idx = i; (e.prim.slabMap ||= new Map()).set(e.bin, e); });
@@ -672,18 +863,29 @@ function drawPrimitives(ctx, primitives, seam) {
   let batch = null;
   const flush = () => {
     if (!batch) return;
-    ctx.fillStyle = batch.color;
-    ctx.fill();
+    if (batch.ops) paintRecorded([['beginPath', []], ...batch.ops, ['=fillStyle', batch.color], ['fill', []]], batch.owners, batch.box, null, batch.cut, batch.elements);
+    else { ctx.fillStyle = batch.color; ctx.fill(); }
     batch = null;
   };
   const whole = (p) => {
-    if (!p.tracePath) { flush(); p.draw(); return; }
-    if (!batch || batch.meshId !== p.meshId) {
+    const ink = recorded(p);
+    if (!p.tracePath) {
       flush();
-      ctx.beginPath();
-      batch = { meshId: p.meshId, color: p.color };
+      if (ink) paintRecorded(record(p.draw), ownersOf(p), p.box, null, null, p.shade && p.shade()); else p.draw();
+      return;
     }
-    p.tracePath();
+    const owners = ink ? ownersOf(p) : null;
+    if (!batch || batch.meshId !== p.meshId || (ink && batch.owners && batch.owners[0] !== owners[0])) {
+      flush();
+      if (!ink) ctx.beginPath();
+      batch = { meshId: p.meshId, color: p.color, ops: ink ? [] : null, box: ink ? { ...p.box } : null, owners, cut: p.strokeCut, elements: [] };
+    }
+    if (batch.ops) {
+      batch.ops.push(...record(p.tracePath));
+      if (p.shade) batch.elements.push(...(p.shade() || []));
+      const b = batch.box;
+      b.x0 = Math.min(b.x0, p.box.x0); b.y0 = Math.min(b.y0, p.box.y0); b.x1 = Math.max(b.x1, p.box.x1); b.y1 = Math.max(b.y1, p.box.y1);
+    } else p.tracePath();
   };
   const BIG = 1e5;
   // A piece drawn in several runs builds its outline once: its canvas calls are recorded the first time
@@ -727,6 +929,31 @@ function drawPrimitives(ctx, primitives, seam) {
     ctx.closePath();
     ctx.clip();
     p.ops ||= record(p.tracePath || p.draw);
+    if (recorded(p)) {
+      const strip = new Path2D();
+      [at(s0, -BIG), at(s1, -BIG), at(s1, BIG), at(s0, BIG)].forEach((q, i) => (i ? strip.lineTo(q.x, q.y) : strip.moveTo(q.x, q.y)));
+      strip.closePath();
+      const ops = p.tracePath ? [['beginPath', []], ...p.ops, ['=fillStyle', p.color], ['fill', []]] : p.ops, elements = shading && p.shade && p.shade();
+      if (!elements || !elements.length) { paintRecorded(ops, ownersOf(p), p.box, strip); ctx.restore(); return; }
+      // A shaded piece is several layers (its base tone, the tone regions over it). Through the strip's antialiased clip edge each
+      // layer would blend over what the neighboring strip already painted and leave a trace of the lower one (a line that slides
+      // along the piece as the strata move), so it is built on a transparent layer and composited through the clip once.
+      const pad = 3 / pxPerUnit, gl = scratchLayers(ctx)[2], g = gl.getContext('2d'), b = p.box;
+      const x0 = Math.max(0, Math.floor(base.a * (b.x0 - pad) + base.e)), y0 = Math.max(0, Math.floor(base.d * (b.y0 - pad) + base.f));
+      const x1 = Math.min(gl.width, Math.ceil(base.a * (b.x1 + pad) + base.e)), y1 = Math.min(gl.height, Math.ceil(base.d * (b.y1 + pad) + base.f));
+      if (x1 > x0 && y1 > y0) {
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.clearRect(x0, y0, x1 - x0, y1 - y0);
+        g.setTransform(base);
+        paintRecorded(ops, ownersOf(p), p.box, strip, null, elements, g);
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(gl, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+        ctx.restore();
+      }
+      ctx.restore();
+      return;
+    }
     if (p.path === undefined) p.path = pathOf(p.ops);
     if (p.path) { ctx.fillStyle = p.color; ctx.fill(p.path); }
     else if (p.tracePath) { ctx.beginPath(); replay(p.ops); ctx.fillStyle = p.color; ctx.fill(); } else replay(p.ops);
@@ -766,11 +993,13 @@ export function render(ctx, canvas, { darkMode }) {
     jointBodies: {},         // joint node id -> the two meshes' bodies there (draw order)
     extraPrimitives: [],     // split cones' host-colored parts, sorted with the rest
     clusterOf: buildClusters(owners),
+    shading: null,           // the light engine (shading.js), when on
   };
+  if (lighting.on && typeof Path2D !== 'undefined') frame.shading = makeShading({ basis, tol: frame.tol, px: 1 / pxPerUnit, camPos, projectPoint: frame.projectPoint });
 
   const primitives = [];
   // The focus view draws only some meshes; everything else is still computed with all of them.
-  const isShown = (mesh) => !focus.on || focus.meshColors.includes(mesh.color);
+  const isShown = (mesh) => !focus.on || focus.meshIds.includes(mesh.id);
   Object.values(meshes).forEach(mesh => {
     if (!isShown(mesh)) return;
     if (mesh.skew) { primitives.push(...buildSkewPrimitives(frame, mesh)); return; }
@@ -797,13 +1026,13 @@ export function render(ctx, canvas, { darkMode }) {
   });
   primitives.push(...frame.extraPrimitives);
 
-  drawPrimitives(ctx, primitives, 2 * frame.underlap);
+  drawPrimitives(ctx, primitives, 2 * frame.underlap, pxPerUnit, frame.shading);
 
   lastFrame = frame;
 
   if (debug.on && debug.joint) drawJointDebug(ctx, frame.joints);
   if (debug.on && debug.shape) drawShapeDebug(ctx, projected, projectPoint);
-
+  if (debug.on && frame.shading) frame.shading.drawDebug(ctx);
   if (debug.on && debug.cone && !focus.on) {
     Object.values(meshes).forEach(mesh => {
       const split = splitOf[mesh.id];

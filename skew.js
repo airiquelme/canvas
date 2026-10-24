@@ -37,7 +37,7 @@ export function shapeAt(A, B, S) {
 // Row-major 3x3 helpers.
 function mul(P, R) { const o = new Array(9); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) o[3 * i + j] = P[3 * i] * R[j] + P[3 * i + 1] * R[3 + j] + P[3 * i + 2] * R[6 + j]; return o; }
 function tr(P) { return [P[0], P[3], P[6], P[1], P[4], P[7], P[2], P[5], P[8]]; }
-function inverse(P) {
+export function inverse(P) {
   const [a, b, c, d, e, f, g, h, i] = P, A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + c * C;
   return [A, c * h - b * i, b * f - c * e, B, a * i - c * g, c * d - a * f, C, b * g - a * h, a * e - b * d].map(v => v / det);
 }

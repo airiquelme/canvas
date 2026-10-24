@@ -1,7 +1,7 @@
 // Entry point: canvas setup, UI buttons, animation loop. See CLAUDE.md.
 import { camera } from './camera.js';
-import { debug, focus } from './config.js';
-import { buildBasicScene, buildFullScene, nodes } from './scene.js';
+import { debug, focus, strokes, lighting, DESIGN_WIDTH, DESIGN_HEIGHT } from './config.js';
+import { buildBasicScene, buildFullScene, nodes, meshes } from './scene.js';
 import { render } from './render.js';
 
 const canvas = document.getElementById('game');
@@ -18,12 +18,27 @@ window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 // ?scene=full is the squashed-nodes demo; the default is the small skew scene.
 (new URLSearchParams(location.search).get('scene') === 'full' ? buildFullScene : buildBasicScene)();
 
-// Focus view: only some meshes, the camera on one joint, magnified (config.js focus).
+// Focus view: one mesh of 3+ nodes (and the meshes sharing a node with it), the camera on its bounding sphere, magnified until all of
+// it fits (config.js focus). A point at distance d from the view axis is drawn at zoom * orbitRadius / depth px per unit, and the
+// nearest point of the sphere is orbitRadius - R from the camera.
 const home = { target: { ...camera.target }, zoom: camera.zoom };
+function focusFrame() {
+  const mesh = focus.meshId !== null ? meshes[focus.meshId] : Object.values(meshes).find(m => m.nodeIds.length > 2);
+  if (!mesh) return null;
+  const ns = mesh.nodeIds.map(id => nodes[id]), n = ns.length;
+  const target = { x: 0, y: 0, z: 0 };
+  ns.forEach(nd => { target.x += nd.center.x / n; target.y += nd.center.y / n; target.z += nd.center.z / n; });
+  const R = Math.max(...ns.map(nd => Math.hypot(nd.center.x - target.x, nd.center.y - target.y, nd.center.z - target.z) + nd.radius));
+  const near = camera.orbitRadius - R, half = Math.min(DESIGN_WIDTH, DESIGN_HEIGHT) / 2;
+  const zoom = near > 0 ? focus.fill * half * near / (R * camera.orbitRadius) : home.zoom;
+  const shares = (m) => m.nodeIds.some(id => mesh.nodeIds.includes(id));
+  focus.meshIds = Object.values(meshes).filter(shares).map(m => m.id);
+  return { target, zoom };
+}
 function applyFocus() {
-  const focused = focus.on && nodes[focus.nodeId];
-  camera.target = focused ? { ...nodes[focus.nodeId].center } : { ...home.target };
-  camera.zoom = focused ? focus.zoom : home.zoom;
+  const f = focus.on ? focusFrame() : null;
+  camera.target = f ? f.target : { ...home.target };
+  camera.zoom = f ? f.zoom : home.zoom;
 }
 applyFocus();
 
@@ -62,7 +77,14 @@ if (focusBtn) {
   focusBtn.addEventListener('click', () => { focus.on = !focus.on; applyFocus(); label(); drawFrame(); });
 }
 
-const debugBtn = document.getElementById('debugBtn');
+const strokeBtn = document.getElementById('strokeBtn');
+if (strokeBtn) {
+  const label = () => { strokeBtn.textContent = strokes.on ? 'Strokes: on' : 'Strokes: off'; strokeBtn.style.background = strokes.on ? '#1b5e20' : '#333'; };
+  label();
+  strokeBtn.addEventListener('click', () => { strokes.on = !strokes.on; label(); drawFrame(); });
+}
+
+const debugBtn =document.getElementById('debugBtn');
 if (debugBtn) {
   debugBtn.addEventListener('click', () => {
     debug.on = !debug.on;

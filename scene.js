@@ -33,7 +33,7 @@ export function buildBasicScene() {
   const pair = (x0, y0, x1, y1, r0, r1, z0 = 0, z1 = 0) =>
     [createNode({ x: x0, y: y0, z: z0 }, r0), createNode({ x: x1, y: y1, z: z1 }, r1)];
   // A plain straight mesh, for comparison.
-  createMesh(pair(cx - 330, cy + 190, cx - 150, cy + 190, 24, 24), '#4fc3f7');
+  createMesh(pair(cx - 110, cy + 150, cx - 20, cy + 150, 24, 24), '#4fc3f7');
   // Skew above the midpoint (a symmetric arch).
   createMesh(pair(cx - 330, cy + 40, cx - 90, cy + 40, 24, 24), '#ff8a65',
     { skew: createNode({ x: cx - 210, y: cy - 90 }, 6) });
@@ -53,8 +53,15 @@ export function buildBasicScene() {
   // Different end radii. Threaded through the orange arch: its plane (x = const) is perpendicular to the
   // orange one, the ends are in front of / behind it (z = -150 / 150) below the orange tube, and the apex
   // passes through the orange arch's opening at z = 0.
-  createMesh(pair(cx - 210, cy + 120, cx - 210, cy + 120, 14, 30, -150, 150), '#f06292',
+  // (Same color as the orange arch it passes through, to show the border strokes.)
+  createMesh(pair(cx - 210, cy + 120, cx - 210, cy + 120, 14, 30, -150, 150), '#ff8a65',
     { skew: createNode({ x: cx - 210, y: cy - 10, z: 0 }, 6) });
+  // Plain meshes (no skew) for the light engine: a pair and a 3-node triangle (the split cone that was on one of its nodes is left out for now).
+  createMesh(pair(cx - 290, cy - 190, cx - 150, cy - 150, 26, 18, 0, 60), '#ffd54f');
+  {
+    const tri = [createNode({ x: cx - 90, y: cy - 110, z: 0 }, 20), createNode({ x: cx + 30, y: cy - 110, z: 40 }, 22), createNode({ x: cx - 30, y: cy - 190, z: -30 }, 18)];
+    createMesh(tri, '#4dd0e1');
+  }
   // Oblate (squashed) nodes: flattened ends with tilted axes (the skew node is only a point).
   createMesh([createNode({ x: cx + 40, y: cy + 230, z: -40 }, 26, { squash: 0.45 }),
     createNode({ x: cx + 330, y: cy + 230, z: 40 }, 26, { squash: 0.5, axis: { x: 1, y: 1, z: 0 } })], '#ba68c8',
