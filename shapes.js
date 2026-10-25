@@ -3,7 +3,7 @@ import { SEAM_PX } from './config.js';
 import {
   vecSub, vecCross, vecDot, vecNormalize,
   capsuleTangentPoints, convexHull, ellipseHullArcs, ellipsePoint, ellipseParam, supportH,
-  hullOutline, projectedCircleEllipse, ellipsePolygon,
+  hullOutline, projectedCircleEllipse, ellipsePolygon, loopArea2, reverseArc, canvasArc,
 } from './geometry.js';
 
 // A projected node as an ellipse object: { center, a, b, angle }.
@@ -124,8 +124,8 @@ export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColo
   // Thickness of the crescent: its area over the longer of chord and rim arc. The area is
   // the terminator polygon (closed by its chord) plus the circular segment between that
   // chord and the rim arc, r^2/2 (span - sin span), signed by the arc's direction.
-  let area = 0;
-  terminator.forEach((p, i) => { const q = terminator[(i + 1) % terminator.length]; area += p.x * q.y - q.x * p.y; });
+  // (a terminator point may carry the arc into it, geometry.js loops: its exact area)
+  let area = loopArea2(terminator);
   area = area / 2 + (domIncreasing ? 1 : -1) * 0.5 * radius * radius * (crescentSpan - Math.sin(crescentSpan));
   const chordLen = Math.hypot(e1.x - e0.x, e1.y - e0.y);
   const thickness = Math.abs(area) / Math.max(chordLen, radius * crescentSpan, 1e-6);
@@ -146,19 +146,26 @@ export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColo
   if (nx * Math.cos(mid) + ny * Math.sin(mid) < 0) { nx = -nx; ny = -ny; }
   const last = terminator.length - 1;
 
+  // the terminator, its inner points moved by k (an arc into a point moves with it; the last one, an end on the rim, is
+  // reached from its moved arc by a line)
+  const traceTerminator = (k) => terminator.forEach((p, i) => {
+    if (i === 0) { ctx.moveTo(p.x, p.y); return; }
+    const a = p.arc, d = i === last ? 0 : k;
+    if (a) {
+      ctx.ellipse(...canvasArc(k ? { ...a, c: { x: a.c.x + nx * k, y: a.c.y + ny * k } } : a));
+      if (i === last && k) ctx.lineTo(p.x, p.y);
+    } else ctx.lineTo(p.x + nx * d, p.y + ny * d);
+  });
   ctx.fillStyle = dominantColor;
   ctx.beginPath();
-  terminator.forEach((p, i) => {
-    const k = (i === 0 || i === last) ? 0 : underlap;
-    if (i === 0) ctx.moveTo(p.x + nx * k, p.y + ny * k); else ctx.lineTo(p.x + nx * k, p.y + ny * k);
-  });
+  traceTerminator(underlap);
   ctx.arc(center.x, center.y, radius, th1, th0, domIncreasing);
   ctx.closePath();
   ctx.fill();
 
   ctx.fillStyle = crescentColor;
   ctx.beginPath();
-  terminator.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+  traceTerminator(0);
   ctx.arc(center.x, center.y, radius, th1, th0, !domIncreasing);
   ctx.closePath();
   ctx.fill();
@@ -171,16 +178,23 @@ export function drawJointSplitFromCurve(ctx, center, radius, split, dominantColo
 // A cone of a joint, cut off at the joint ring: `polys` (lists of screen points)
 // are its outline pieces, with the ring's projected interior among them where this
 // mesh is the front one. One nonzero path, filled once, so their shared edge along
-// the ring doesn't stack (CLAUDE.md rule 3).
+// the ring doesn't stack (CLAUDE.md rule 3). A point with an `arc` (geometry.js loops)
+// is reached from the previous one along that elliptic arc (the ring, an end node's rim,
+// the joint disc's cut), else by a straight line.
 export function drawJointBody(ctx, polys, color) {
-  const sign = (pts) => pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p.x * q.y - q.x * p.y; }, 0) >= 0 ? 1 : -1;
-  const first = polys.find(pts => pts.length >= 3);
+  const sign = (pts) => (loopArea2(pts) >= 0 ? 1 : -1);
+  const first = polys.find(pts => pts.length >= 3 || (pts.length === 2 && pts.some(p => p.arc)));
   if (!first) return;
+  // the loop run the other way: the arc into point i becomes the arc out of it, run backward
+  const reverse = (pts) => pts.map((_, i) => { const p = pts[pts.length - 1 - i]; return { x: p.x, y: p.y, arc: reverseArc(pts[(pts.length - i) % pts.length].arc) }; });
+  const to = (p) => { if (p.arc) ctx.ellipse(...canvasArc(p.arc)); else ctx.lineTo(p.x, p.y); };
   ctx.beginPath();
   polys.forEach(pts => {
-    if (pts.length < 3) return;
-    const ordered = sign(pts) === sign(first) ? pts : pts.slice().reverse();
-    ordered.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    if (pts.length < 2) return;
+    const ordered = sign(pts) === sign(first) ? pts : reverse(pts);
+    ctx.moveTo(ordered[0].x, ordered[0].y);
+    for (let i = 1; i < ordered.length; i++) to(ordered[i]);
+    if (ordered[0].arc) to(ordered[0]);
     ctx.closePath();
   });
   ctx.fillStyle = color;
@@ -285,7 +299,8 @@ export function drawSplitShared(ctx, sharedProj, ring, axisCam, color, projectPo
 // The cone's own part, from the ring to the far node. When the far node is a joint (opts.farIsJoint) this part has no
 // cap there: the joint circle is drawn separately and the part ends in a chord.
 export function drawSplitFar(ctx, farProj, ring, color, projectPoint, opts = {}) {
-  const farCircle = { center: farProj.center, a: farProj.radius, b: farProj.radius, angle: 0 };
+  // (a far end squashed along the cone's axis: its drawn ellipse; the cone is still circular, splitRing.js coaxialCone)
+  const farCircle = farProj.round ? { center: farProj.center, a: farProj.radius, b: farProj.radius, angle: 0 } : nodeEllipse(farProj);
   fillOutline(ctx, hullOutline([{ e: ringEllipse(ring, projectPoint) }, { e: farCircle, skip: !!opts.farIsJoint }]), color);
 }
 

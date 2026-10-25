@@ -14,9 +14,9 @@
 // sphere's center by a few percent of the radius when the cones differ). The
 // back circle is where that plane cuts the sphere. Pure 3D; every
 // point carries its outward normal so a view can tell which parts face it.
-import { vecSub, vecDot, vecCross, vecNormalize } from './geometry.js';
+import { vecSub, vecDot, vecCross, vecNormalize, homographyEllipse, arcThrough, arcPoint, arcParam } from './geometry.js';
 import { coneFrame } from './shapes.js';
-import { tangentCone, coneSurface } from './splitRing.js';
+import { coaxialCone, coneSurface } from './splitRing.js';
 
 // Chord tolerance (in the units of the spheres' coordinates) when a curve is cut into
 // segments, and the fewest segments of any arc.
@@ -66,6 +66,10 @@ export function facesCamera(q, viewDir) {
 //  back   the circle arc from touch[0] to touch[1] through the back
 //         (the whole bisector circle when there are no touch points);
 //  loop   front followed by back, closed;
+//  screenLoop  the loop on screen (x, y of the flat solid, which the camera views along z) with exact arcs
+//         (geometry.js loops): the back is a circle, so its image is an ellipse; the front is the ring's plane
+//         cut with cone A, the central projection from the cone's apex of its tangent circle onto the plane, so its
+//         image is a homography of a circle (homographyEllipse) when it is an ellipse, else its chords;
 //  plane  the unit normal of the ring's plane (not through the node center
 //         unless the cones are equal).
 export function buildJointCurve(node, farA, farB, tol = DEFAULT_TOL) {
@@ -74,7 +78,8 @@ export function buildJointCurve(node, farA, farB, tol = DEFAULT_TOL) {
 
 function computeJointCurve(node, farA, farB, tol) {
   const frameA = coneFrame(node, farA), frameB = coneFrame(node, farB);
-  const coneA = tangentCone(node, farA, frameA), coneB = tangentCone(node, farB, frameB);
+  // (a far end may be a spheroid squashed along the cone's axis, `ra` / `rp`: still a circular cone, coaxialCone)
+  const coneA = coaxialCone(node, farA, frameA), coneB = coaxialCone(node, farB, frameB);
   const dA = frameA.dir, dB = frameB.dir;
   const g = vecDot(dA, dB), det = 1 - g * g;
 
@@ -247,12 +252,14 @@ function computeJointCurve(node, farA, farB, tol) {
     if (through0(cand) && (!through0(phiEnd) || Math.abs(cand - phi[0]) < Math.abs(phiEnd - phi[0]))) phiEnd = cand;
   }
   const back = [touch[0], ...circle(e1, e2, phi[0], phiEnd, arcSteps(phiEnd - phi[0], rho, tol)).slice(1, -1), touch[1]];
+  // the circle on screen: ringCenter + rho (e1 cos phi + e2 sin phi), viewed along z
+  const circle2D = { c: { x: ringCenter.x, y: ringCenter.y }, U: { x: rho * e1.x, y: rho * e1.y }, V: { x: rho * e2.x, y: rho * e2.y } };
 
-  let front;
+  let front, frontArc = null;
+  const at = (th) => { const q = ringPoint(th, tAt(th)); return { p: onPlane(q.point), n: q.outward, n2: q.n2 }; };
   if (run) {
     // Cut the arc into chords no farther than tol from it: halve a segment until its
     // middle is within tol of the chord (never fewer than 4 segments of the arc).
-    const at = (th) => { const q = ringPoint(th, tAt(th)); return { p: onPlane(q.point), n: q.outward, n2: q.n2 }; };
     const dist = (a, b) => len(vecSub(a, b));
     const pts = [];
     const split = (th0, p0, th1, p1, depth) => {
@@ -266,20 +273,54 @@ function computeJointCurve(node, farA, farB, tol) {
     split(th0, eStart, th1, eEnd, 0);
     const startsAtPlus = dist(eStart.p, touch[0].p) <= dist(eStart.p, touch[1].p);
     front = [startsAtPlus ? touch[0] : touch[1], ...pts, startsAtPlus ? touch[1] : touch[0]];
+    // The front on screen. A point of generatrix th, h = (cos th, sin th, 1): P0 = Pm h on the tangent circle, the line
+    // through it and the apex V meets the plane n . (X - T0) = 0 at X = [(n . (T0 - V)) P0 + (n . (P0 - T0)) V] / (n . (P0 - V)),
+    // linear in h over linear in h (a cylinder, slope 0: X = P0 - dA (n . (P0 - T0)) / (n . dA)).
+    const cT = add(node.center, scale(dA, coneA.sA)), cols = [scale(frameA.u, coneA.radA), scale(frameA.v, coneA.radA), cT];
+    const an = cols.map(c => vecDot(plane, c)), Lrow = [an[0], an[1], an[2] - vecDot(plane, T0)];
+    let H;
+    if (Math.abs(coneA.slope) > 1e-9) {
+      const V = vecSub(cT, scale(dA, coneA.radA / coneA.slope)), kTV = vecDot(plane, vecSub(T0, V));
+      H = [['x', V.x], ['y', V.y]].map(([k, v]) => cols.map((c, j) => kTV * c[k] + v * Lrow[j]));
+      H.push([an[0], an[1], an[2] - vecDot(plane, V)]);
+    } else if (Math.abs(nd) > 1e-12) {
+      H = ['x', 'y'].map(k => cols.map((c, j) => c[k] - dA[k] * Lrow[j] / nd));
+      H.push([0, 0, 1]);
+    }
+    const e = H && homographyEllipse(H);
+    if (e) {
+      // the arc from the front's first point to its last through its middle, kept only if that exact middle point is on
+      // the ellipse (else the chords stay)
+      const xy = (q) => ({ x: q.p.x, y: q.p.y }), mid = xy(at(th0 + run.span / 2));
+      const arc = arcThrough(e, xy(front[0]), mid, xy(front[front.length - 1])), on = arcPoint(arc, arcParam(e, mid));
+      if (Math.hypot(on.x - mid.x, on.y - mid.y) < 1e-6 * (Math.hypot(e.U.x, e.U.y) + Math.hypot(e.V.x, e.V.y))) frontArc = arc;
+    }
   } else {
     // The surfaces never leave each other past the sphere: use the other half
     // of the circle so the ring still closes.
     const other = phiEnd > phi[0] ? phiEnd - 2 * Math.PI : phiEnd + 2 * Math.PI;
     front = [touch[0], ...circle(e1, e2, phi[0], other, arcSteps(other - phi[0], rho, tol)).slice(1, -1), touch[1]];
+    frontArc = { ...circle2D, t0: phi[0], t1: other };
   }
 
   // Close the ring: front runs P_start -> P_end, so the back must run P_end -> P_start.
   const frontStartsAtPlus = front[0] === touch[0] || len(vecSub(front[0].p, touch[0].p)) < 1e-9;
   const backBack = frontStartsAtPlus ? back.slice().reverse() : back;
   const loop = [...front, ...backBack.slice(1)];
+  const backArc = frontStartsAtPlus ? { ...circle2D, t0: phiEnd, t1: phi[0] } : { ...circle2D, t0: phi[0], t1: phiEnd };
+  const screenLoop = screenLoopOf(front, frontArc, backArc);
   // The ring is the crease of cone A's generatrices over this cyclic angle range.
   const ringRange = run;
-  return { hasTouch: true, touch, front, back, loop, plane, ringRange };
+  return { hasTouch: true, touch, front, back, loop, screenLoop, plane, ringRange };
+}
+
+// The ring on screen as a loop with arcs (geometry.js loops): the front from its first point to its last (its arc, or its
+// chords), then the back's arc to the first point again.
+export function screenLoopOf(front, frontArc, backArc) {
+  const xy = (q) => ({ x: q.p.x, y: q.p.y }), last = front.length - 1;
+  const head = { ...xy(front[0]), arc: backArc };
+  if (frontArc) return [head, { ...xy(front[last]), arc: frontArc }];
+  return [head, ...front.slice(1).map(xy)];
 }
 
 // Where each cone's two silhouette edges touch the ring. An edge is the generatrix
@@ -303,7 +344,7 @@ export function edgeContacts(node, farA, farB, curve) {
     return rel <= ringRange.span + 1e-9;
   };
   return [farA, farB].map((far) => {
-    const frame = coneFrame(node, far), cone = tangentCone(node, far, frame);
+    const frame = coneFrame(node, far), cone = coaxialCone(node, far, frame);
     // The silhouette generatrices: the outward normal r(a) cosT + axis sinT has z = 0
     // where r.z = u.z cos a + v.z sin a = Wz cos(a - psi) equals -axis.z tanT, so
     // a = psi +- acos(-axis.z tanT / Wz) (none when |.| >= 1: no silhouette).

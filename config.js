@@ -13,8 +13,9 @@ export const debug = { on: false, gap: true, cone: true, joint: true, shape: tru
 export const SEAM_PX = 1.5;
 
 
-// Border strokes (the Strokes button): where a mesh lies over another mesh of the SAME color, its edge gets a black
-// stroke `px` canvas pixels thick (the visible, outer half of a stroke centered on the edge), whatever the zoom.
+// Border strokes (the Strokes button): where a mesh lies over another mesh of the SAME color and the same tone, its edge gets a
+// stroke one tone darker than the front's (Lit -> Twilight, Twilight -> Shade), `px` canvas pixels thick (the visible, outer half
+// of a stroke centered on the edge), whatever the zoom. No stroke where the two tones differ.
 export const strokes = { on: true, px: 2 };
 
 // Light engine (the Light button; light.js, shading.js). One directional world light (`dir`: unit vector toward the light, world
@@ -24,6 +25,10 @@ export const strokes = { on: true, px: 2 };
 // Only Lit and Twilight are used for now; the others are for local (harsh) lights and shadows later.
 export const lighting = {
   on: true,
+  // Skewed arches lit like a straight tube (shading.js buildArch): one fixed half of the cross-section, in the arch's own frame,
+  // centered on the tube light at the skew node, so the shade lines follow the arch from end to end (the Debug view's cyan curves).
+  // Not realistic, like the straight cones' tube light; false: lit by the light itself at every point of the arch.
+  archTube: true,
   toneMix: [1, 0.4, 0.18, 0, -0.25],
 };
 const lightLen = Math.hypot(100, 110, 200);

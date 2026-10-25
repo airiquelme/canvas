@@ -7,9 +7,10 @@
 // radius), so the terminators meet the drawn silhouettes. An element is a sphere (the lit cap `n . l >= 0`: a great circle, which
 // projects to an ellipse through the node's center, closed by the rim arc), a cone (the lit generatrices, straight lines) or a
 // face (a flat triangle of a 3+ node mesh, wholly one tone).
-import { light, debug } from './config.js';
+import { light, debug, lighting } from './config.js';
 import { camera } from './camera.js';
 import { TWILIGHT, LIT, toneColor } from './light.js';
+import { convexHull } from './geometry.js';
 
 const TAU = Math.PI * 2;
 // The line drawn along the circle where a cone meets a sphere, in pixels (see `buildCone`), and the stroke of a face.
@@ -87,7 +88,7 @@ const intersectArcs = (arcs) => arcs.reduce((acc, a) => {
   return out;
 }, [[0, TAU]]);
 
-export function makeShading({ basis, tol, px, camPos, projectPoint }) {
+export function makeShading({ basis, tol, px, camPos, projectPoint, lit = true }) {
   const pz = camera.zoom;
   // The light in the flat solid: screen right, screen down, toward the viewer (unit).
   const L = { x: dot(light.dir, basis.right), y: -dot(light.dir, basis.up), z: -dot(light.dir, basis.forward) };
@@ -220,27 +221,72 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
     return { spheres, faces, flats, partnersOf, cones: [...cones.values()] };
   };
 
-  // A skewed arch (CLAUDE.md "Skewed meshes"), lit in WORLD space: `samples` are { c, Q } along the arch (the center and the body's
-  // quadratic form x^T Q x = 1, row-major 3x3). The swept body's surface is the envelope of the ellipsoids: its point with the unit
-  // normal n (n perpendicular to the arch's tangent t) is c + S n / sqrt(n^T S n), S = Q^-1. So per sample the normals are a circle,
-  // n(phi) = cos(phi) e1 + sin(phi) e2, and n . L >= 0 is EXACTLY one arc of phi (centered on the light's direction in that plane) and
-  // n . v >= 0 (facing the viewer) another: the lit visible surface of a sample is the intersection of the two arcs, whose ends are
-  // the terminator (a point of the border, independent of the camera) or the silhouette. Consecutive samples' arcs, cut into the same
-  // number of steps, are joined into quads in ONE path (no antialiasing seam between them). The two ends are capped the same way, on
-  // rings n = cos(a) n(phi) + sin(a) out (a from 0 to the pole), whose arcs are cos(phi - phiL) >= -tan(a) (out . L) / |L_e|.
-  // `cutAt`: a sample where the surface is always cut into separate sheets (the apex, where a skewed mesh is split into its two halves;
-  // see the sheets below): each half paints the whole arch, so the other half's surface inside its fill (its round end reaches past the
-  // apex) keeps its own shading, and a half hidden behind the other does not shine through.
-  const buildArch = (samples, cutAt = null) => {
-    const n = samples.length, Lw = light.dir, cp = camPos;
-    const M = 5, RINGS = 10, ARCH_SEAM_PX = 1.5;
+  const inv3 = (m) => {
+    const [a, b, c, d, e, f, g, h, i] = m, A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + c * C;
+    return [A / det, (c * h - b * i) / det, (b * f - c * e) / det, B / det, (a * i - c * g) / det, (c * d - a * f) / det, C / det, (b * g - a * h) / det, (a * e - b * d) / det];
+  };
+  // The perspective projection in homogeneous form: camera space (X, Y, Z) -> (s X + cx Z, -s Y + cy Z, Z) (projectToScreen).
+  const projK = (() => {
+    const Z0 = 100, f = basis.forward, q = projectPoint({ x: camPos.x + f.x * Z0, y: camPos.y + f.y * Z0, z: camPos.z + f.z * Z0 });
+    return { cx: q.x, cy: q.y, s: q.scale * Z0 };
+  })();
+  const hom = (w, isPoint) => {
+    const d = isPoint ? sub(w, camPos) : w, X = dot(d, basis.right), Y = dot(d, basis.up), Z = dot(d, basis.forward);
+    return [projK.s * X + projK.cx * Z, -projK.s * Y + projK.cy * Z, Z];
+  };
+  // The screen image of the 3D ellipse C + U cos th + V sin th, in closed form: the projection is a projective map H = [U V C] (homogeneous
+  // columns), so the image is the conic H^-T diag(1, 1, -1) H^-1, whose dual (its tangent lines) is H diag(1, 1, -1) H^T: no inverse,
+  // so a thin row (a flat ribbon's, U or V tiny) stays well-conditioned (inverting H blew such a conic up to thousands of pixels). The
+  // dual of the ellipse (x - c)^T P^-1 (x - c) = 1 is [[P - c c^T, -c], [-c^T, -1]], which gives the center and P. As { x, y, a, b, angle }
+  // (ctx.ellipse's terms), or null if it is not a proper ellipse (the row crosses the camera's plane).
+  const projectedEllipse = (C, U, V) => {
+    const u = hom(U, false), v = hom(V, false), c = hom(C, true);
+    const m = (i, j) => u[i] * u[j] + v[i] * v[j] - c[i] * c[j];
+    const w = m(2, 2);
+    if (!(w < 0)) return null;
+    const k = -1 / w, x = -k * m(0, 2), y = -k * m(1, 2);
+    const P00 = k * m(0, 0) + x * x, P01 = k * m(0, 1) + x * y, P11 = k * m(1, 1) + y * y;
+    const mean = (P00 + P11) / 2, diff = Math.hypot((P00 - P11) / 2, P01), l1 = mean + diff, l2 = mean - diff;
+    if (!(l1 > 0)) return null;
+    return { x, y, a: Math.sqrt(l1), b: Math.sqrt(Math.max(l2, 0)), angle: 0.5 * Math.atan2(2 * P01, P00 - P11) };
+  };
+  // A screen point's parameter on an ellipse (ctx.ellipse's angle) and back.
+  const paramOn = (e, p) => {
+    const dx = p[0] - e.x, dy = p[1] - e.y, ca = Math.cos(e.angle), sa = Math.sin(e.angle);
+    return Math.atan2((dy * ca - dx * sa) / e.b, (dx * ca + dy * sa) / e.a);
+  };
+  const pointOn = (e, psi) => {
+    const ca = Math.cos(e.angle), sa = Math.sin(e.angle), c = Math.cos(psi), s = Math.sin(psi);
+    return [e.x + e.a * c * ca - e.b * s * sa, e.y + e.a * c * sa + e.b * s * ca];
+  };
+  const boxOfPts = (ps) => ps.reduce((b, [x, y]) => ({ x0: Math.min(b.x0, x), y0: Math.min(b.y0, y), x1: Math.max(b.x1, x), y1: Math.max(b.y1, y) }), { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
+  const boxesMeet = (p, q) => p.x0 <= q.x1 && q.x0 <= p.x1 && p.y0 <= q.y1 && q.y0 <= p.y1;
+  const inBox = (x, y, b) => x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1;
+
+  // A skewed arch (CLAUDE.md "Skewed meshes"), lit in WORLD space. `sampleAt(t)` gives the arch's sample at t in [0, 1]: { tv: t, c, Q, t, sinT }
+  // (the center, the body's quadratic form x^T Q x = 1, row-major 3x3, the unit tangent, on a round arch the radius' tilt); the same t gives
+  // the same object while the nodes stay put (render.js caches them), so a sample's camera-independent data is computed once (`prep`). The
+  // swept body's surface is the envelope of the ellipsoids: its point with the unit normal n (n perpendicular to the arch's tangent t) is
+  // c + S n / sqrt(n^T S n), S = Q^-1. So per sample the normals are a circle, n(phi) = cos(phi) e1 + sin(phi) e2, and n . L >= 0 is EXACTLY
+  // one arc of phi (centered on the light's direction in that plane) and n . v >= 0 (facing the viewer) another: the lit visible surface of a
+  // sample is the intersection of the two arcs, whose ends are the terminator (a point of the border, independent of the camera) or the
+  // silhouette. Each row of the surface is a planar 3D conic (a circle on a round arch; on a squashed one the ellipsoid's cut by the plane
+  // t^T Q x = 0), so on screen it is an exact ellipse (`projectedEllipse`) and its arcs are drawn as elliptic arcs; consecutive rows' arcs are
+  // joined into strips in ONE path (no antialiasing seam between them). The rows are placed where they are needed: bisected while a tracked
+  // curve (the visible and lit arcs' ends: the silhouette and the terminator) bends away from the chord between two rows by more than
+  // ROW_TOL on screen, or the arcs change between them, so only the strips' sides are chords. The two ends are capped the same way, on rings
+  // n = cos(a) n(phi) + sin(a) out (a from the end row to the pole), whose arcs are cos(phi - phiL) >= -tan(a) (out . L) / |L_e| (circles on
+  // a round end; a squashed end is sliced by planes parallel to its end row instead, `sliceRing`, plane ellipses too).
+  // `cuts` (a skewed mesh split into two halves), as values of t: `apex` the skew node (its tangent gives the tube light), `lo` / `hi` where
+  // the two halves' drawn fills end (one drawn sample before / after the apex, where they overlap). The surface is always cut into sheets at
+  // lo and hi (see the sheets below), each sheet tagged with its `half`: 0 before lo, 1 after hi, 'both' in between.
+  const buildArch = (sampleAt, cutsT = null) => {
+    const Lw = light.dir, cp = camPos;
+    const PROBES = 5, PROXY_STEPS = 5, ARCH_SEAM_PX = 1.5, ROW_TOL = 0.5 * px, POLY_STEP = 0.3, MAIN_DEPTH = 6, CAP_DEPTH = 4;
     const TWO_PI = 2 * Math.PI;
-    const inv3 = (m) => {
-      const [a, b, c, d, e, f, g, h, i] = m, A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + c * C;
-      return [A / det, (c * h - b * i) / det, (b * f - c * e) / det, B / det, (a * i - c * g) / det, (c * d - a * f) / det, C / det, (b * g - a * h) / det, (a * e - b * d) / det];
-    };
     const Qm = (Q, v) => ({ x: Q[0] * v.x + Q[1] * v.y + Q[2] * v.z, y: Q[3] * v.x + Q[4] * v.y + Q[5] * v.z, z: Q[6] * v.x + Q[7] * v.y + Q[8] * v.z });
     const wrap = (x) => { x = (x + Math.PI) % TWO_PI; if (x < 0) x += TWO_PI; return x - Math.PI; };
+    const mod = (x) => ((x % TWO_PI) + TWO_PI) % TWO_PI;
     // the arcs (relative to the first center) where both cos(phi - c1) >= -k1 and cos(phi - c2) >= -k2: half widths w = acos(-k)
     const meet = (c1, w1, c2, w2) => {
       const D = wrap(c2 - c1);
@@ -254,61 +300,212 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
       return out.sort((p, q) => p[0] - q[0]);
     };
     const halfWidth = (k) => (k <= -1 ? null : Math.acos(Math.max(-1, Math.min(1, -k))));      // cos(x) >= -k; null: never
-    // the arch's tangent and a frame (e1, e2) perpendicular to it that turns with the arch (e1 from the plane's normal)
-    const tans = samples.map((s, i) => unit(sub(samples[Math.min(i + 1, n - 1)].c, samples[Math.max(i - 1, 0)].c)));
-    let r0 = cross(sub(samples[n - 1].c, samples[0].c), sub(samples[n >> 1].c, samples[0].c));
-    if (len(r0) < 1e-9) { const ch = tans[0]; r0 = Math.abs(ch.x) < 0.9 ? cross(ch, { x: 1, y: 0, z: 0 }) : cross(ch, { x: 0, y: 1, z: 0 }); }
+    // a frame (e1, e2) perpendicular to the tangent that turns with the arch (e1 from the arch plane's normal r0; the same as the Debug
+    // view's curves, archBorderCurves)
+    const sA = sampleAt(0), sB = sampleAt(1), sM = sampleAt(cutsT ? cutsT.apex : 0.5);
+    let r0 = cross(sub(sB.c, sA.c), sub(sM.c, sA.c));
+    if (len(r0) < 1e-9) { const ch = sA.t; r0 = Math.abs(ch.x) < 0.9 ? cross(ch, { x: 1, y: 0, z: 0 }) : cross(ch, { x: 0, y: 1, z: 0 }); }
     r0 = unit(r0);
-    const S = samples.map(s => inv3(s.Q));
-    const frames = samples.map((s, i) => {
-      const t = tans[i], k = dot(r0, t);
+    const prep = (s) => {
+      if (s.arch) return s.arch;
+      const t = s.t, k = dot(r0, t), Q = s.Q;
       const e1 = unit({ x: r0.x - k * t.x, y: r0.y - k * t.y, z: r0.z - k * t.z }), e2 = cross(t, e1);
-      return { e1, e2, t };
-    });
-    // the ring a (a = 0: the tube itself) of sample i, facing `sign` of its tangent: arcs of phi, plus the terminator's phi (+ and -)
-    const ring = (i, a, sign) => {
-      const { e1, e2, t } = frames[i], c = samples[i].c, v = unit(sub(cp, c));
+      const round = Q[1] === 0 && Q[2] === 0 && Q[3] === 0 && Q[5] === 0 && Q[6] === 0 && Q[7] === 0 && Q[0] === Q[4] && Q[4] === Q[8];
+      return (s.arch = { t, e1, e2, S: inv3(Q), round, r: round ? 1 / Math.sqrt(Q[0]) : 0 });
+    };
+    // Tube mode (config.js lighting.archTube): every row is lit on one fixed half of its cross-section in this frame, centered on the
+    // tube light at the skew node (`phiS`: the light without its part along the tangent there), so the shade lines are the curves at
+    // phiS +- pi/2 from end to end (the Debug view's cyan curves); on the end caps the same half (n . lam >= 0 for the tube light carried
+    // to that end, cos(phi - phiS) >= 0 on every ring), as a straight cone's end sphere continues its border.
+    const tube = lighting.archTube && !!cutsT;
+    let phiS = 0, tubeDark = false;
+    if (tube) {
+      const f = prep(sM), u = f.t, k = dot(Lw, u), lam = { x: Lw.x - k * u.x, y: Lw.y - k * u.y, z: Lw.z - k * u.z };
+      if (len(lam) < 1e-9) tubeDark = true;
+      else phiS = Math.atan2(dot(lam, f.e2), dot(lam, f.e1));
+    }
+    // the ring a (a = 0: the tube itself) of sample s, facing `sign` of its tangent: arcs of phi, plus the terminator's phi (+ and -)
+    // A squashed end's cap (rows a != 0) is sliced by planes parallel to its end row instead of rings of constant normal angle,
+    // which on an ellipsoid are not planar: with T the semi-diameter along the tangent and U0 / V0 the end row's conjugate
+    // semi-diameters (a conjugate triple, so each slice is the plane ellipse c + sign sin a T + cos a (U0 cos phi + V0 sin phi)),
+    // facing the viewer (n . v >= 0, n ~ K y) and lit (n . L >= 0) are each y^T K w >= 0, linear in (cos phi, sin phi): one arc each,
+    // closed form, and a = 0 gives the end row's own arcs.
+    const isSlice = (s, a) => a !== 0 && !prep(s).round;
+    const triple = (s) => {
+      const f = prep(s);
+      if (f.triple) return f.triple;
+      const Kt = Qm(s.Q, f.t), kt = Math.sqrt(dot(f.t, Kt)), T = { x: f.t.x / kt, y: f.t.y / kt, z: f.t.z / kt };
+      const Se1 = Qm(f.S, f.e1), k = dot(f.e2, Se1) / dot(f.e1, Se1), m = { x: f.e2.x - k * f.e1.x, y: f.e2.y - k * f.e1.y, z: f.e2.z - k * f.e1.z };
+      const Sm = Qm(f.S, m), ku = Math.sqrt(dot(f.e1, Se1)), kv = Math.sqrt(Math.max(dot(m, Sm), 1e-300));
+      return (f.triple = { T, U0: { x: Se1.x / ku, y: Se1.y / ku, z: Se1.z / ku }, V0: { x: Sm.x / kv, y: Sm.y / kv, z: Sm.z / kv } });
+    };
+    const sliceRing = (s, a, sign) => {
+      const { T, U0, V0 } = triple(s), sa = Math.sin(a) * sign, ca = Math.cos(a);
+      // y^T K w >= 0 as cos(phi - c) >= -C / R: { c, w } (w the half-width), w = PI when it always holds, null when never
+      const half = (w) => {
+        const Kw = Qm(s.Q, w), A = ca * dot(U0, Kw), B = ca * dot(V0, Kw), C = sa * dot(T, Kw), R = Math.hypot(A, B);
+        if (R < 1e-12 * (Math.abs(C) + 1e-300)) return C >= 0 ? { c: 0, w: Math.PI } : { c: 0, w: null };
+        return { c: Math.atan2(B, A), w: halfWidth(C / R) };
+      };
+      const f = prep(s), V = half(unit(sub(cp, s.c)));
+      const dark = !lit || (tube && tubeDark);
+      const L = dark ? null : half(tube ? { x: Math.cos(phiS) * f.e1.x + Math.sin(phiS) * f.e2.x, y: Math.cos(phiS) * f.e1.y + Math.sin(phiS) * f.e2.y, z: Math.cos(phiS) * f.e1.z + Math.sin(phiS) * f.e2.z } : Lw);
+      const vis = V.w === null ? null : [V.c - V.w, V.c + V.w];
+      const phiL = L ? L.c : 0, wL = L ? L.w : null;
+      if (wL === null || V.w === null) return { arcs: [], phiL, wL, vis };
+      return { arcs: meet(phiL, wL, V.c, V.w).map(([lo, hi]) => [phiL + lo, phiL + hi]), phiL, wL, phiV: V.c, wV: V.w, vis };
+    };
+    const ring = (s, a, sign) => {
+      if (isSlice(s, a)) return sliceRing(s, a, sign);
+      const { e1, e2, t } = prep(s), v = unit(sub(cp, s.c));
       const hL = Math.hypot(dot(Lw, e1), dot(Lw, e2)), hV = Math.hypot(dot(v, e1), dot(v, e2));
-      if (hL < 1e-9 || hV < 1e-9) return null;
-      const ta = Math.tan(a), phiL = Math.atan2(dot(Lw, e2), dot(Lw, e1)), phiV = Math.atan2(dot(v, e2), dot(v, e1));
-      const wL = halfWidth(ta * sign * dot(Lw, t) / hL), wV = halfWidth(ta * sign * dot(v, t) / hV);
+      if (hV < 1e-9) return null;
+      // (no light: an instance for the outline only, `lit` false, or the light along the tangent: the visible arc alone)
+      const dark = !lit || (tube ? tubeDark : hL < 1e-9);
+      const ta = Math.tan(a), phiV = Math.atan2(dot(v, e2), dot(v, e1)), wV = halfWidth(ta * sign * dot(v, t) / hV);
+      const phiL = tube ? phiS : dark ? 0 : Math.atan2(dot(Lw, e2), dot(Lw, e1));
+      const wL = dark ? null : tube ? Math.PI / 2 : halfWidth(ta * sign * dot(Lw, t) / hL);
       const vis = wV === null ? null : [phiV - wV, phiV + wV];     // the visible arc (lit or not)
       if (wL === null || wV === null) return { arcs: [], phiL, wL, vis };
       const arcs = meet(phiL, wL, phiV, wV).map(([lo, hi]) => [phiL + lo, phiL + hi]);
       return { arcs, phiL, wL, phiV, wV, vis };
     };
-    const at = (i, a, sign, phi) => {
-      const { e1, e2, t } = frames[i], ca = Math.cos(a), sa = Math.sin(a) * sign;
-      const nv = { x: ca * (Math.cos(phi) * e1.x + Math.sin(phi) * e2.x) + sa * t.x, y: ca * (Math.cos(phi) * e1.y + Math.sin(phi) * e2.y) + sa * t.y, z: ca * (Math.cos(phi) * e1.z + Math.sin(phi) * e2.z) + sa * t.z };
-      const x = Qm(S[i], nv), k = Math.sqrt(Math.max(dot(nv, x), 1e-300)), c = samples[i].c;
+    const at = (r, phi) => {
+      if (isSlice(r.s, r.a)) {
+        const { T, U0, V0 } = triple(r.s), sa = Math.sin(r.a) * r.sign, ca = Math.cos(r.a), cu = ca * Math.cos(phi), cv = ca * Math.sin(phi), c = r.s.c;
+        return { x: c.x + sa * T.x + cu * U0.x + cv * V0.x, y: c.y + sa * T.y + cu * U0.y + cv * V0.y, z: c.z + sa * T.z + cu * U0.z + cv * V0.z };
+      }
+      const { e1, e2, t, S } = prep(r.s), ca = Math.cos(r.a), sa = Math.sin(r.a) * r.sign, cs = Math.cos(phi), sn = Math.sin(phi);
+      const nv = { x: ca * (cs * e1.x + sn * e2.x) + sa * t.x, y: ca * (cs * e1.y + sn * e2.y) + sa * t.y, z: ca * (cs * e1.z + sn * e2.z) + sa * t.z };
+      const x = Qm(S, nv), k = Math.sqrt(Math.max(dot(nv, x), 1e-300)), c = r.s.c;
       return { x: c.x + x.x / k, y: c.y + x.y / k, z: c.z + x.z / k };
     };
-    // rings in order along the surface: cap 0 (pole first), the samples, cap 1. Each cap ends in a ring at the pole itself (a point; its arc
-    // is all or nothing), so the strip to it closes the cap (the rings used to stop at 79 degrees, leaving a spot of base tone at the pole).
-    const POLE = (Math.PI / 2) * (1 - 1e-4), rows = [];
-    rows.push({ i: 0, a: POLE, sign: -1 });
-    for (let k = RINGS - 1; k >= 1; k--) rows.push({ i: 0, a: (Math.PI / 2) * (k - 0.25) / RINGS, sign: -1 });
-    for (let i = 0; i < n; i++) rows.push({ i, a: 0, sign: 1 });
-    for (let k = 1; k < RINGS; k++) rows.push({ i: n - 1, a: (Math.PI / 2) * (k - 0.25) / RINGS, sign: 1 });
-    rows.push({ i: n - 1, a: POLE, sign: 1 });
-    rows.forEach(r => { r.ring = ring(r.i, r.a, r.sign); });
+    const onScreen = (r, phi) => { const q = projectPoint(at(r, phi)); return [q.x, q.y]; };
+    const makeRow = (s, a, sign) => ({ s, a, sign, ring: ring(s, a, sign) });
+    // what the rows' spacing follows: the ends of the visible arc and of the lit arcs on screen, and the arcs' layout
+    const track = (r) => {
+      if (r.tr) return r.tr;
+      const g = r.ring;
+      if (!g) return (r.tr = { key: 'x', pts: [] });
+      const phis = g.vis ? [g.vis[0], g.vis[1]] : [];
+      g.arcs.forEach(a => phis.push(a[0], a[1]));
+      return (r.tr = { key: (g.vis ? 'v' : '-') + g.arcs.length, pts: phis.map(phi => onScreen(r, phi)) });
+    };
+    // the rows after r0 up to r1 (parameters p0, p1), bisected where needed (above), at most `depth` times
+    const refine = (p0, rA, p1, rB, make, depth, out) => {
+      if (depth > 0) {
+        const pm = (p0 + p1) / 2, rm = make(pm), T0 = track(rA), T1 = track(rB), Tm = track(rm);
+        let split = T0.key !== Tm.key || Tm.key !== T1.key;
+        for (let j = 0; !split && j < Tm.pts.length; j++) {
+          const a = T0.pts[j], b = T1.pts[j], m = Tm.pts[j];
+          split = Math.hypot(m[0] - (a[0] + b[0]) / 2, m[1] - (a[1] + b[1]) / 2) > ROW_TOL;
+        }
+        if (split) { refine(p0, rA, pm, rm, make, depth - 1, out); refine(pm, rm, p1, rB, make, depth - 1, out); return; }
+      }
+      out.push(rB);
+    };
+    // (in tube mode a round arch's rows take the radius' tilt, sinT: the normals of the swept spheres' surface, like the curves)
+    const tilt = (s) => (tube ? Math.asin(Math.max(-1, Math.min(1, s.sinT || 0))) : 0);
+    const mainRow = (t) => { const s = sampleAt(t); return makeRow(s, tilt(s), 1); };
+    const ts = [...new Set([...Array.from({ length: 17 }, (_, i) => i / 16), ...(cutsT ? [cutsT.apex, cutsT.lo, cutsT.hi, ...(cutsT.draw || [])] : [])])].sort((p, q) => p - q);
+    const main = [mainRow(ts[0])];
+    for (let k = 1; k < ts.length; k++) refine(ts[k - 1], main[main.length - 1], ts[k], mainRow(ts[k]), mainRow, MAIN_DEPTH, main);
+    const samples = main.map(r => r.s), n = samples.length;
+    const indexOf = (t) => samples.findIndex(s => s.tv === t);
+    const cuts = cutsT ? { lo: indexOf(cutsT.lo), hi: indexOf(cutsT.hi) } : null;
+    // the caps: rings from the end row (the same circle, as a ring facing outward) to the pole; the pole's ring is a point (its arc is all or
+    // nothing), so the strip to it closes the cap
+    const POLE = (Math.PI / 2) * (1 - 1e-4);
+    const cap = (end, sign) => {
+      const s = end.s, make = (a) => makeRow(s, a, sign), a0 = sign * end.a, out = [];
+      const base = [0, 1, 2, 3, 4].map(k => a0 + (POLE - a0) * k / 4);
+      let prev = make(base[0]);
+      for (let k = 1; k < base.length; k++) { const r = make(base[k]); refine(base[k - 1], prev, base[k], r, make, CAP_DEPTH, out); prev = r; }
+      return out;
+    };
+    const rows = [...cap(main[0], -1).reverse(), ...main, ...cap(main[n - 1], 1)];
+    const nCap0 = rows.indexOf(main[0]);
+    rows.forEach((r, k) => { r.i = k < nCap0 ? 0 : k < nCap0 + n ? k - nCap0 : n - 1; });
+    // A row's screen ellipse (every row is planar), or null (an edge-on row, thinner than half a pixel: drawn as a polyline).
+    const conicOf = (r) => {
+      if (r.conic !== undefined) return r.conic;
+      const f = prep(r.s);
+      let C, U, V;
+      if (f.round) {
+        const ra = f.r * Math.cos(r.a), off = f.r * Math.sin(r.a) * r.sign, c = r.s.c;
+        C = { x: c.x + off * f.t.x, y: c.y + off * f.t.y, z: c.z + off * f.t.z };
+        U = { x: ra * f.e1.x, y: ra * f.e1.y, z: ra * f.e1.z }; V = { x: ra * f.e2.x, y: ra * f.e2.y, z: ra * f.e2.z };
+      } else if (isSlice(r.s, r.a)) {
+        // a cap slice (above)
+        const { T, U0, V0 } = triple(r.s), sa = Math.sin(r.a) * r.sign, ca = Math.cos(r.a), c = r.s.c;
+        C = { x: c.x + sa * T.x, y: c.y + sa * T.y, z: c.z + sa * T.z };
+        U = { x: ca * U0.x, y: ca * U0.y, z: ca * U0.z }; V = { x: ca * V0.x, y: ca * V0.y, z: ca * V0.z };
+      } else if (r.a === 0) {
+        // conjugate semi-diameters of the cut: S e1 and S m, m = e2 - (e1^T S e2 / e1^T S e1) e1, each scaled onto the body
+        const Se1 = Qm(f.S, f.e1), k = dot(f.e2, Se1) / dot(f.e1, Se1), m = { x: f.e2.x - k * f.e1.x, y: f.e2.y - k * f.e1.y, z: f.e2.z - k * f.e1.z };
+        const Sm = Qm(f.S, m), ku = Math.sqrt(dot(f.e1, Se1)), kv = Math.sqrt(Math.max(dot(m, Sm), 1e-300));
+        C = r.s.c; U = { x: Se1.x / ku, y: Se1.y / ku, z: Se1.z / ku }; V = { x: Sm.x / kv, y: Sm.y / kv, z: Sm.z / kv };
+      } else return (r.conic = null);
+      const e = projectedEllipse(C, U, V);
+      return (r.conic = e && e.b >= 0.5 * px ? e : null);
+    };
     // An end of an arc that is the silhouette (not the terminator) is pushed out ARCH_SEAM_PX on screen: the drawn outline and the 3D
     // silhouette differ by about a pixel, and a lit part that falls short leaves a thin line of the base tone along the edge (the
     // part past the outline is cut off by the fill). The terminator ends stay where they are.
     const csc = samples.map(s => projectPoint(s.c));
-    const pts = (r, arc) => {
-      const out = [], g = r.ring;
+    // A row's arc on screen: `draw` the elliptic arc (or null: the polyline `pts`), `P0` / `P1` its exact ends, `Q0` / `Q1` the same pushed
+    // out; `pts` a coarse polyline on it (PROXY_STEPS steps, pushed ends) and `raw` the same unpushed (the true projection), what the
+    // sheets' overlap and order tests work on (they only need to find where strips overlap, the drawing is the exact arc).
+    const chain = (r, arc) => {
+      const g = r.ring, e = conicOf(r);
       const isTerm = (phi) => Math.abs(wrap(phi - (g.phiL + g.wL))) < 1e-6 || Math.abs(wrap(phi - (g.phiL - g.wL))) < 1e-6;
-      for (let s = 0; s <= M; s++) {
-        const phi = arc[0] + (arc[1] - arc[0]) * s / M, p = projectPoint(at(r.i, r.a, r.sign, phi));
-        let x = p.x, y = p.y;
-        if ((s === 0 || s === M) && !isTerm(s === 0 ? arc[0] : arc[1])) {
-          const c = csc[r.i], dx = x - c.x, dy = y - c.y, l = Math.hypot(dx, dy) || 1;
-          x += dx / l * ARCH_SEAM_PX * px; y += dy / l * ARCH_SEAM_PX * px;
+      const whole = arc[1] - arc[0] >= TWO_PI - 1e-9;
+      const P0 = onScreen(r, arc[0]), P1 = whole ? P0 : onScreen(r, arc[1]);
+      let raw, draw = null;
+      if (e) {
+        const p0 = paramOn(e, P0);
+        let dir, span;
+        if (whole) { dir = mod(paramOn(e, onScreen(r, arc[0] + Math.PI / 2)) - p0) < Math.PI ? 1 : -1; span = TWO_PI; }
+        else {
+          const p1 = paramOn(e, P1), pm = paramOn(e, onScreen(r, (arc[0] + arc[1]) / 2));
+          dir = mod(pm - p0) < mod(p1 - p0) ? 1 : -1;
+          span = dir > 0 ? mod(p1 - p0) : mod(p0 - p1);
         }
-        out.push([x, y]);
+        draw = { e, from: p0, to: p0 + dir * span, ccw: dir < 0 };
+        raw = [];
+        for (let j = 0; j <= PROXY_STEPS; j++) raw.push(j === 0 ? P0 : j === PROXY_STEPS ? P1 : pointOn(e, p0 + dir * span * j / PROXY_STEPS));
+      } else {
+        const m = Math.max(2, Math.ceil((arc[1] - arc[0]) / POLY_STEP));
+        raw = [];
+        for (let j = 0; j <= m; j++) raw.push(j === 0 ? P0 : j === m ? P1 : onScreen(r, arc[0] + (arc[1] - arc[0]) * j / m));
       }
-      return out;
+      const push = (P, phi) => {
+        if (isTerm(phi)) return P;
+        const c = csc[r.i], dx = P[0] - c.x, dy = P[1] - c.y, l = Math.hypot(dx, dy) || 1;
+        return [P[0] + dx / l * ARCH_SEAM_PX * px, P[1] + dy / l * ARCH_SEAM_PX * px];
+      };
+      const Q0 = push(P0, arc[0]), Q1 = push(P1, arc[1]), pts = raw.slice();
+      pts[0] = Q0; pts[pts.length - 1] = Q1;
+      return { draw, P0, P1, Q0, Q1, pts, raw };
+    };
+    // A strip's shape: a list of points [x, y] and arcs { c: chain, rev }; `flat` its polyline (pushed ends), `trace` adds it to a path.
+    const flat = (shape) => shape.flatMap(it => (Array.isArray(it) ? [it] : it.rev ? it.c.pts.slice().reverse() : it.c.pts));
+    const reversed = (shape) => shape.slice().reverse().map(it => (Array.isArray(it) ? it : { c: it.c, rev: !it.rev }));
+    // (`exact`: the true projection, without the ARCH_SEAM_PX push: the fill's outline)
+    const trace = (path, shape, exact = false) => {
+      let started = false;
+      const to = (p) => { if (started) path.lineTo(p[0], p[1]); else path.moveTo(p[0], p[1]); started = true; };
+      shape.forEach(it => {
+        if (Array.isArray(it)) { to(it); return; }
+        const c = it.c, d = c.draw, line = exact ? c.raw : c.pts;
+        if (!d) { (it.rev ? line.slice().reverse() : line).forEach(to); return; }
+        const [Qa, Pa, Qb, from, end] = exact ? (it.rev ? [c.P1, c.P1, c.P0, d.to, d.from] : [c.P0, c.P0, c.P1, d.from, d.to])
+          : it.rev ? [c.Q1, c.P1, c.Q0, d.to, d.from] : [c.Q0, c.P0, c.Q1, d.from, d.to];
+        to(Qa); to(Pa);
+        path.ellipse(d.e.x, d.e.y, d.e.a, d.e.b, d.e.angle, from, end, it.rev ? !d.ccw : d.ccw);
+        path.lineTo(Qb[0], Qb[1]);
+      });
+      path.closePath();
     };
     const area = (ps) => ps.reduce((acc, p, i) => { const q = ps[(i + 1) % ps.length]; return acc + p[0] * q[1] - q[0] * p[1]; }, 0);
     // The arch is not convex: where its surface folds over itself on screen (a wide band turning past edge-on at a bend), a lit strip
@@ -322,18 +519,26 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
       const A = rows[k].ring, B = rows[k + 1].ring, strip = { k, vis: null, area: 0, lits: [] };
       strips.push(strip);
       if (!A || !B) continue;
-      if (A.vis && B.vis) { strip.vis = pts(rows[k], A.vis).concat(pts(rows[k + 1], B.vis).reverse()); strip.area = area(strip.vis); }
-      const push = (poly) => strip.lits.push(area(poly) < 0 ? poly.reverse() : poly);
-      const onScreen = (r, phi) => { const q = projectPoint(at(r.i, r.a, r.sign, phi)); return [q.x, q.y]; };
+      if (A.vis && B.vis) {
+        const a = chain(rows[k], A.vis), b = chain(rows[k + 1], B.vis);
+        strip.vis = [{ c: a }, { c: b, rev: true }];
+        strip.visFlat = flat(strip.vis); strip.area = area(strip.visFlat);
+        strip.rawRows = [a.raw, b.raw];
+      }
+      const push = (shape) => strip.lits.push(area(flat(shape)) < 0 ? reversed(shape) : shape);
       const lerp = (p, q, f) => [p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f];
       if (A.arcs.length !== B.arcs.length) {
         // A lit patch that starts between the two rows (none on one, one or more arcs on the other): each arc tapers to a point halfway to
-        // the other row, instead of ending square on its own row.
+        // the other row, instead of ending square on its own row. The tip is at the arc's end nearest the other row's visible arc (the
+        // patch vanishes where that end meets the silhouette): aimed at its middle, the tip could face away on the other row and project
+        // across the tube (a lit hook at the skew node of the threaded orange arch at 2.0, where the tube points at the camera).
         if (A.arcs.length && B.arcs.length) continue;
         const [R0, R1, arcs, first] = A.arcs.length ? [rows[k], rows[k + 1], A.arcs, true] : [rows[k + 1], rows[k], B.arcs, false];
+        const visO = R1.ring.vis, off = (phi) => (visO ? Math.max(0, Math.abs(wrap(phi - (visO[0] + visO[1]) / 2)) - (visO[1] - visO[0]) / 2) : 0);
         arcs.forEach(arc => {
-          const c = (arc[0] + arc[1]) / 2, tip = lerp(onScreen(R0, c), onScreen(R1, c), 0.5), side = pts(R0, arc);
-          push(first ? side.concat([tip]) : [tip].concat(side));
+          const c = !visO ? (arc[0] + arc[1]) / 2 : off(arc[0]) <= off(arc[1]) ? arc[0] : arc[1];
+          const tip = lerp(onScreen(R0, c), onScreen(R1, c), 0.5), side = { c: chain(R0, arc) };
+          push(first ? [side, tip] : [tip, side]);
         });
         continue;
       }
@@ -350,15 +555,14 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
           // an arc's silhouette end is the one on an end of the visible arc (the other is the terminator)
           const silEnd = (arc, vis) => { const d = (x) => Math.abs(wrap(x - near(x, vis))); return d(arc[0]) <= d(arc[1]) ? arc[0] : arc[1]; };
           const endA = silEnd(arcA, A.vis), endB = silEnd(arcB, B.vis);
-          push(pts(rows[k], arcA).concat([lerp(onScreen(rows[k], endA), onScreen(rows[k + 1], near(endA, B.vis)), f)]));
-          push([lerp(onScreen(rows[k], near(endB, A.vis)), onScreen(rows[k + 1], endB), f)].concat(pts(rows[k + 1], arcB)));
+          push([{ c: chain(rows[k], arcA) }, lerp(onScreen(rows[k], endA), onScreen(rows[k + 1], near(endA, B.vis)), f)]);
+          push([lerp(onScreen(rows[k], near(endB, A.vis)), onScreen(rows[k + 1], endB), f), { c: chain(rows[k + 1], arcB) }]);
           return;
         }
-        const poly = pts(rows[k], arcA).concat(pts(rows[k + 1], arcB).reverse());
-        push(poly);
+        push([{ c: chain(rows[k], arcA) }, { c: chain(rows[k + 1], arcB), rev: true }]);
       });
     }
-    const scr = (r, phi) => { const p = at(r.i, r.a, r.sign, phi), q = projectPoint(p); return { x: q.x, y: q.y, d: dot(sub(p, cp), basis.forward) }; };
+    const scr = (r, phi) => { const p = at(r, phi), q = projectPoint(p); return { x: q.x, y: q.y, d: dot(sub(p, cp), basis.forward) }; };
     const sil = rows.map(r => (r.ring && r.ring.vis ? r.ring.vis.map(phi => scr(r, phi)) : null));
     const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
     const crosses = (k) => {
@@ -378,78 +582,151 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
     // Two strips overlap on screen: a few points of one (its corners and the midpoints across it) inside the other. A tube bending toward
     // the camera hides its own earlier strips behind later ones without any contour across it (at the apex of the threaded orange arch
     // at 2.02, a lit rim sliver showed through as a crescent), so a sheet is also cut where a strip overlaps a non-neighbor of its sheet.
+    // Each strip's two row curves in their true projection (`raw`: without the ARCH_SEAM_PX push at the silhouette, which would make strips
+    // of an ordinary bend touch), end points included: two strips overlap where those curves cross or a point of one lies inside the other.
+    // (Counting sample points inside missed thin crescents: where the tube points at the camera, consecutive rows are nearly concentric, and a
+    // lit taper showed through a nearer strip of the same sheet as a hook at the skew node, threaded orange arch at 2.0. Leaving the end
+    // points out instead of unpushing them missed strips that overlap only along the silhouette: a lit rim near the apex showed through a
+    // nearer, unlit part of the same half as a thin sliver, 4.256.)
     strips.forEach(st => {
       if (!st.vis) return;
-      const v = st.vis, h = v.length / 2;
-      st.box = v.reduce((b, [x, y]) => ({ x0: Math.min(b.x0, x), y0: Math.min(b.y0, y), x1: Math.max(b.x1, x), y1: Math.max(b.y1, y) }), { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
-      st.pts = v.concat(Array.from({ length: h - 1 }, (_, m) => [(v[m + 1][0] + v[v.length - 2 - m][0]) / 2, (v[m + 1][1] + v[v.length - 2 - m][1]) / 2]));
+      st.chains = st.rawRows;
+      st.poly = st.rawRows[0].concat(st.rawRows[1].slice().reverse());
+      st.box = boxOfPts(st.poly);
+      st.visBox = boxOfPts(st.visFlat);
+    });
+    const segsCross = (a, b, c, d) => {
+      const o = (p, q, r) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+      return o(a, b, c) * o(a, b, d) < 0 && o(c, d, a) * o(c, d, b) < 0;
+    };
+    // The fill's outline (render.js buildSkewPrimitives): the union of the visible strips in their true projection, all wound anticlockwise
+    // on screen, traced into one nonzero path. The visible surface covers the whole body on screen (a ray that meets the body enters it
+    // through a front-facing point), so this is the body's outline from the same exact rows as its shading, with only the strips' sides
+    // as chords (within ROW_TOL of the silhouette). A strip whose sides cross (a fold, the silhouette jumping across the band) is the
+    // hull of its two row curves instead: wound one way it would cancel the strips beside it.
+    const outlineOf = (st) => {
+      if (st.outline !== undefined) return st.outline;
+      if (!st.vis) return (st.outline = null);
+      const [a, b] = [st.vis[0].c, st.vis[1].c];
+      if (crosses(st.k) || segsCross(a.P0, b.P0, a.P1, b.P1)) {
+        const hull = convexHull(st.poly.map(([x, y]) => ({ x, y }))).reverse();
+        return (st.outline = { hull: hull.map(q => [q.x, q.y]) });
+      }
+      return (st.outline = { shape: area(st.poly) > 0 ? reversed(st.vis) : st.vis });
+    };
+    const tvOf = (k) => samples[rows[k].i].tv;
+    // the strips from t0 to t1 (an end cap goes with its end)
+    const outline = (t0, t1) => (path) => strips.forEach(st => {
+      if (tvOf(st.k) < t0 - 1e-12 || tvOf(st.k + 1) > t1 + 1e-12) return;
+      const o = outlineOf(st);
+      if (!o) return;
+      if (o.shape) trace(path, o.shape, true);
+      else { o.hull.forEach((q, j) => (j ? path.lineTo(q[0], q[1]) : path.moveTo(q[0], q[1]))); path.closePath(); }
     });
     const overlaps = (p, q) => {
-      if (p.box.x1 < q.box.x0 || q.box.x1 < p.box.x0 || p.box.y1 < q.box.y0 || q.box.y1 < p.box.y0) return false;
-      const count = (a, b) => a.pts.reduce((acc, pt) => acc + (inside(pt, b.vis) ? 1 : 0), 0);
-      return count(p, q) >= 2 || count(q, p) >= 2;
+      if (!boxesMeet(p.box, q.box)) return false;
+      const within = (pt, s) => inBox(pt[0], pt[1], s.box) && inside(pt, s.poly);
+      if (p.chains.some(ch => ch.some(pt => within(pt, q))) || q.chains.some(ch => ch.some(pt => within(pt, p)))) return true;
+      return p.chains.some(ca => q.chains.some(cb => {
+        for (let i = 0; i + 1 < ca.length; i++) for (let j = 0; j + 1 < cb.length; j++) if (segsCross(ca[i], ca[i + 1], cb[j], cb[j + 1])) return true;
+        return false;
+      }));
     };
     const sheets = [];
     let sheet = null;
-    strips.forEach(st => {
+    if (lit) strips.forEach(st => {
       if (!st.vis) { sheet = null; return; }
-      // the cut at `cutAt` is soft (not a contour): the strips on both sides of it paint no cover, so no line of the base tone is
+      // the cuts at `lo` and `hi` are soft (not contours): the strips on both sides of them paint no cover, so no line of the base tone is
       // left across the arch where the later sheet's edge meets the earlier one
-      const soft = cutAt !== null && sheet && rows[st.k].i === cutAt - 1 && rows[st.k + 1].i === cutAt;
+      const soft = !!cuts && !!sheet && [cuts.lo, cuts.hi].some(c => rows[st.k].i === c && rows[st.k + 1].i === c + 1);
       if (soft) sheet.softEnd = true;
-      const hidden = sheet && sheet.strips.some(o => o.k <= st.k - 3 && overlaps(st, o));
-      if (!sheet || soft || hidden || crosses(st.k)) sheets.push(sheet = { strips: [], softStart: soft });
+      // (a non-neighbor: at least 3/64 of the arch back, not 3 strips: the rows are denser where the arch points at the camera, and
+      // nearly concentric rows a few strips apart overlap there without hiding anything of another tone)
+      const tv = (k) => samples[rows[k].i].tv;
+      const hidden = sheet && sheet.strips.some(o => tv(st.k) - tv(o.k + 1) >= 3 / 64 - 1e-9 && overlaps(st, o));
+      const fold = !soft && !hidden && !!sheet && crosses(st.k);
+      // (`joined`: the sheet continues the previous one across a cut that is not a contour, see the underpaint below)
+      if (!sheet || soft || hidden || fold) sheets.push(sheet = { strips: [], softStart: soft, joined: !!sheet && !fold });
       sheet.strips.push(st);
     });
-    const litPath = (list) => { const path = new Path2D(); list.forEach(st => st.lits.forEach(poly => path.addPath(polygon(poly)))); return path; };
+    const litPath = (list) => { const path = new Path2D(); list.forEach(st => st.lits.forEach(shape => trace(path, shape))); return path; };
     let out;
-    if (sheets.length <= 1) out = [{ kind: 'lit', lit: litPath(strips) }];
+    if (!lit) out = [];
+    else if (sheets.length <= 1) out = [{ kind: 'lit', lit: litPath(strips) }];
     else {
-      // Probe points of each sheet (its visible quads' interiors, with their depth), to order two sheets where they overlap on screen.
+      // Probe points of each sheet (its visible quads' interiors, with their depth), to order two sheets where they overlap on screen;
+      // each strip keeps its probes' mean depth, each sheet its box (and the box of its true projection, for the overlap test).
       sheets.forEach(sh => {
         sh.probes = [];
+        sh.box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+        sh.rawBox = { ...sh.box };
         sh.strips.forEach(st => {
           const A = rows[st.k], B = rows[st.k + 1];
-          for (let m = 1; m < M; m++) {
-            const f = m / M, pa = scr(A, A.ring.vis[0] + (A.ring.vis[1] - A.ring.vis[0]) * f), pb = scr(B, B.ring.vis[0] + (B.ring.vis[1] - B.ring.vis[0]) * f);
-            sh.probes.push({ x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, d: (pa.d + pb.d) / 2, st });
+          let dSum = 0;
+          for (let m = 1; m < PROBES; m++) {
+            const f = m / PROBES, pa = scr(A, A.ring.vis[0] + (A.ring.vis[1] - A.ring.vis[0]) * f), pb = scr(B, B.ring.vis[0] + (B.ring.vis[1] - B.ring.vis[0]) * f);
+            const q = { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2, d: (pa.d + pb.d) / 2, st };
+            sh.probes.push(q); dSum += q.d;
           }
+          st.probeD = dSum / (PROBES - 1);
+          [[sh.box, st.visBox], [sh.rawBox, st.box]].forEach(([b, s]) => { b.x0 = Math.min(b.x0, s.x0); b.y0 = Math.min(b.y0, s.y0); b.x1 = Math.max(b.x1, s.x1); b.y1 = Math.max(b.y1, s.y1); });
         });
         sh.depth = sh.probes.reduce((acc, q) => acc + q.d, 0) / (sh.probes.length || 1);
       });
-      // nearer[i][j]: +1 if sheet i is in front of sheet j where they overlap, -1 behind, 0 if they don't overlap.
+      const idx = new Map(sheets.map((sh, i) => [sh, i])), pairKey = (P, Q) => idx.get(P) * sheets.length + idx.get(Q);
+      // +1 if sheet P is in front of sheet Q where they overlap (P's probes inside Q's strips), -1 behind, 0 if they don't overlap.
+      const orderMemo = new Map();
       const order = (P, Q) => {
+        const key = pairKey(P, Q);
+        if (orderMemo.has(key)) return orderMemo.get(key);
         let votes = 0;
-        P.probes.forEach(q => {
-          const st = Q.strips.find(s2 => inside([q.x, q.y], s2.vis));
-          if (!st) return;
-          const near = Q.probes.filter(o => o.st === st);
-          const dq = near.length ? near.reduce((acc, o) => acc + o.d, 0) / near.length : Q.depth;
-          votes += q.d < dq ? 1 : -1;
+        if (boxesMeet(P.box, Q.box)) P.probes.forEach(q => {
+          if (!inBox(q.x, q.y, Q.box)) return;
+          const st = Q.strips.find(s2 => inBox(q.x, q.y, s2.visBox) && inside([q.x, q.y], s2.visFlat));
+          if (st) votes += q.d < st.probeD ? 1 : -1;
         });
+        orderMemo.set(key, Math.sign(votes));
         return Math.sign(votes);
       };
       // Back to front: repeatedly take, among the sheets left, one that nothing left is behind (ties and cycles: the farthest).
       const left = sheets.slice(), sorted = [];
-      const rel = new Map();
-      const relOf = (P, Q) => { const key = sheets.indexOf(P) + ',' + sheets.indexOf(Q); if (!rel.has(key)) rel.set(key, order(P, Q) - order(Q, P)); return rel.get(key); };
+      const relOf = (P, Q) => order(P, Q) - order(Q, P);
       while (left.length) {
         left.sort((p, q) => q.depth - p.depth);
         const pick = left.find(P => left.every(Q => Q === P || relOf(P, Q) <= 0)) || left[0];
         sorted.push(pick); left.splice(left.indexOf(pick), 1);
       }
-      // A sheet covers what it hides only if it overlaps a sheet painted before it.
+      // Underpaint across the cuts that are not contours (soft cuts, self-overlap cuts; rule 1): of two sheets that meet there, the one
+      // painted later also fills the other's strip next to the cut, so its lit part has no edge on the cut row (two antialiased edges on
+      // one line left a hairline of the base tone across the lit part); it ends one strip into the earlier sheet, over the same lit part.
+      sheets.forEach((sh, i) => {
+        if (!i || !sh.joined) return;
+        const prev = sheets[i - 1];
+        if (sorted.indexOf(sh) > sorted.indexOf(prev)) (sh.extra ||= []).push(prev.strips[prev.strips.length - 1]);
+        else (prev.extra ||= []).push(sh.strips[0]);
+      });
+      // A sheet covers what it hides only if it overlaps a sheet painted before it: by the probes' order (`relOf`) or by the strips' own
+      // overlap test (the probes, a few points inside each strip, missed a thin overlap along a junction: the big tube of the threaded
+      // orange arch painted no cover over the thin tube's lit tip behind it, a lit spike beside the skew node at 2.146).
+      const overlapMemo = new Map();
+      const sheetsOverlap = (P, Q) => {
+        const key = pairKey(P, Q);
+        if (!overlapMemo.has(key)) overlapMemo.set(key, boxesMeet(P.rawBox, Q.rawBox) && P.strips.some(a => a.chains && Q.strips.some(b => b.chains && overlaps(a, b))));
+        return overlapMemo.get(key);
+      };
+      const coversSome = (sh, p) => sorted.slice(0, p).some(Q => relOf(sh, Q) !== 0 || sheetsOverlap(sh, Q));
       out = sorted.map((sh, p) => {
-        // `half`: the side of `cutAt` the sheet is on (a skewed mesh's half drawn first paints only its own sheets, render.js), read from
-        // the far row of its first strip (the strip across the cut starts on sample cutAt - 1 but belongs to the sheet after the cut)
-        const half = cutAt === null ? undefined : (rows[sh.strips[0].k + 1].i < cutAt ? 0 : 1);
-        if (!sorted.slice(0, p).some(Q => relOf(sh, Q) !== 0)) return { kind: 'lit', lit: litPath(sh.strips), half };
+        // `half`: the part the sheet is in (a skewed mesh's half drawn first paints only its own sheets and the shared band, render.js),
+        // read from its first strip's start
+        const i0 = rows[sh.strips[0].k].i, half = !cuts ? undefined : i0 < cuts.lo ? 0 : i0 >= cuts.hi ? 1 : 'both';
+        const lit = litPath(sh.extra ? sh.strips.concat(sh.extra) : sh.strips);
+        if (!coversSome(sh, p)) return { kind: 'lit', lit, half };
         const cover = new Path2D(), last = sh.strips.length - 1;
         sh.strips.forEach((st, j) => {
           if ((j === 0 && sh.softStart) || (j === last && sh.softEnd)) return;
-          cover.addPath(polygon(st.area < 0 ? st.vis.slice().reverse() : st.vis));
+          trace(cover, st.area < 0 ? reversed(st.vis) : st.vis);
         });
-        return { kind: 'lit', lit: litPath(sh.strips), cover, half };
+        return { kind: 'lit', lit, cover, half };
       });
     }
     if (debug.on) {
@@ -460,8 +737,8 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
         rows.forEach(r => {
           const g = r.ring;
           if (!g || g.wL === null || g.wL === undefined) { flush(); return; }
-          const phi = g.phiL + side * g.wL, p = at(r.i, r.a, r.sign, phi), c = samples[r.i].c;
-          const nrm = Qm(samples[r.i].Q, { x: p.x - c.x, y: p.y - c.y, z: p.z - c.z });
+          const phi = g.phiL + side * g.wL, p = at(r, phi), c = r.s.c;
+          const nrm = Qm(r.s.Q, { x: p.x - c.x, y: p.y - c.y, z: p.z - c.z });
           if (dot(nrm, unit(sub(cp, p))) < 0) { flush(); return; }
           const q = projectPoint(p);
           run.push([q.x, q.y]);
@@ -469,13 +746,30 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
         flush();
       });
     }
+    out.outline = outline;
     return out;
+  };
+
+  // A straight cone's shade borders in WORLD space, for round nodes at world centers cA, cB with radii rA, rB (tube light: lam = the light
+  // without its part along the axis d; the border's radial directions r = +-(d x lam); the tangent cone's normal there n = cosT r + sinT d,
+  // sinT = (rA - rB) / |cB - cA|): the two border generatrices [{ n, ends: [cA + rA n, cB + rB n] }], or [] (light along the axis).
+  const tubeBorders = (cA, rA, cB, rB) => {
+    const dv = sub(cB, cA), D = len(dv), sinT = (rA - rB) / D;
+    if (D < 1e-12 || Math.abs(sinT) >= 1) return [];
+    const cosT = Math.sqrt(1 - sinT * sinT), u = unit(dv), Lw = light.dir, k = dot(Lw, u);
+    const lam = { x: Lw.x - k * u.x, y: Lw.y - k * u.y, z: Lw.z - k * u.z };
+    if (len(lam) < 1e-9) return [];
+    const r = unit(cross(u, unit(lam)));
+    return [1, -1].map(sg => {
+      const n = { x: sg * cosT * r.x + sinT * u.x, y: sg * cosT * r.y + sinT * u.y, z: sg * cosT * r.z + sinT * u.z };
+      return { n, ends: [[cA, rA], [cB, rB]].map(([c, rr]) => ({ x: c.x + rr * n.x, y: c.y + rr * n.y, z: c.z + rr * n.z })) };
+    });
   };
 
   return {
     flat,
-    // A skewed arch by its mesh id, its world samples and the sample it is split at (buildArch).
-    arch: (key, samples, cutAt) => cached('a' + key, () => buildArch(samples, cutAt)),
+    // A skewed arch by its mesh id, its samples (`sampleAt(t)`) and its cuts as values of t (buildArch).
+    arch: (key, sampleAt, cuts) => cached('a' + key, () => buildArch(sampleAt, cuts)),
     // The pair of a 2-node mesh (or a split cone): lit as a tube, i.e. by the light's component perpendicular to the axis only, so a
     // generatrix has one tone along its whole length (the cone's border is a straight line) and a node's border is the great circle
     // n . lam = 0 (a plane parallel to the axis), which continues that line across the seam without a corner. Returns the elements
@@ -496,6 +790,91 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
     // The tangent cone of two nodes lit by the light itself (not as a tube): a split cone's host-colored part, so the whole host
     // color has one light model and the switch to the tube is on the split ring, a color border.
     cone: (pa, pb) => cached('c' + pa.id + ',' + pb.id, () => buildCone(flat(pa), flat(pb), L, [], pa.id + '-' + pb.id + 'L')),
+    // Debug: where the shade borders of a plain (straight) cone would cross a skew node's cross-section, taken as that cone's
+    // cross-section, in WORLD space (fixed on the object; only the projection depends on the camera). Filled where they face the viewer.
+    // A round arch passes `round`: the arch's spheres just before and after the skew node, { cA, rA, cB, rB }; the dots are the middle
+    // of the two border generatrices of their tangent cone (`tubeBorders`, the same logic as `tubeBorderLines`), which as the two
+    // close in is the swept body's own cross-section there, including the tilt of its normals where the radius changes (sinT).
+    // A squashed arch passes `c` the center, `K` the body's form there (x^T K x = 1), `t` the arch's tangent: tube light, the border
+    // normals perpendicular to t with n . lam = 0, so n = +-(t x lam), at the body points c + S n / sqrt(n^T S n), S = K^-1.
+    tubeBorderDebug: (c, K, t, round = null) => {
+      if (!debug.on) return;
+      if (round) {
+        tubeBorders(round.cA, round.rA, round.cB, round.rB).forEach(({ n, ends: [p, q] }) => {
+          const m = { x: (p.x + q.x) / 2, y: (p.y + q.y) / 2, z: (p.z + q.z) / 2 }, sp = projectPoint(m);
+          debugItems.push({ kind: 'dot', pt: [sp.x, sp.y], visible: dot(n, sub(camPos, m)) >= 0 });
+        });
+        return;
+      }
+      const u = unit(t), Lw = light.dir, k = dot(Lw, u), lam = { x: Lw.x - k * u.x, y: Lw.y - k * u.y, z: Lw.z - k * u.z };
+      if (len(lam) < 1e-9) return;
+      const [a, b, cc, d, e, f, g, h, i] = K, A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + cc * C;
+      const S = [A / det, (cc * h - b * i) / det, (b * f - cc * e) / det, B / det, (a * i - cc * g) / det, (cc * d - a * f) / det, C / det, (b * g - a * h) / det, (a * e - b * d) / det];
+      const n = unit(cross(u, unit(lam)));
+      [n, { x: -n.x, y: -n.y, z: -n.z }].forEach(m => {
+        const x = { x: S[0] * m.x + S[1] * m.y + S[2] * m.z, y: S[3] * m.x + S[4] * m.y + S[5] * m.z, z: S[6] * m.x + S[7] * m.y + S[8] * m.z };
+        const q = Math.sqrt(Math.max(dot(m, x), 1e-300)), p = { x: c.x + x.x / q, y: c.y + x.y / q, z: c.z + x.z / q }, sp = projectPoint(p);
+        debugItems.push({ kind: 'dot', pt: [sp.x, sp.y], visible: dot(m, sub(camPos, p)) >= 0 });
+      });
+    },
+    // Debug: a straight cone's shade borders in WORLD space (fixed on the object; only the projection depends on the camera), for the
+    // round nodes at world centers cA, cB with radii rA, rB. Tube light as in `tubeBorderDebug`: lam = the light without its part along
+    // the axis d, the border's radial directions r = +-(d x lam), and the tangent cone's normal there n = cosT r + sinT d; each border
+    // generatrix runs between the two tangent circles, cA + rA n to cB + rB n. Solid where it faces the viewer at both ends.
+    tubeBorderLines: (cA, rA, cB, rB) => {
+      if (!debug.on) return;
+      tubeBorders(cA, rA, cB, rB).forEach(({ n, ends }) => debugItems.push({
+        kind: 'tubeLine', pts: ends.map(p => { const q = projectPoint(p); return [q.x, q.y]; }), visible: ends.every(p => dot(n, sub(camPos, p)) >= 0),
+      }));
+    },
+    // Debug: the two curves along a skewed arch through its skew-node dots (tubeBorderDebug), in WORLD space from end node to end node.
+    // Each keeps its dot's angle phi0 around the arch in the arch's own frame: e1 = the arch plane's normal made perpendicular to the
+    // tangent t, e2 = t x e1 (the arch is planar, so this frame turns with it without twisting; nothing depends on the camera). At each
+    // row the normal is n = cosT (cos phi0 e1 + sin phi0 e2) + sinT t on a round arch (sinT the radius' tilt, as in tubeBorders) and the
+    // point c + r n; on a squashed arch n has no tilt and the point is c + S n / sqrt(n^T S n), S = K^-1. `rows`: { c, t (unit), r, sinT,
+    // K } along the arch, `apex` the index of the skew node's row. Solid where the curve faces the viewer, dashed where it faces away.
+    archBorderCurves: (rows, apex, round) => {
+      if (!debug.on || rows.length < 3) return;
+      const inv = (m) => {
+        const [a, b, c, d, e, f, g, h, i] = m, A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + c * C;
+        return [A / det, (c * h - b * i) / det, (b * f - c * e) / det, B / det, (a * i - c * g) / det, (c * d - a * f) / det, C / det, (b * g - a * h) / det, (a * e - b * d) / det];
+      };
+      const last = rows.length - 1;
+      let N = cross(sub(rows[last].c, rows[0].c), sub(rows[apex].c, rows[0].c));
+      if (len(N) < 1e-9) { const t0 = rows[apex].t; N = Math.abs(t0.x) < 0.9 ? cross(t0, { x: 1, y: 0, z: 0 }) : cross(t0, { x: 0, y: 1, z: 0 }); }
+      N = unit(N);
+      const frame = (t) => { const k = dot(N, t), e1 = unit({ x: N.x - k * t.x, y: N.y - k * t.y, z: N.z - k * t.z }); return { e1, e2: cross(t, e1) }; };
+      // the dots' radial directions at the skew node (tube light there), as angles in its frame
+      const u = rows[apex].t, Lw = light.dir, k = dot(Lw, u), lam = { x: Lw.x - k * u.x, y: Lw.y - k * u.y, z: Lw.z - k * u.z };
+      if (len(lam) < 1e-9) return;
+      const r0 = unit(cross(u, unit(lam))), f0 = frame(u);
+      const phi0 = Math.atan2(dot(r0, f0.e2), dot(r0, f0.e1));
+      [phi0, phi0 + Math.PI].forEach(phi => {
+        const pts = rows.map(row => {
+          const { e1, e2 } = frame(row.t), cs = Math.cos(phi), sn = Math.sin(phi);
+          const rad = { x: cs * e1.x + sn * e2.x, y: cs * e1.y + sn * e2.y, z: cs * e1.z + sn * e2.z };
+          let n, p;
+          if (round) {
+            const ct = Math.sqrt(Math.max(0, 1 - row.sinT * row.sinT));
+            n = { x: ct * rad.x + row.sinT * row.t.x, y: ct * rad.y + row.sinT * row.t.y, z: ct * rad.z + row.sinT * row.t.z };
+            p = { x: row.c.x + row.r * n.x, y: row.c.y + row.r * n.y, z: row.c.z + row.r * n.z };
+          } else {
+            const S = inv(row.K), x = { x: S[0] * rad.x + S[1] * rad.y + S[2] * rad.z, y: S[3] * rad.x + S[4] * rad.y + S[5] * rad.z, z: S[6] * rad.x + S[7] * rad.y + S[8] * rad.z };
+            const q = Math.sqrt(Math.max(dot(rad, x), 1e-300));
+            n = rad; p = { x: row.c.x + x.x / q, y: row.c.y + x.y / q, z: row.c.z + x.z / q };
+          }
+          const sp = projectPoint(p);
+          return { pt: [sp.x, sp.y], visible: dot(n, sub(camPos, p)) >= 0 };
+        });
+        // runs of one visibility (neighboring runs share their end point)
+        let run = [pts[0]];
+        for (let i = 1; i < pts.length; i++) {
+          if (pts[i].visible !== run[0].visible) { run.push(pts[i]); debugItems.push({ kind: 'tubeLine', pts: run.map(q => q.pt), visible: run[0].visible }); run = [pts[i]]; }
+          else run.push(pts[i]);
+        }
+        if (run.length > 1) debugItems.push({ kind: 'tubeLine', pts: run.map(q => q.pt), visible: run[0].visible });
+      });
+    },
     // A 3+ node mesh (buildHull), by its mesh id `key` and its projected nodes `ps`.
     hull: (key, ps) => cached('h' + key, () => {
       const h = buildHull(ps.map(flat), ps.map(p => p.id));
@@ -544,6 +923,29 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
             it.pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
             ctx.stroke();
           });
+        } else if (it.kind === 'tubeLine') {
+          // a straight cone's shade border in world space (tubeBorderLines), or an arch's curve through its skew-node dots
+          // (archBorderCurves): cyan over a dark underlay, dashed where it faces away
+          ctx.lineCap = 'butt';
+          ctx.setLineDash(it.visible ? [] : [6 * px, 5 * px]);
+          [['#000000', 4], ['#00e5ff', 2]].forEach(([color, w]) => {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = w * px;
+            ctx.beginPath();
+            it.pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
+            ctx.stroke();
+          });
+          ctx.lineCap = 'round';
+        } else if (it.kind === 'dot') {
+          // a straight cone's shade border on a skew node's cross-section (tubeBorderDebug): cyan, hollow where it faces away
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.arc(it.pt[0], it.pt[1], 4.5 * px, 0, TAU);
+          ctx.fillStyle = '#00e5ff';
+          ctx.strokeStyle = '#000000';
+          ctx.lineWidth = 1.5 * px;
+          if (it.visible) ctx.fill();
+          ctx.stroke();
         } else if (it.kind === 'cone') {
           ctx.strokeStyle = ctx.fillStyle = colorOf(it.id);
           ctx.lineWidth = 2 * px;
@@ -568,21 +970,24 @@ export function makeShading({ basis, tol, px, camPos, projectPoint }) {
     // Paints the elements over the fill `path` (already filled in `baseColor(color)`), clipped to it.
     // `atop`: on a group layer that already holds the piece's base fill, composited source-atop instead of clipped to `path`
     // (a clip's antialiased edge on top of the fill's own edge blends the lit tone twice there).
-    paint(ctx, path, color, elements, atop = false) {
+    // `mask`: paints a lit mask instead (opaque where Lit, erased where a later element is Twilight), for the border strokes' tones.
+    paint(ctx, path, color, elements, atop = false, mask = false) {
       ctx.save();
       if (!atop) ctx.clip(path);
-      const list = [...new Set(elements)].filter(Boolean), lit = toneColor(color, LIT);
+      const list = [...new Set(elements)].filter(Boolean), lit = mask ? '#ffffff' : toneColor(color, LIT);
+      const twilight = (g) => { if (mask) g.globalCompositeOperation = 'destination-out'; else g.fillStyle = g.strokeStyle = toneColor(color, TWILIGHT); };
       list.forEach(el => {
         ctx.save();
         el.clips?.forEach(c => ctx.clip(c.path, c.rule));
         if (el.kind === 'face') {
-          ctx.fillStyle = ctx.strokeStyle = toneColor(color, el.tone);
+          if (el.tone === LIT || !mask) ctx.fillStyle = ctx.strokeStyle = mask ? lit : toneColor(color, el.tone);
+          else twilight(ctx);
           ctx.lineWidth = FACE_STROKE_PX * px;
           ctx.lineJoin = 'round';
           ctx.fill(el.footprint);
           ctx.stroke(el.footprint);
         } else {
-          if (el.cover) { ctx.fillStyle = toneColor(color, TWILIGHT); ctx.fill(el.cover); }      // an arch sheet over the ones behind it
+          if (el.cover) { ctx.save(); twilight(ctx); ctx.fill(el.cover); ctx.restore(); }      // an arch sheet over the ones behind it
           ctx.fillStyle = lit;
           if (el.kind === 'sphere') ctx.fill(el.lit.path, el.lit.rule); else ctx.fill(el.lit);
         }

@@ -253,7 +253,14 @@ export function hullProbe(cone, x, hintPsi, caps = true, rounds = 2) {
   if (hintPsi !== undefined && hintPsi !== null) {
     const c = Math.round(hintPsi / (TWO_PI / count)), W = 2;
     for (let i = c - W; i <= c + W; i++) { const v = score(i); if (v > bv) { bv = v; bi = i; } }
-    if (bi === c - W || bi === c + W) bi = -1;     // the maximum may lie beyond the window
+    // the maximum may lie beyond the window: climb on from its edge while the value grows (a quarter turn at most, then the
+    // full scan); the answer moves a few generatrices between Newton steps and frames
+    if (bi === c - W || bi === c + W) {
+      const dir = bi === c + W ? 1 : -1;
+      let k = 0;
+      for (; k < count / 4; k++) { const v = score(bi + dir); if (!(v > bv)) break; bv = v; bi += dir; }
+      if (k >= count / 4) bi = -1;
+    }
   }
   if (bi < 0) {
     bv = -Infinity;

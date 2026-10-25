@@ -2,6 +2,7 @@
 // sort -> batched draw. Terms (joint, joint ring, split cone): see CLAUDE.md.
 import { DESIGN_WIDTH, DESIGN_HEIGHT, debug, focus, strokes, lighting } from './config.js';
 import { makeShading } from './shading.js';
+import { SHADE, TWILIGHT, toneColor } from './light.js';
 import { buildJointCurve, edgeContacts } from './jointCurve.js';
 import { buildJointCurveGeneral, edgeContactsGeneral } from './jointCurveGeneral.js';
 import { projectJointSplit } from './jointSplit.js';
@@ -9,7 +10,7 @@ import { findSplitRing } from './splitRing.js';
 import { buildConeDebugCurves, drawConeDebugCurves } from './coneDebug.js';
 import { drawJointDebug } from './jointDebug.js';
 import { drawShapeDebug } from './shapeDebug.js';
-import { shadowEllipse, vecSub, vecDot, vecCross, vecNormalize, closestPointOnCircle, ellipseRayPoint, ellipsePoint, ellipsoidShape, ellipseCapsule, ellipsePolygon, convexHull, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
+import { shadowEllipse, vecSub, vecDot, vecNormalize, closestPointOnCircle, ellipseRayPoint, ellipsePoint, ellipsoidShape, ellipseCapsule, hullOutline, outlinePolygon, ellipseParam, ellipseArc, mapArc, arcPoint, loopBox, untwistLoop, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from './geometry.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from './camera.js';
 import { nodes, meshes } from './scene.js';
 import { archAt, archSamples, shapeAt, inverse } from './skew.js';
@@ -51,13 +52,14 @@ function strokeColorsOf(primitives) {
   }));
   return new Set([...byColor].filter(([, ids]) => ids.size > 1).map(([color]) => color));
 }
-// Three scratch canvases (stroke, mask, piece group) the size of the main one, kept between frames.
+// Scratch canvases the size of the main one, kept between frames: stroke, mask, piece group, and for the strokes' tones
+// the frame's lit map, the front fill's lit mask and a dilation layer.
 let layerCache = null;
 function scratchLayers(ctx) {
   const { width, height } = ctx.canvas;
   if (!layerCache || layerCache[0].width !== width || layerCache[0].height !== height) {
     const make = () => (typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(width, height) : Object.assign(document.createElement('canvas'), { width, height }));
-    layerCache = [make(), make(), make()];
+    layerCache = [make(), make(), make(), make(), make(), make()];
   }
   return layerCache;
 }
@@ -235,13 +237,17 @@ function alignToFlatEllipses(points, p1, p2, tol) {
   return [...clamped, ...feet];
 }
 
-// The polygon shrunk toward its centroid so its boundary moves in by about `d`
-// (exact for a circle; for a ring's ellipse it moves in by d at the nearest side).
+// The loop shrunk toward its centroid so its boundary moves in by about `d`
+// (exact for a circle; for a ring's ellipse it moves in by d at the nearest side). Its arcs
+// (geometry.js loops) shrink with it. The centroid and the nearest side are taken on its points
+// and its arcs' middles.
 function insetPolygon(poly, d) {
-  const c = poly.reduce((s, p) => ({ x: s.x + p.x / poly.length, y: s.y + p.y / poly.length }), { x: 0, y: 0 });
-  const near = Math.min(...poly.map(p => Math.hypot(p.x - c.x, p.y - c.y)));
+  const probes = poly.flatMap(p => (p.arc ? [p, arcPoint(p.arc, (p.arc.t0 + p.arc.t1) / 2)] : [p]));
+  const c = probes.reduce((s, p) => ({ x: s.x + p.x / probes.length, y: s.y + p.y / probes.length }), { x: 0, y: 0 });
+  const near = Math.min(...probes.map(p => Math.hypot(p.x - c.x, p.y - c.y)));
   const k = Math.max(0.5, 1 - d / (near || 1));
-  return poly.map(p => ({ x: c.x + (p.x - c.x) * k, y: c.y + (p.y - c.y) * k }));
+  const f = (p) => ({ x: c.x + (p.x - c.x) * k, y: c.y + (p.y - c.y) * k }), lin = (v) => ({ x: v.x * k, y: v.y * k });
+  return poly.map(p => (p.arc ? { ...f(p), arc: mapArc(p.arc, f, lin) } : f(p)));
 }
 
 // A linear map of the screen plane that turns an ellipse into the circle of radius b about the
@@ -258,7 +264,8 @@ function ellipseUnitMap(center, e) {
     return { x: center.x + m.xx * dx + m.xy * dy, y: center.y + m.xy * dx + m.yy * dy };
   };
   return {
-    to: apply(T), from: apply(F), radius: e.b,
+    to: apply(T), from: apply(F), radius: e.b, stretch: e.a / e.b,
+    toLin: (v) => ({ x: T.xx * v.x + T.xy * v.y, y: T.xy * v.x + T.yy * v.y }), fromLin: (v) => ({ x: F.xx * v.x + F.xy * v.y, y: F.xy * v.x + F.yy * v.y }),
     // canvas transform for drawing in unit space: x' = F (x - center) + center
     fromMatrix: [F.xx, F.xy, F.xy, F.yy, center.x - (F.xx * center.x + F.xy * center.y), center.y - (F.xy * center.x + F.yy * center.y)],
   };
@@ -287,10 +294,16 @@ function computeJoints(jointNodeIds, owners, projected, camPos, basis, tol) {
     const p = projected[nodeId];
     const farNode = (mesh) => nodes[mesh.nodeIds.find(id => id !== nodeId)];
     const pz = projected[nodeId].radius / nodes[nodeId].radius;
-    const flat = (id) => ({ center: { ...projected[id].center, z: -projected[id].depth * pz }, radius: projected[id].radius });
-    // Squashed nodes (any of the three) take the general ring (jointCurveGeneral.js); round ones
-    // keep the closed form.
-    const general = [nodeId, farNode(meshA).id, farNode(meshB).id].some(id => !projected[id].round);
+    // A far end squashed along its cone's axis (scene.js finalizeShapes) is, in the flat solid, the spheroid about the flat
+    // axis with its own scale (`ra` / `rp`): the cone stays circular (splitRing.js coaxialCone), so the closed form holds.
+    const flat = (id) => {
+      const out = { center: { ...projected[id].center, z: -projected[id].depth * pz }, radius: projected[id].radius }, sh = nodes[id].shape;
+      if (sh.axial) { out.ra = sh.ra * projected[id].scale; out.rp = sh.rp * projected[id].scale; }
+      return out;
+    };
+    // A squashed joint node, or a far end squashed along another axis, takes the general ring (jointCurveGeneral.js);
+    // round joint nodes with round or axial far ends keep the closed form.
+    const general = !projected[nodeId].round || [farNode(meshA).id, farNode(meshB).id].some(id => !projected[id].round && !nodes[id].shape.axial);
     const bodies = general ? [nodeId, farNode(meshA).id, farNode(meshB).id].map(id => flatBody(projected[id], pz)) : null;
     const curve = general ? buildJointCurveGeneral(bodies[0], bodies[1], bodies[2], tol, nodeId) : buildJointCurve(flat(nodeId), flat(farNode(meshA).id), flat(farNode(meshB).id), tol);
     // The ring's plane separates the two cones, so the cone on the camera's side
@@ -312,7 +325,11 @@ function computeJoints(jointNodeIds, owners, projected, camPos, basis, tol) {
       frontArc: usable ? screen(curve.front) : null,
       // A point inside both the ring and the node circle: the touch points' midpoint.
       inner: usable ? { x: (curve.touch[0].p.x + curve.touch[1].p.x) / 2, y: (curve.touch[0].p.y + curve.touch[1].p.y) / 2 } : null,
-      loop: usable ? screen(curve.loop) : null,
+      // the ring on screen with its exact arcs (jointCurve.js screenLoop)
+      loop: usable ? curve.screenLoop : null,
+      // as simple loops: seen nearly edge-on the ring crosses itself on screen, and its two lobes, wound opposite ways, made
+      // the front's fill cancel its own body along the joint (a gap of background at 1.8 in the squashed demo)
+      lobes: usable ? untwistLoop(curve.screenLoop) : null,
       farProjA: projected[farNode(meshA).id], farProjB: projected[farNode(meshB).id],
       curve,
       view: flatView,
@@ -409,14 +426,14 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
   // it also fills the whole ring's interior (CLAUDE.md "Joint ring").
   const underlap = frame.underlap;
   const discRadius = (joint) => Math.max(joint.radius - underlap, 0.5 * joint.radius);
-  // A far end's rim as polygon points, chords within a fraction of a pixel of the exact curve (these feed the polygon booleans).
-  const rimPoints = (c) => ellipsePolygon(nodeEllipse(c), 2.5 * frame.tol);
-  // The polygon with the joint's node disc cut out (subtractDisc): a squashed node is cut in its
-  // unit-circle space and mapped back.
+  // The polygon with the joint's node disc cut out (subtractDisc, its cut an exact arc): a squashed node is cut in its
+  // unit-circle space and mapped back (the polygon's own points as they were, the circle's arcs as arcs of the ellipse
+  // the map turns them into: x' = R diag(stretch, 1) R^T x, so the circle's angle th is the ellipse's th - angle).
   const cutDisc = (poly, joint) => {
     if (!joint.map) return subtractDisc(poly, joint.center, discRadius(joint));
-    const rad = Math.max(joint.map.radius - underlap, 0.5 * joint.map.radius);
-    return subtractDisc(poly.map(joint.map.to), joint.center, rad).map(out => out.map(joint.map.from));
+    const m = joint.map, rad = Math.max(m.radius - underlap, 0.5 * m.radius);
+    const move = (f, lin) => (p) => { const q = f(p); if (p.arc) q.arc = mapArc(p.arc, f, lin); return q; };
+    return subtractDisc(poly.map(move(m.to, m.toLin)), joint.center, rad).map(out => out.map(move(m.from, m.fromLin)));
   };
   // A cone's body where it ends at joints (every cone arriving at a 2-to-2 shared
   // node, split cone or not): `basePoints` are the hull points of the rest of the
@@ -428,15 +445,16 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
   // the ring where the ring leaves the node, the flat rim elsewhere. The cut disc
   // is pulled in by the seam underlap so the body reaches under the disc's
   // antialiased rim (rule 1).
-  const drawAtJoints = (basePoints, joints, c = ctx) => {
+  // `baseEllipses`: whole ellipses (a far end's rim) taking part in the hull as exact arcs.
+  const drawAtJoints = (basePoints, joints, c = ctx, baseEllipses = []) => {
     const points = [...basePoints], fills = [], cutLoops = [], closings = [];
     joints.forEach(joint => {
       const isFront = (joint.frontIsA ? joint.meshA : joint.meshB) === mesh;
-      if (isFront) fills.push(...cutDisc(joint.loop, joint));
+      if (isFront) joint.lobes.forEach(lobe => fills.push(...cutDisc(lobe, joint)));
       // The back cone is cut a little inside the ring, so it reaches under the
       // front cone's antialiased edge along the ring (rule 1); the front cone's
       // fill and outline share the ring's exact edge in one path.
-      cutLoops.push(isFront ? joint.loop : insetPolygon(joint.loop, underlap));
+      joint.lobes.forEach(lobe => cutLoops.push(isFront ? lobe : insetPolygon(lobe, underlap)));
       // The cone's two edges STOP at a known point each: where it touches the ring
       // (the green dot, exact) or, if it doesn't, where it meets the node's circle.
       // Those two stopping points are the only hull points at this end, so each edge
@@ -454,17 +472,43 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
         closings.push({ pair, via: joint.inner });
       } else points.push(...joint.frontArc);
     });
-    let hull = convexHull(points);
+    // The hull as an exact outline (hullOutline: corners, and arcs of the far ends' rims joined by their tangents).
+    let ops = hullOutline([{ pts: points }, ...baseEllipses.map(e => ({ e }))]);
     closings.forEach(({ pair, via }) => {
-      const n = hull.length, i = hull.indexOf(pair[0]), j = hull.indexOf(pair[1]);
+      const n = ops.length, i = ops.findIndex(op => op.p === pair[0]), j = ops.findIndex(op => op.p === pair[1]);
       if (i < 0 || j < 0 || !via) return;
       // The two stops are neighbors on the hull (the chord); put the via point between them.
       const after = (j - i + n) % n === 1 ? i : ((i - j + n) % n === 1 ? j : -1);
-      if (after >= 0) hull = [...hull.slice(0, after + 1), via, ...hull.slice(after + 1)];
+      if (after >= 0) ops = [...ops.slice(0, after + 1), { k: 'p', p: via }, ...ops.slice(after + 1)];
     });
+    // As a polygon for the booleans: an arc is its two ends with the `arc` on the second (drawJointBody), a chord to the
+    // booleans; an arc whose box meets a cut's box (a far end close to the joint) is chords within the tolerance instead.
+    const cutBoxes = joints.flatMap(joint => {
+      const r = joint.map ? joint.map.radius * joint.map.stretch : joint.radius;
+      return [{ x0: joint.center.x - r, y0: joint.center.y - r, x1: joint.center.x + r, y1: joint.center.y + r }, loopBox(joint.loop)];
+    });
+    const hull = [];
+    const add = (p) => {
+      const last = hull[hull.length - 1];
+      if (last && Math.hypot(p.x - last.x, p.y - last.y) < 1e-9) { if (p.arc) hull[hull.length - 1] = { x: last.x, y: last.y, arc: p.arc }; return; }
+      hull.push(p);
+    };
+    ops.forEach(op => {
+      if (op.k === 'p') { add(op.p); return; }
+      const e = op.e, box = { x0: e.center.x - e.a, y0: e.center.y - e.a, x1: e.center.x + e.a, y1: e.center.y + e.a };
+      if (cutBoxes.some(b => b.x0 <= box.x1 && box.x0 <= b.x1 && b.y0 <= box.y1 && box.y0 <= b.y1)) { outlinePolygon([op], 2.5 * frame.tol).forEach(add); return; }
+      const start = ellipseParam(e, op.from), end = op.from - op.to >= 2 * Math.PI - 1e-9 ? start - 2 * Math.PI : ellipseParam(e, op.to);
+      add(ellipsePoint(e, op.from));
+      add({ ...ellipsePoint(e, op.to), arc: ellipseArc(e.center.x, e.center.y, e.a, e.b, e.angle, start, end, true) });
+    });
+    if (hull.length > 1) {
+      const p = hull[hull.length - 1], q = hull[0];
+      if (Math.hypot(p.x - q.x, p.y - q.y) < 1e-9) { hull.pop(); if (p.arc) hull[0] = { x: q.x, y: q.y, arc: p.arc }; }
+    }
+    // the ring loops first, then the discs: a disc's cut is an exact arc, which the polygon booleans would take for a chord
     let outline = [hull];
-    joints.forEach(joint => { outline = outline.flatMap(poly => cutDisc(poly, joint)); });
     cutLoops.forEach(loop => { outline = outline.flatMap(poly => subtractPolygon(poly, loop)); });
+    joints.forEach(joint => { outline = outline.flatMap(poly => cutDisc(poly, joint)); });
     drawJointBody(c, [...outline, ...fills], color);
   };
   const draw = (c = ctx) => {
@@ -484,12 +528,12 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
       return;
     }
     if (touchesJoint) {
-      const joints = [], basePoints = [];
+      const joints = [], ellipses = [];
       [a, b].forEach(end => {
         const joint = frame.joints[end.id];
-        if (joint && joint.frontArc) joints.push(joint); else basePoints.push(...rimPoints(end));
+        if (joint && joint.frontArc) joints.push(joint); else ellipses.push(nodeEllipse(end));
       });
-      drawAtJoints(basePoints, joints, c);
+      drawAtJoints([], joints, c, ellipses);
       return;
     }
   };
@@ -543,9 +587,10 @@ function buildPairPrimitive(frame, mesh, a, b, screenCentroid, split) {
   return prim;
 }
 
-// A skewed mesh (CLAUDE.md "Skewed meshes"): the union of capsules between consecutive screen circles along the arch
-// through its skew node, as two traced primitives split at the skew node (A..S and S..B, sharing the apex circle),
-// each with its own depth key (the mean depth of its samples), so another body can pass between the halves.
+// A skewed mesh (CLAUDE.md "Skewed meshes"): the arch's visible surface in its exact rows (shading.js buildArch), as two traced
+// primitives split at the skew node (A..S and S..B, reaching a little into each other), each with its own depth key (the mean
+// depth of its screen circles), so another body can pass between the halves.
+const archSampleCache = new Map();     // mesh id -> { stamp (its nodes), map: t -> the shading's world sample }
 function buildSkewPrimitives(frame, mesh) {
   const { projectPoint } = frame;
   const [A, B] = mesh.nodeIds.map(id => nodes[id]), S = nodes[mesh.skew];
@@ -566,20 +611,33 @@ function buildSkewPrimitives(frame, mesh) {
   };
   const samples = archSamples(project, 5 * frame.tol);
   const apex = samples.findIndex(s => s.t === 0.5);
-  const half = (list) => {
-    const tracePath = (c = frame.ctx) => {
-      if (oblate) {
-        traceEllipse(c, list[0].c.e);
-        for (let i = 1; i < list.length; i++) traceEllipseCapsule(c, list[i - 1].c.e, list[i].c.e);
-        return;
-      }
-      traceCircle(c, list[0].c, list[0].c.r);
-      for (let i = 1; i < list.length; i++) {
-        const p = list[i - 1].c, q = list[i].c;
-        if (Math.hypot(p.x - q.x, p.y - q.y) <= Math.abs(p.r - q.r)) traceCircle(c, p.r >= q.r ? p : q, Math.max(p.r, q.r));
-        else traceCapsule(c, p, p.r, q, q.r);
-      }
-    };
+  // The body's world samples for its outline and shading (shading.js buildArch, which places its own rows by the view): the center, the
+  // form of x^T K x = 1 (shape.Q is S^2), the tangent and, on a round arch, the radius' tilt sinT (the tube mode's surface, the same as the
+  // Debug view's curves). Camera-independent, so they are kept per mesh while its nodes stay put.
+  const h = 1e-4;
+  const stamp = [A, B, S].map(nd => [nd.center.x, nd.center.y, nd.center.z, nd.radius, ...nd.shape.Q].join(',')).join(';');
+  let store = archSampleCache.get(mesh.id);
+  if (!store || store.stamp !== stamp || store.map.size > 4096) archSampleCache.set(mesh.id, store = { stamp, map: new Map() });
+  const sampleAt = (t) => {
+    let s = store.map.get(t);
+    if (s) return s;
+    const w = at(t), r2 = 1 / (w.radius * w.radius), lo = at(Math.max(0, t - h)), hi = at(Math.min(1, t + h));
+    const dv = { x: hi.center.x - lo.center.x, y: hi.center.y - lo.center.y, z: hi.center.z - lo.center.z }, D = Math.hypot(dv.x, dv.y, dv.z) || 1;
+    s = { tv: t, c: w.center, Q: oblate ? inverse(qAt(t)) : [r2, 0, 0, 0, r2, 0, 0, 0, r2], t: { x: dv.x / D, y: dv.y / D, z: dv.z / D }, sinT: oblate ? 0 : (lo.radius - hi.radius) / D };
+    store.map.set(t, s);
+    return s;
+  };
+  // The cuts, as values of t (shading.js buildArch `cuts`): `draw`, where the halves' fills end: they reach DRAW_BAND past the apex into
+  // each other (same color), so where the apex section is a line (a flat ribbon) they overlap in a strip instead of only touching along an
+  // edge, which lets the background through (rule 1); `lo` / `hi`, where the shading's sheets are cut, SHARED_BAND each way (its 'both'
+  // band: the half drawn first paints its own sheets and that band, see below).
+  const DRAW_BAND = 1 / 32, SHARED_BAND = 1 / 16;
+  const cuts = { apex: 0.5, lo: 0.5 - SHARED_BAND, hi: 0.5 + SHARED_BAND, draw: [0.5 - DRAW_BAND, 0.5 + DRAW_BAND] };
+  const all = () => frame.archGeom.arch(mesh.id, sampleAt, cuts);
+  // A half: the visible strips of the arch's exact rows from t0 to t1 (shading.js `outline`), the same surface as its shading. Its box
+  // and depth key come from the chain of screen circles `list` (archSamples).
+  const half = (list, t0, t1) => {
+    const tracePath = (c = frame.ctx) => all().outline(t0, t1)(c);
     const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
     let depth = 0;
     list.forEach(({ c }) => {
@@ -589,33 +647,43 @@ function buildSkewPrimitives(frame, mesh) {
     });
     return { cluster: frame.clusterOf[mesh.id], depth, binDepth: depth, slice: null, box, meshId: mesh.id, color: mesh.color, tracePath };
   };
-  // The halves reach one sample past the apex into each other (same color), so where the apex section is a line (a flat ribbon)
-  // they overlap in a strip instead of only touching along an edge, which lets the background through (rule 1).
-  const first = half(samples.slice(0, Math.min(apex + 2, samples.length))), second = half(samples.slice(Math.max(apex - 1, 0)));
+  // (the circles reaching past each half's end, for the boxes)
+  const upTo = (t) => { const k = samples.findIndex(s => s.t >= t); return k < 0 ? samples.length : k + 1; };
+  const from = (t) => { let k = samples.length - 1; while (k > 0 && samples[k].t > t) k--; return k; };
+  const first = half(samples.slice(0, Math.max(upTo(cuts.draw[1]), Math.min(apex + 2, samples.length))), 0, cuts.draw[1]);
+  const second = half(samples.slice(Math.min(from(cuts.draw[0]), Math.max(apex - 1, 0))), cuts.draw[0], 1);
   // Border strokes between the halves (CLAUDE.md "Border strokes"): each half is its own stroke owner (and its own fill), so
   // wherever one half is drawn over the other the nearer one gets its edge stroked, growing and shrinking with the overlap.
   // The strip where the halves reach into each other around the apex is not a border: both strokes leave it out
-  // (`strokeCut`: the body of the samples apex-1 .. apex+1, traced on demand).
-  const strip = half(samples.slice(Math.max(apex - 1, 0), Math.min(apex + 2, samples.length)));
+  // (`strokeCut`: the body from draw[0] to draw[1], traced on demand).
+  const strip = half([], cuts.draw[0], cuts.draw[1]);
   const strokeCut = { trace: strip.tracePath };
   first.owners = [`${mesh.id}.0`]; first.strokeCut = strokeCut;
   second.owners = [`${mesh.id}.1`]; second.strokeCut = strokeCut;
-  // The light engine: the arch's lit part (shading.js buildArch), in world space, over each half's own fill, cut into sheets at the apex
-  // (and at folds) and painted back to front. The half drawn LATER paints every sheet: its round end reaches well past the apex, and
-  // painting only its own part left that disc in the base tone (a moon-phase look at the skew node). The half drawn first paints only
-  // its own sheets: the other half's sheets are the 3D surface, not its drawn outline, and where they reach past that outline they
-  // stayed on the earlier half (shading past the front half's edge and its border stroke, a band of base tone along the apex).
-  // Its own disc past the apex is the later half's circle at that sample, so the later half covers it.
+  // The light engine: the arch's lit part (shading.js buildArch), in world space, over each half's own fill, cut into sheets at lo and hi
+  // (and at folds) and painted back to front. The half drawn LATER paints every sheet: painting only its own part left its round end past
+  // the apex in the base tone (a moon-phase look at the skew node). The half drawn first paints only its own sheets and the band where
+  // the two overlap: the other half's sheets past that are the other fill's, and where they reached past this half's outline they stayed
+  // on the earlier half.
   if (frame.shading) {
-    // The shade border is a smooth 3D curve: its own uniform samples of the arch (the drawn chain is only as fine as its outline needs).
-    const N = 64, shadeTs = Array.from({ length: N + 1 }, (_, i) => i / N);
-    let worldSamples = null;
-    const samplesOf = () => (worldSamples ||= shadeTs.map((t) => {
-      const w = at(t), r2 = 1 / (w.radius * w.radius);
-      return { c: w.center, Q: oblate ? inverse(qAt(t)) : [r2, 0, 0, 0, r2, 0, 0, 0, r2] };      // the form of x^T K x = 1 (shape.Q is S^2)
-    }));
-    const all = () => frame.shading.arch(mesh.id, samplesOf(), N / 2);
-    const own = (h) => () => all().filter(e => e.half === undefined || e.half === h);
+    // Debug: the skew node's cross-section taken as the cross-section of a straight cone along the arch's tangent there, in world
+    // space: where that cone's shade borders would be (shading.js tubeBorderDebug).
+    if (debug.on) {
+      const a = at(0.5 - h), b = at(0.5 + h);
+      const s0 = sampleAt(0.5);
+      frame.shading.tubeBorderDebug(s0.c, s0.Q, { x: b.center.x - a.center.x, y: b.center.y - a.center.y, z: b.center.z - a.center.z },
+        oblate ? null : { cA: a.center, rA: a.radius, cB: b.center, rB: b.radius });
+      // and the two curves along the arch through those dots, end node to end node (shading.js archBorderCurves)
+      const T = 128, rows = Array.from({ length: T + 1 }, (_, i) => {
+        const t = i / T, w = at(t), lo = at(Math.max(0, t - h)), hi = at(Math.min(1, t + h));
+        const dv = { x: hi.center.x - lo.center.x, y: hi.center.y - lo.center.y, z: hi.center.z - lo.center.z }, D = Math.hypot(dv.x, dv.y, dv.z) || 1;
+        const r2 = 1 / (w.radius * w.radius);
+        return { c: w.center, t: { x: dv.x / D, y: dv.y / D, z: dv.z / D }, r: w.radius, sinT: (lo.radius - hi.radius) / D, K: oblate ? inverse(qAt(t)) : [r2, 0, 0, 0, r2, 0, 0, 0, r2] };
+      });
+      frame.shading.archBorderCurves(rows, T / 2, !oblate);
+    }
+    // the half drawn first: its own sheets and the band where the two fills overlap
+    const own = (h) => () => all().filter(e => e.half === undefined || e.half === h || e.half === 'both');
     // (draw order between the halves: the larger key first; on a tie the first half, the sort being stable)
     if (first.depth >= second.depth) { first.shade = own(0); second.shade = all; } else { first.shade = all; second.shade = own(1); }
   }
@@ -677,7 +745,8 @@ function buildJointPrimitive(frame, nodeId) {
   const { map } = joint, farCenter = projected[(dominantA ? joint.farA : joint.farB).id].center;
   const radius = map ? map.radius : joint.radius;
   const view = map ? { viewDirAt: joint.view.viewDirAt, projectPoint: (w) => map.to(joint.view.projectPoint(w)) } : joint.view;
-  const split = projectJointSplit(joint.curve, joint.center, radius, view, map ? map.to(farCenter) : farCenter);
+  const loop2D = joint.loop && (map ? joint.loop.map(p => { const q = map.to(p); if (p.arc) q.arc = mapArc(p.arc, map.to, map.toLin); return q; }) : joint.loop);
+  const split = projectJointSplit(joint.curve, joint.center, radius, view, map ? map.to(farCenter) : farCenter, loop2D);
   const drawDisc = (c) => (split
     ? drawJointSplitFromCurve(c, joint.center, radius, split, dominantColor, crescentColor, frame.pxPerUnit)
     : fillCircle(c, joint.center, radius, dominantColor));
@@ -718,7 +787,9 @@ function orderByCluster(entries) {
   for (let i = 0; i < pieces.length; i++) {
     for (let j = i + 1; j < pieces.length; j++) {
       const P = pieces[i], Q = pieces[j];
-      if (P.cluster === undefined || P.cluster !== Q.cluster || P.depth === Q.depth || !piecesOverlap(P, Q)) continue;
+      // Pieces of one mesh are left to the strata: chaining them whole (a hull's pieces all meet at its nodes) moved a piece's
+      // far slabs after another mesh's body that is between them in depth (a cyan triangle node over the green arch at 2.374).
+      if (P.cluster === undefined || P.cluster !== Q.cluster || P.depth === Q.depth || (P.meshId !== undefined && P.meshId === Q.meshId) || !piecesOverlap(P, Q)) continue;
       const [first, second] = P.depth > Q.depth ? [P, Q] : [Q, P], fl = byPiece.get(first), sl = byPiece.get(second);
       edge(fl[fl.length - 1], sl[0]);
     }
@@ -758,7 +829,59 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
   const recorded = (p) => inked(p) || !!(shading && p.shade);
   const painted = [];            // every fill of an ink color so far: { owner, color, path, box, strip }
   const base = (inkColors.size || shading) ? ctx.getTransform() : null;
-  const strokeUnder = (owner, color, path, box, strip, cut) => {
+  // The tones of the stroked colors' fills so far (`litMap`: opaque where Lit), for the strokes' tones.
+  if (inkColors.size && shading) { const lm = scratchLayers(ctx)[3], g = lm.getContext('2d'); g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = 'source-over'; g.clearRect(0, 0, lm.width, lm.height); }
+  const litMask = (g, path, color, els) => {
+    if (els) shading.paint(g, path, color, els, false, true);
+    else { g.fillStyle = '#ffffff'; g.fill(path); }
+  };
+  const updateLitMap = (path, color, strip, els) => {
+    if (!shading) return;
+    const g = scratchLayers(ctx)[3].getContext('2d');
+    g.save();
+    g.setTransform(base);
+    if (strip) g.clip(strip);
+    g.globalCompositeOperation = 'destination-out';
+    g.fill(path);
+    g.globalCompositeOperation = 'source-over';
+    litMask(g, path, color, els);
+    g.restore();
+  };
+  // The stroke's color is one tone darker than the front fill's tone at its edge (Lit -> Twilight, Twilight -> Shade), and it is
+  // drawn only where the mesh behind has that same tone: the front's lit and twilight parts are each spread out by the stroke's
+  // width (offset copies) to reach the stroke, which lies outside the fill, and matched against the lit map there.
+  const DILATE = [[0, 0], ...[1, 0.5].flatMap(k => Array.from({ length: 8 }, (_, i) => [k * Math.cos(i * Math.PI / 4), k * Math.sin(i * Math.PI / 4)]))];
+  const toneStroke = (sl, ml, color, path, els, x0, y0, w, h) => {
+    const blit = (src) => { ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(src, x0, y0, w, h, x0, y0, w, h); ctx.restore(); };
+    const s = sl.getContext('2d');
+    if (!shading) {
+      s.globalCompositeOperation = 'source-in';
+      s.setTransform(1, 0, 0, 1, 0, 0);
+      s.fillStyle = toneColor(color, TWILIGHT);
+      s.fillRect(x0, y0, w, h);
+      blit(sl);
+      return;
+    }
+    const [, , , lm, fl, dl] = scratchLayers(ctx), m = ml.getContext('2d'), f = fl.getContext('2d'), d = dl.getContext('2d');
+    [m, f, d].forEach(g => { g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = 'source-over'; g.clearRect(x0, y0, w, h); });
+    f.save(); f.setTransform(base); litMask(f, path, color, els); f.restore();
+    m.setTransform(base); m.fillStyle = '#ffffff'; m.fill(path);
+    m.setTransform(1, 0, 0, 1, 0, 0); m.globalCompositeOperation = 'destination-out'; m.drawImage(fl, x0, y0, w, h, x0, y0, w, h);
+    [[fl, 'destination-in', TWILIGHT], [ml, 'destination-out', SHADE]].forEach(([src, back, tone]) => {
+      d.globalCompositeOperation = 'source-over';
+      d.clearRect(x0, y0, w, h);
+      DILATE.forEach(([dx, dy]) => d.drawImage(src, x0, y0, w, h, x0 + dx * strokes.px, y0 + dy * strokes.px, w, h));
+      d.globalCompositeOperation = back;
+      d.drawImage(lm, x0, y0, w, h, x0, y0, w, h);
+      d.globalCompositeOperation = 'destination-in';
+      d.drawImage(sl, x0, y0, w, h, x0, y0, w, h);
+      d.globalCompositeOperation = 'source-in';
+      d.fillStyle = toneColor(color, tone);
+      d.fillRect(x0, y0, w, h);
+      blit(dl);
+    });
+  };
+  const strokeUnder = (owner, color, path, box, strip, cut, els) => {
     const others = painted.filter(q => q.owner !== owner && q.color === color && boxesMeet(q.box, box));
     if (!others.length) return;
     const [sl, ml] = scratchLayers(ctx),s = sl.getContext('2d'), m = ml.getContext('2d');
@@ -794,10 +917,7 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
       s.fill(cut.path);
       s.stroke(cut.path);
     }
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.drawImage(sl, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
-    ctx.restore();
+    toneStroke(sl, ml, color, path, els, x0, y0, x1 - x0, y1 - y0);
   };
   // Replays recorded canvas calls onto `T` (the main canvas, or a piece's group layer); before each fill, the stroke under it
   // (always on the main canvas), and after it the fill is remembered.
@@ -811,11 +931,12 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
         // `elements` may be per fill ({ fills: [...] }, a joint disc's two regions), like `owners`.
         const els = elements && elements.fills ? elements.fills[Math.min(fillIdx, elements.fills.length - 1)] : elements;
         path.addPath(sub, mat);
-        if (owner !== undefined && inkColors.has(color) && meshOf(owner).color === color) {
-          strokeUnder(owner, color, path, box, strip, cut);
-          painted.push({ owner, color, path, box, strip });
-        }
         const shaded = els && els.length && !stack.length;
+        if (owner !== undefined && inkColors.has(color) && meshOf(owner).color === color) {
+          strokeUnder(owner, color, path, box, strip, cut, shaded ? els : null);
+          painted.push({ owner, color, path, box, strip });
+          updateLitMap(path, color, strip, shaded ? els : null);
+        }
         if (shaded && T === ctx && els.every(e => e?.kind === 'lit')) {
           // A skewed arch: base and lit part are built on a transparent layer (the lit part source-atop, so it takes the fill's own
           // antialiased alpha) and composited once. Painted directly, the base tone and the lit tone each blend at the fill's edge and
@@ -1018,7 +1139,10 @@ export function render(ctx, canvas, { darkMode }) {
     if (s) (splitFars[s.splitNodeId] ||= []).push(projected[m.nodeIds.find(id => id !== s.splitNodeId)]);
   });
   frame.splitFarsOf = (id) => splitFars[id] || null;
-  if (lighting.on && typeof Path2D !== 'undefined') frame.shading = makeShading({ basis, tol: frame.tol, px: 1 / pxPerUnit, camPos, projectPoint: frame.projectPoint });
+  const shadingOpts = { basis, tol: frame.tol, px: 1 / pxPerUnit, camPos, projectPoint: frame.projectPoint };
+  if (lighting.on && typeof Path2D !== 'undefined') frame.shading = makeShading(shadingOpts);
+  // the skewed arches' outlines come from their shading's rows (buildSkewPrimitives); with the light off, from an instance without light
+  frame.archGeom = frame.shading || makeShading({ ...shadingOpts, lit: false });
 
   const primitives = [];
   // The focus view draws only some meshes; everything else is still computed with all of them.
@@ -1048,6 +1172,12 @@ export function render(ctx, canvas, { darkMode }) {
     jointPrims[key].depth = Math.min(jointPrims[key].depth, ...bodies.map(b => b.prim.depth - 0.0001));
   });
   primitives.push(...frame.extraPrimitives);
+  // Debug: the straight cones' shade borders in world space (shading.js tubeBorderLines), round 2-node meshes only.
+  if (debug.on && frame.shading) Object.values(meshes).forEach(mesh => {
+    if (!isShown(mesh) || mesh.skew || mesh.nodeIds.length !== 2) return;
+    const [A, B] = mesh.nodeIds.map(id => nodes[id]);
+    if (A.shape.isSphere && B.shape.isSphere) frame.shading.tubeBorderLines(A.center, A.radius, B.center, B.radius);
+  });
 
   drawPrimitives(ctx, primitives, 2 * frame.underlap, pxPerUnit, frame.shading);
 
@@ -1059,8 +1189,8 @@ export function render(ctx, canvas, { darkMode }) {
   if (debug.on && debug.cone && !focus.on) {
     Object.values(meshes).forEach(mesh => {
       const split = splitOf[mesh.id];
-      // (the curves are the sphere closed forms: not drawn when a node of the split is squashed)
-      const squashed = [...mesh.nodeIds, ...(split ? split.hostMesh.nodeIds : [])].some(id => !nodes[id].shape.isSphere);
+      // (the curves are the closed forms, with a round or axial far end: not drawn for a free-axis squashed node)
+      const squashed = [...mesh.nodeIds, ...(split ? split.hostMesh.nodeIds : [])].some(id => !nodes[id].shape.isSphere && !nodes[id].shape.axial);
       if (split && !squashed) drawConeDebugCurves(ctx, buildConeDebugCurves(split, mesh, split.hostMesh, camPos, projectPoint));
     });
   }

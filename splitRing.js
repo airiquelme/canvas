@@ -24,6 +24,42 @@ export function tangentCone(shared, far, frame) {
   };
 }
 
+// The semi-axes of a cone end along the cone's axis and across it: a sphere's radius both ways, an axial spheroid's
+// (scene.js finalizeShapes: squashed along the axis to its partner) ra and rp. A body may give its own `ra` / `rp` (the
+// joint's flat solid, render.js computeJoints).
+const endAxes = (n) => (n.ra !== undefined ? [n.ra, n.rp] : n.shape && n.shape.axial ? [n.shape.ra, n.shape.rp] : [n.radius, n.radius]);
+
+// The cone between two bodies of revolution about the axis between their centers (spheres, or spheroids squashed
+// along it), in tangentCone's terms. Every meridian plane shows the same two axis-aligned ellipses, so the hull is a
+// circular cone and its normal n = cosT r + sinT d is where their supports agree:
+//   sqrt(raN^2 s^2 + rpN^2 c^2) = D s + sqrt(raF^2 s^2 + rpF^2 c^2)        (s = sinT, c = cosT, D the distance)
+// Squared twice it is a quadratic in x = s^2 (closed form); the root that satisfies the equation itself is the outer
+// tangent. Each end touches the cone along the circle at axial offset ra^2 s / h, radius rp^2 c / h (its support point,
+// h = its support). Two spheres give tangentCone's numbers exactly.
+export function coaxialCone(shared, far, frame) {
+  const [raN, rpN] = endAxes(shared), [raF, rpF] = endAxes(far);
+  if (raN === rpN && raF === rpF) return tangentCone(shared, far, frame);
+  const D = frame.len, aN = raN * raN, bN = rpN * rpN, aF = raF * raF, bF = rpF * rpF;
+  // A^2 = bN + (aN - bN) x, B^2 = bF + (aF - bF) x; 4 A^2 B^2 = (A^2 + B^2 - D^2 x)^2
+  const p1 = aN - bN, q1 = aF - bF, m = p1 + q1 - D * D, c0 = bN + bF;
+  const qa = m * m - 4 * p1 * q1, qb = 2 * m * c0 - 4 * (bN * q1 + bF * p1), qc = c0 * c0 - 4 * bN * bF;
+  const xs = Math.abs(qa) < 1e-12 * (Math.abs(qb) + Math.abs(qc)) ? [-qc / qb] : (() => {
+    const disc = qb * qb - 4 * qa * qc;
+    if (disc < 0) return [];
+    const r = Math.sqrt(disc);
+    return [(-qb + r) / (2 * qa), (-qb - r) / (2 * qa)];
+  })();
+  const hN = (sn, cs) => Math.sqrt(aN * sn * sn + bN * cs * cs), hF = (sn, cs) => Math.sqrt(aF * sn * sn + bF * cs * cs);
+  let best = null;
+  xs.filter(x => x >= 0 && x < 1).forEach(x => [Math.sqrt(x), -Math.sqrt(x)].forEach(sinT => {
+    const cosT = Math.sqrt(1 - sinT * sinT), err = Math.abs(hN(sinT, cosT) - D * sinT - hF(sinT, cosT));
+    if (!best || err < best.err) best = { sinT, cosT, err };
+  }));
+  if (!best) return tangentCone({ radius: rpN }, { radius: rpF }, frame);
+  const { sinT, cosT } = best, h0 = hN(sinT, cosT), h1 = hF(sinT, cosT);
+  return { sinT, cosT, sA: aN * sinT / h0, sB: D + aF * sinT / h1, radA: bN * cosT / h0, slope: -sinT / cosT };
+}
+
 // The cone surface at axial distance s and angle a, with its outward normal.
 export function coneSurface(shared, frame, cone, a) {
   const r = frame.radial(a);
@@ -108,9 +144,10 @@ export function findSplitRing(shared, far, hostMesh) {
   const hit = ringCache.get(id);
   if (hit && hit.snap.length === snap.length && hit.snap.every((v, i) => v === snap[i])) return hit.ring;
   const hostNodes = hostMesh.nodeIds.map(nid => nodes[nid]);
-  // Any squashed node among the cone's ends and the host: the uniform closed form (all the same shape) or the
-  // general numeric ring (below); round everywhere: the closed forms of the sphere cone.
-  const general = [shared, far, ...hostNodes].some(n => !n.shape.isSphere);
+  // A round shared node and host with a round or axial far end (scene.js finalizeShapes: the cone is circular,
+  // coaxialCone): the closed forms of the sphere cone. Any other squashed node: the uniform closed form (all the same
+  // shape) or the general numeric ring (below), kept for free-axis shapes.
+  const general = [shared, ...hostNodes].some(n => !n.shape.isSphere) || !(far.shape.isSphere || far.shape.axial);
   const ring = (general && (findUniformSplitRing(shared, far, hostNodes) || findGeneralSplitRing(shared, far, hostNodes))) || sphereSplitRing(shared, far, hostNodes);
   ringCache.set(id, { snap, ring });
   return ring;
@@ -119,7 +156,7 @@ export function findSplitRing(shared, far, hostMesh) {
 // The split ring of a cone of spheres (the nodes are { id, center, radius }, the host's among them): closed forms.
 export function sphereSplitRing(shared, far, hostNodes) {
   const frame = coneFrame(shared, far);
-  const cone = tangentCone(shared, far, frame);
+  const cone = coaxialCone(shared, far, frame);
   const { s, touch } = firstContact(shared, hostNodes, frame, cone);
   return {
     s, frame, cone, dir: frame.dir,
@@ -278,7 +315,7 @@ export function findLastContact(shared, far, hostMesh) {
 
 function computeLastContact(shared, far, hostMesh) {
   const frame = coneFrame(shared, far);
-  const cone = tangentCone(shared, far, frame);
+  const cone = coaxialCone(shared, far, frame);
   const hostSdf = buildHostSdf(hostMesh, shared.id);
   const step = (cone.sB - cone.sA) / SLIDE_STEPS;
 

@@ -15,13 +15,15 @@
 //    cuts N, around the exposed back (an ellipse on N; computed on the unit sphere Sinv (x - c)).
 import { vecSub, vecDot, vecCross, vecNormalize, supportH, supportPoint, mat3Mul } from './geometry.js';
 import { buildHullCone, hullProbe, coneNormal } from './hullCone.js';
+import { screenLoopOf } from './jointCurve.js';
 
 const TWO_PI = Math.PI * 2;
 const mod2pi = (a) => ((a % TWO_PI) + TWO_PI) % TWO_PI;
 const MIN_STEPS = 8, ON_SPHERE_EPS = 0.002;
 // Exact ring points (each a Newton solve) before the checks; the rest of the front is a Hermite spline through
-// them with the exact tangent n_A x n_B at every node.
-const RING_NODES = 12;
+// them with the exact tangent n_A x n_B at every node. (The checks add a node wherever the spline is off, so fewer
+// to start with means fewer solves: 12 took 23 per joint, 8 takes 18, the ring within 0.02 px of it.)
+const RING_NODES = 8;
 const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
 const scale = (a, k) => ({ x: a.x * k, y: a.y * k, z: a.z * k });
 const len = (a) => Math.hypot(a.x, a.y, a.z);
@@ -55,10 +57,12 @@ function crossHull(other, pN, d, hint) {
   const newton = (caps) => {
     const at = (t, psi, rounds = 1) => hullProbe(other, x(t), psi, caps, rounds);
     let t = 1, probe = null;
-    if (hint) {
-      t = Math.min(1, hint.t + 0.1);
+    // (just right of the hint's root first: from there Newton needs a step or two; then further right, then the far end)
+    if (hint) for (const off of [0.02, 0.1]) {
+      t = Math.min(1, hint.t + off);
       probe = at(t, hint.psi);
-      if (!(probe.value > 0)) { t = 1; probe = null; }
+      if (probe.value > 0) break;
+      t = 1; probe = null;
     }
     if (!probe) { probe = at(t, hint && hint.psi); if (!(probe.value > 0)) return null; }
     for (let it = 0; it < 40; it++) {
@@ -272,17 +276,20 @@ function computeGeneral(N, FA, FB, tol, warmIn) {
     if (len(pl) > 1e-9) plane = vecNormalize(pl);
   }
   const backInfo = bisectBackArc(geo, touch, plane, tol, front.length ? null : 'half');
-  if (!front.length) front = backInfo.otherHalf;
+  let frontArc = null;
+  if (!front.length) { front = backInfo.otherHalf; frontArc = backInfo.otherArc; }
   const frontStartsAtPlus = len(vecSub(front[0].p, touch[0].p)) < 1e-9;
   const backBack = frontStartsAtPlus ? backInfo.back.slice().reverse() : backInfo.back;
   const loop = [...front, ...backBack.slice(1)];
+  // on screen: the front's chords (the crease of two hulls is no conic), the back's exact arc
+  const ba = backInfo.backArc, screenLoop = screenLoopOf(front, frontArc, frontStartsAtPlus ? { ...ba, t0: ba.t1, t1: ba.t0 } : ba);
   // The ring's arcs in A's and B's azimuths, for the edge contacts.
   const mid = uniform[Math.floor(uniform.length / 2)];
   const ringRange = mid ? {
     A: { a: azimuth(coneA, touchN[0]), b: azimuth(coneA, touchN[1]), m: azimuth(coneA, mid.n) },
     B: { a: azimuth(coneB, touchN[0]), b: azimuth(coneB, touchN[1]), m: azimuth(coneB, mid.n2) },
   } : null;
-  return { hasTouch: true, touch, front, back: backInfo.back, loop, plane: backInfo.plane, ringRange, general: geo, exact: uniform, warm };
+  return { hasTouch: true, touch, front, back: backInfo.back, loop, screenLoop, plane: backInfo.plane, ringRange, general: geo, exact: uniform, warm };
 }
 
 // The plane through the touch points and the back, as a circle on N: returns { back, plane,
@@ -320,12 +327,17 @@ function bisectBackArc(geo, touch, planeIn, tol, wantOther) {
   // The radius of the circle in the world is of the order of N's size: use the largest semi-axis.
   const rWorld = Math.max(...N.shape.axes) * circle.rho;
   const back = [touch[0], ...arcPts(phi[0], phiEnd, arcSteps(phiEnd - phi[0], rWorld, tol)).slice(1, -1), touch[1]];
-  let otherHalf = null;
+  // The same circle on screen (viewed along z): N's center + S y, so an ellipse with conjugate semi-diameters rho S e1 and
+  // rho S e2, its parameter phi.
+  const c0 = add(N.center, mat3Mul(N.shape.S, scale(circle.mh, circle.e))), Se1 = mat3Mul(N.shape.S, e1), Se2 = mat3Mul(N.shape.S, e2);
+  const ell = { c: { x: c0.x, y: c0.y }, U: { x: circle.rho * Se1.x, y: circle.rho * Se1.y }, V: { x: circle.rho * Se2.x, y: circle.rho * Se2.y } };
+  let otherHalf = null, otherArc = null;
   if (wantOther) {
     const other = phiEnd > phi[0] ? phiEnd - TWO_PI : phiEnd + TWO_PI;
     otherHalf = [touch[0], ...arcPts(phi[0], other, arcSteps(other - phi[0], rWorld, tol)).slice(1, -1), touch[1]];
+    otherArc = { ...ell, t0: phi[0], t1: other };
   }
-  return { back, plane, otherHalf };
+  return { back, plane, otherHalf, backArc: { ...ell, t0: phi[0], t1: phiEnd }, otherArc };
 }
 
 // The plane { plane . x = d } cut with the ellipsoid N, on the unit sphere y = Sinv (x - c):

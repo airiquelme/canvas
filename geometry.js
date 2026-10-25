@@ -376,7 +376,9 @@ export function ellipseTangentAngles(e1, e2) {
   cand.forEach(th0 => {
     let th = th0;
     for (let it = 0; it < 6; it++) {
-      const h = 1e-6, g0 = g(th), g1 = (g(th + h) - g(th - h)) / (2 * h);
+      const h = 1e-6, g0 = g(th);
+      if (Math.abs(g0) <= 1e-13 * scaleG) break;      // converged
+      const g1 = (g(th + h) - g(th - h)) / (2 * h);
       if (Math.abs(g1) < 1e-14) break;
       const nt = th - g0 / g1;
       if (!Number.isFinite(nt) || Math.abs(nt - th) > 0.05) break;
@@ -606,212 +608,429 @@ export function pointInPolygon(p, poly) {
   return inside;
 }
 
-// A polygon's edges with their bounding boxes, for quick rejection in the crossing tests.
-function edgeIndex(poly) {
-  const n = poly.length, box = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity }, e = new Float64Array(n * 4);
-  for (let k = 0; k < n; k++) {
-    const c = poly[k], d = poly[(k + 1) % n];
-    e[4 * k] = Math.min(c.x, d.x); e[4 * k + 1] = Math.max(c.x, d.x); e[4 * k + 2] = Math.min(c.y, d.y); e[4 * k + 3] = Math.max(c.y, d.y);
-    box.minX = Math.min(box.minX, e[4 * k]); box.maxX = Math.max(box.maxX, e[4 * k + 1]);
-    box.minY = Math.min(box.minY, e[4 * k + 2]); box.maxY = Math.max(box.maxY, e[4 * k + 3]);
+// ---- loops with elliptic-arc edges (the joint bodies' booleans, render.js drawAtJoints) ----
+// A loop is a list of points; a point may carry `arc` = { c, U, V, t0, t1 }: the edge from the previous point to it is
+// c + U cos t + V sin t for t from t0 to t1 (c the center, U / V conjugate semi-diameters, so an affine map carries the
+// arc by mapping c, U and V), else a straight line. The crossings and tests below are closed form on the exact edges,
+// except where an arc meets a circle or another arc (a quartic, `circleRoots`): bisected to machine precision.
+
+export const arcPoint = (a, t) => ({ x: a.c.x + a.U.x * Math.cos(t) + a.V.x * Math.sin(t), y: a.c.y + a.U.y * Math.cos(t) + a.V.y * Math.sin(t) });
+const subArc = (a, u0, u1) => a && { c: a.c, U: a.U, V: a.V, t0: a.t0 + u0 * (a.t1 - a.t0), t1: a.t0 + u1 * (a.t1 - a.t0) };
+export const reverseArc = (a) => a && { c: a.c, U: a.U, V: a.V, t0: a.t1, t1: a.t0 };
+// An affine map of the plane applied to an arc (f: points, lin: its linear part, on vectors).
+export const mapArc = (a, f, lin) => a && { c: f(a.c), U: lin(a.U), V: lin(a.V), t0: a.t0, t1: a.t1 };
+// The arc ctx.ellipse(cx, cy, rx, ry, rot, a0, a1, ccw) draws (ccw: decreasing angle).
+export function ellipseArc(cx, cy, rx, ry, rot, a0, a1, ccw) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  let t1 = a1;
+  if (ccw) { while (t1 > a0) t1 -= TWO_PI; } else { while (t1 < a0) t1 += TWO_PI; }
+  return { c: { x: cx, y: cy }, U: { x: rx * c, y: rx * s }, V: { x: -ry * s, y: ry * c }, t0: a0, t1 };
+}
+// ctx.ellipse's arguments for an arc: its principal axes (U, V turned by d, tan 2d = 2 U.V / (U.U - V.V)), the angle
+// reversed where they are a mirror image of the canvas' frame.
+export function canvasArc(a) {
+  const { U, V } = a, uu = U.x * U.x + U.y * U.y, vv = V.x * V.x + V.y * V.y, uv = U.x * V.x + U.y * V.y;
+  const d = 0.5 * Math.atan2(2 * uv, uu - vv), cd = Math.cos(d), sd = Math.sin(d);
+  const P = { x: U.x * cd + V.x * sd, y: U.y * cd + V.y * sd }, Q = { x: -U.x * sd + V.x * cd, y: -U.y * sd + V.y * cd };
+  const sg = P.x * Q.y - P.y * Q.x >= 0 ? 1 : -1, a0 = sg * (a.t0 - d), a1 = sg * (a.t1 - d);
+  return [a.c.x, a.c.y, Math.hypot(P.x, P.y), Math.hypot(Q.x, Q.y), Math.atan2(P.y, P.x), a0, a1, a1 < a0];
+}
+const crs = (p, q) => p.x * q.y - p.y * q.x;
+// Twice the loop's signed area (shoelace terms for straight edges, the exact integral for arcs).
+export function loopArea2(loop) {
+  let s = 0;
+  for (let i = 0; i < loop.length; i++) {
+    const p = loop[(i + loop.length - 1) % loop.length], q = loop[i], a = q.arc;
+    s += a ? crs(a.c, a.U) * (Math.cos(a.t1) - Math.cos(a.t0)) + crs(a.c, a.V) * (Math.sin(a.t1) - Math.sin(a.t0)) + crs(a.U, a.V) * (a.t1 - a.t0) : crs(p, q);
   }
-  return { poly, e, box };
+  return s;
 }
-
-// The parameters t in (0, 1), ascending, where the segment a -> b crosses the boundary
-// of the indexed polygon `cut` (edgeIndex).
-function segmentPolygonCrossings(a, b, cut) {
-  const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x), y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y), bx = cut.box;
-  if (x1 < bx.minX || x0 > bx.maxX || y1 < bx.minY || y0 > bx.maxY) return [];
-  const pts = cut.poly, e = cut.e, rx = b.x - a.x, ry = b.y - a.y, ts = [];
-  for (let k = 0; k < pts.length; k++) {
-    if (x1 < e[4 * k] || x0 > e[4 * k + 1] || y1 < e[4 * k + 2] || y0 > e[4 * k + 3]) continue;
-    const c = pts[k], d = pts[(k + 1) % pts.length], sx = d.x - c.x, sy = d.y - c.y, den = rx * sy - ry * sx;
-    if (Math.abs(den) < 1e-18) continue;
-    const t = ((c.x - a.x) * sy - (c.y - a.y) * sx) / den, u = ((c.x - a.x) * ry - (c.y - a.y) * rx) / den;
-    if (t > 0 && t < 1 && u >= 0 && u <= 1) ts.push(t);
+// The fraction along arc a of the angle t (any turn of it), or null if t is not on the arc.
+const fracOn = (a, t) => {
+  const lo = Math.min(a.t0, a.t1), span = Math.abs(a.t1 - a.t0);
+  if (span < 1e-15) return null;
+  const tt = lo + (((t - lo) % TWO_PI) + TWO_PI) % TWO_PI;
+  return tt - lo <= span + 1e-12 ? (tt - a.t0) / (a.t1 - a.t0) : null;
+};
+const edgePoint = (p, q, a, u) => (a ? arcPoint(a, a.t0 + u * (a.t1 - a.t0)) : { x: p.x + (q.x - p.x) * u, y: p.y + (q.y - p.y) * u });
+const edgeBox = (p, q, a) => {
+  if (!a) return { x0: Math.min(p.x, q.x), x1: Math.max(p.x, q.x), y0: Math.min(p.y, q.y), y1: Math.max(p.y, q.y) };
+  const rx = Math.hypot(a.U.x, a.V.x), ry = Math.hypot(a.U.y, a.V.y);
+  return { x0: a.c.x - rx, x1: a.c.x + rx, y0: a.c.y - ry, y1: a.c.y + ry };
+};
+const meet = (b, c) => b.x0 <= c.x1 && c.x0 <= b.x1 && b.y0 <= c.y1 && c.y0 <= b.y1;
+// The loop's box (its arcs' whole ellipses: a loose bound).
+export function loopBox(loop) {
+  return loop.reduce((b, q, i) => {
+    const e = edgeBox(loop[(i + loop.length - 1) % loop.length], q, q.arc);
+    return { x0: Math.min(b.x0, e.x0), y0: Math.min(b.y0, e.y0), x1: Math.max(b.x1, e.x1), y1: Math.max(b.y1, e.y1) };
+  }, { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
+}
+// Where the edge p -> q (arc a, or straight) crosses the segment s0 -> s1: [{ u (on the edge), s (on the segment) }].
+function edgeSegmentHits(p, q, a, s0, s1) {
+  const rx = s1.x - s0.x, ry = s1.y - s0.y, out = [];
+  if (!a) {
+    const sx = q.x - p.x, sy = q.y - p.y, den = sx * ry - sy * rx, wx = s0.x - p.x, wy = s0.y - p.y;
+    if (Math.abs(den) < 1e-18) return out;
+    const u = (wx * ry - wy * rx) / den, s = (wx * sy - wy * sx) / den;
+    if (u >= 0 && u <= 1 && s >= 0 && s <= 1) out.push({ u, s });
+    return out;
   }
-  return ts.sort((p, q) => p - q);
+  // n . X(t) = n . s0 with n the segment's normal: A cos t + B sin t = C
+  const nx = -ry, ny = rx, A = nx * a.U.x + ny * a.U.y, B = nx * a.V.x + ny * a.V.y, C = nx * (s0.x - a.c.x) + ny * (s0.y - a.c.y);
+  const R = Math.hypot(A, B);
+  if (!(R > 0) || Math.abs(C) >= R) return out;
+  const phi = Math.atan2(B, A), del = Math.acos(C / R), l2 = rx * rx + ry * ry;
+  [phi + del, phi - del].forEach(t => {
+    const u = fracOn(a, t);
+    if (u === null) return;
+    const X = arcPoint(a, t), s = ((X.x - s0.x) * rx + (X.y - s0.y) * ry) / l2;
+    if (s >= 0 && s <= 1) out.push({ u, s });
+  });
+  return out;
 }
-
-// The parameters t in (0, 1), ascending, where the segment a -> b crosses a circle.
-function segmentCircleCrossings(a, b, center, radius) {
-  const dx = b.x - a.x, dy = b.y - a.y, fx = a.x - center.x, fy = a.y - center.y;
-  const A = dx * dx + dy * dy, B = 2 * (fx * dx + fy * dy), C = fx * fx + fy * fy - radius * radius;
-  const disc = B * B - 4 * A * C;
-  if (disc <= 0 || A <= 1e-12) return [];
-  const q = Math.sqrt(disc);
-  return [(-B - q) / (2 * A), (-B + q) / (2 * A)].filter(t => t > 0 && t < 1);
+// Fractions u in (0, 1), ascending, where the edge p -> q (arc a, or straight) crosses the circle.
+function edgeCircleHits(p, q, a, center, radius) {
+  const out = [];
+  if (!a) {
+    const dx = q.x - p.x, dy = q.y - p.y, fx = p.x - center.x, fy = p.y - center.y;
+    const A = dx * dx + dy * dy, B = 2 * (fx * dx + fy * dy), C = fx * fx + fy * fy - radius * radius, disc = B * B - 4 * A * C;
+    if (disc <= 0 || A <= 1e-12) return out;
+    const r = Math.sqrt(disc);
+    [(-B - r) / (2 * A), (-B + r) / (2 * A)].forEach(u => { if (u > 0 && u < 1) out.push(u); });
+    return out;
+  }
+  return circleRoots(a, center, radius).filter(u => u > 0 && u < 1);
 }
-
-// The polygon `poly` with the polygon `cut` cut out of it, as a list of polygons
-// (the cut can split it). Same idea as subtractDisc: the boundary of `poly`
-// outside `cut`, and wherever it enters `cut` the boundary of `cut` itself (against
-// poly's turning direction) up to the next point where poly's boundary leaves.
-// `cut` may be any simple polygon.
-export function subtractPolygon(poly, cut) {
-  const dedupe = (pts) => pts.filter((p, i) => { const q = pts[(i + 1) % pts.length]; return Math.hypot(p.x - q.x, p.y - q.y) > 1e-9; });
-  poly = dedupe(poly); cut = dedupe(cut);
-  const n = poly.length, qn = cut.length;
-  if (n < 3 || qn < 3) return [poly];
-  // The walk is poly's vertices plus, on an edge that crosses the cut's boundary,
-  // a point between each two consecutive crossings (exact crossings, no resampling),
-  // so consecutive walk points are separated by at most one crossing.
-  const index = edgeIndex(cut), box = index.box;
-  const walk = [];
-  for (let i = 0; i < n; i++) {
-    const a = poly[i], b = poly[(i + 1) % n], ts = segmentPolygonCrossings(a, b, index);
-    walk.push(a);
-    for (let j = 0; j + 1 < ts.length; j++) {
-      const t = (ts[j] + ts[j + 1]) / 2;
-      walk.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+// Fractions u in [0, 1] along arc b where G(X) = (X - c)^T A (X - c) - k is zero (A symmetric 2 x 2 as [a00, a01, a11]).
+// Along the arc X - c = d + U cos t + V sin t, so G is the trigonometric quartic K0 + K1 cos 2t + K2 sin 2t + K3 cos t + K4 sin t,
+// whose second derivative is at most M = 4 |(K1, K2)| + |(K3, K4)|: on an interval of half-width h around m, G stays within
+// M h^2 / 2 of its tangent at m, so if |G(m)| - |G'(m)| h - M h^2 / 2 > 0 it has no root there and is dropped; the others are
+// halved, and a sign change is bisected to machine precision. (A first-order bound alone let the halves pile up around a
+// double root: two ring arcs meet tangentially at the touch points, millions of evaluations per pair.) A touch, which is no
+// crossing, ends at the depth limit.
+function conicRoots(b, c, A, k) {
+  const q = (p, r) => A[0] * p.x * r.x + A[1] * (p.x * r.y + p.y * r.x) + A[2] * p.y * r.y;
+  const d = { x: b.c.x - c.x, y: b.c.y - c.y }, uu = q(b.U, b.U), vv = q(b.V, b.V);
+  const K0 = q(d, d) + (uu + vv) / 2 - k, K1 = (uu - vv) / 2, K2 = q(b.U, b.V), K3 = 2 * q(d, b.U), K4 = 2 * q(d, b.V);
+  const span = b.t1 - b.t0, M = (4 * Math.hypot(K1, K2) + Math.hypot(K3, K4)) * span * span;
+  const at = (u) => b.t0 + u * span;
+  const f = (u) => { const t = at(u); return K0 + K1 * Math.cos(2 * t) + K2 * Math.sin(2 * t) + K3 * Math.cos(t) + K4 * Math.sin(t); };
+  const df = (u) => { const t = at(u); return (-2 * K1 * Math.sin(2 * t) + 2 * K2 * Math.cos(2 * t) - K3 * Math.sin(t) + K4 * Math.cos(t)) * span; };
+  const out = [];
+  const search = (u0, f0, u1, f1, depth) => {
+    if ((f0 < 0) !== (f1 < 0)) {
+      let lo = u0, hi = u1, flo = f0;
+      for (let it = 0; it < 60 && hi - lo > 1e-15; it++) { const m = (lo + hi) / 2, fm = f(m); if ((fm < 0) === (flo < 0)) { lo = m; flo = fm; } else hi = m; }
+      out.push((lo + hi) / 2);
+      return;
+    }
+    if (depth > 40) return;
+    const um = (u0 + u1) / 2, fm = f(um), h = (u1 - u0) / 2;
+    if (Math.abs(fm) - Math.abs(df(um)) * h - M * h * h / 2 > 0) return;
+    search(u0, f0, um, fm, depth + 1);
+    search(um, fm, u1, f1, depth + 1);
+  };
+  search(0, f(0), 1, f(1), 0);
+  return out;
+}
+// Fractions u along arc a where it is at distance r from the point o.
+const circleRoots = (a, o, r) => conicRoots(a, o, [1, 0, 1], r * r);
+// Where two arcs cross: [{ u (on a), s (on b) }]. a's ellipse is (X - c)^T (J J^T)^-1 (X - c) = 1 with J = [U V]; times
+// det(J)^2 it is (X - c)^T adj(J J^T) (X - c) = det(J)^2, which stays well scaled for a thin ellipse (the inverse, or mapping
+// a to the unit circle, blew the other arc up by a's aspect ratio and the root search with it). The point's angle on a is
+// that of adj(J) (X - c), signed by det(J).
+function arcArcHits(a, b) {
+  const det = a.U.x * a.V.y - a.U.y * a.V.x;
+  if (!(Math.abs(det) > 0)) return [];
+  const p = a.U.x * a.U.x + a.V.x * a.V.x, q = a.U.x * a.U.y + a.V.x * a.V.y, r = a.U.y * a.U.y + a.V.y * a.V.y, sg = Math.sign(det), out = [];
+  conicRoots(b, a.c, [r, -q, p], det * det).forEach(s => {
+    const X = arcPoint(b, b.t0 + s * (b.t1 - b.t0)), dx = X.x - a.c.x, dy = X.y - a.c.y;
+    const u = fracOn(a, Math.atan2(sg * (a.U.x * dy - a.U.y * dx), sg * (dx * a.V.y - dy * a.V.x)));
+    if (u !== null) out.push({ u, s });
+  });
+  return out;
+}
+// Where the edge p -> q (arc a or straight) crosses the edge r -> w (arc b or straight): [{ u, s }] (fractions on each).
+function edgeEdgeHits(p, q, a, r, w, b) {
+  if (a && b) return arcArcHits(a, b);
+  if (!a) return edgeSegmentHits(r, w, b, p, q).map(h => ({ u: h.s, s: h.u }));
+  return edgeSegmentHits(p, q, a, r, w);
+}
+// A loop that crosses itself (a joint ring seen nearly edge-on is a figure of eight on screen) as simple loops, cut at its
+// crossings: at a crossing of edges i and k, the stretch from one to the other closes into a loop and so does the rest.
+// The union of the pieces is what the even-odd rule fills of the loop where the pieces don't overlap (a figure of eight).
+export function untwistLoop(loop, depth = 0) {
+  const n = loop.length, E = 1e-9;
+  if (depth > 8 || n < 2) return [loop];
+  // the edges' boxes swept in x: only pairs whose boxes overlap are tested
+  const boxes = loop.map((q, i) => edgeBox(loop[(i + n - 1) % n], q, q.arc)), order = boxes.map((_, i) => i).sort((i, k) => boxes[i].x0 - boxes[k].x0);
+  for (let oi = 0; oi < n; oi++) {
+    const i0 = order[oi], bi = boxes[i0];
+    for (let ok = oi + 1; ok < n && boxes[order[ok]].x0 <= bi.x1; ok++) {
+      const k0 = order[ok], bk = boxes[k0];
+      if (bk.y0 > bi.y1 || bi.y0 > bk.y1) continue;
+      // (straight neighbors meet only at their shared point; arcs can cross a neighbor elsewhere)
+      const i = Math.min(i0, k0), k = Math.max(i0, k0), adjacent = k - i === 1 || (i === 0 && k === n - 1);
+      if (adjacent && !loop[i].arc && !loop[k].arc) continue;
+      const p = loop[(i + n - 1) % n], q = loop[i], r = loop[k - 1], w = loop[k];
+      const hit = edgeEdgeHits(p, q, q.arc, r, w, w.arc).find(h => h.u > E && h.u < 1 - E && h.s > E && h.s < 1 - E);
+      if (!hit) continue;
+      const P = edgePoint(p, q, q.arc, hit.u);
+      const one = [{ ...P, arc: subArc(w.arc, 0, hit.s) }, { x: q.x, y: q.y, arc: subArc(q.arc, hit.u, 1) }, ...loop.slice(i + 1, k)];
+      const two = [{ ...P, arc: subArc(q.arc, 0, hit.u) }, { x: w.x, y: w.y, arc: subArc(w.arc, hit.s, 1) }, ...loop.slice(k + 1), ...loop.slice(0, i)];
+      return [...untwistLoop(one, depth + 1), ...untwistLoop(two, depth + 1)];
     }
   }
-  const m = walk.length, flags = walk.map(p => p.x >= box.minX && p.x <= box.maxX && p.y >= box.minY && p.y <= box.maxY && pointInPolygon(p, cut));
-  if (!flags.some(Boolean)) return [poly];
-  if (flags.every(Boolean)) return [];
-  // The cut's boundary with cumulative lengths.
-  const cum = [0];
-  for (let k = 0; k < qn; k++) cum.push(cum[k] + Math.hypot(cut[(k + 1) % qn].x - cut[k].x, cut[(k + 1) % qn].y - cut[k].y));
-  const perim = cum[qn];
-  // Where segment a (outside) -> b (inside), or the reverse, crosses the cut's boundary:
-  // the crossing nearest the outside point, and its position along the boundary.
-  const cross = (out, inn) => {
-    let best = null;
-    for (let k = 0; k < qn; k++) {
-      const c = cut[k], d = cut[(k + 1) % qn];
-      const rx = inn.x - out.x, ry = inn.y - out.y, sx = d.x - c.x, sy = d.y - c.y, den = rx * sy - ry * sx;
-      if (Math.abs(den) < 1e-18) continue;
-      const t = ((c.x - out.x) * sy - (c.y - out.y) * sx) / den, u = ((c.x - out.x) * ry - (c.y - out.y) * rx) / den;
-      if (t >= 0 && t <= 1 && u >= 0 && u <= 1 && (!best || t < best.t)) best = { t, pt: { x: out.x + rx * t, y: out.y + ry * t }, s: cum[k] + u * (cum[k + 1] - cum[k]) };
+  return [loop];
+}
+
+// Is the point inside the loop? Even-odd ray cast toward +x, on the exact edges.
+export function pointInLoop(p, loop) {
+  let inside = false;
+  for (let i = 0; i < loop.length; i++) {
+    const s = loop[(i + loop.length - 1) % loop.length], e = loop[i], a = e.arc;
+    if (!a) {
+      if ((e.y > p.y) !== (s.y > p.y) && p.x < ((s.x - e.x) * (p.y - e.y)) / (s.y - e.y) + e.x) inside = !inside;
+      continue;
     }
-    return best;
-  };
-  const nearest = (p) => { // fallback: closest boundary position to a point
-    let bestD = Infinity, best = null;
-    for (let k = 0; k < qn; k++) { const d = Math.hypot(cut[k].x - p.x, cut[k].y - p.y); if (d < bestD) { bestD = d; best = { pt: cut[k], s: cum[k] }; } }
-    return best;
-  };
-  const start = flags.findIndex((f, i) => !f && flags[(i + m - 1) % m]);
-  const stretches = [];
+    const A = a.U.y, B = a.V.y, C = p.y - a.c.y, R = Math.hypot(A, B);
+    if (!(R > 0) || Math.abs(C) >= R) continue;
+    const phi = Math.atan2(B, A), del = Math.acos(C / R);
+    [phi + del, phi - del].forEach(t => {
+      const u = fracOn(a, t);
+      if (u !== null && u < 1 && arcPoint(a, t).x > p.x) inside = !inside;
+    });
+  }
+  return inside;
+}
+// Drops repeated points (an edge of no length), keeping an arc that goes all the way around.
+function dedupeLoop(loop) {
+  const same = (p, q) => Math.hypot(p.x - q.x, p.y - q.y) < 1e-9, full = (p) => p.arc && Math.abs(p.arc.t1 - p.arc.t0) > 1e-9;
+  const out = [];
+  loop.forEach(p => { if (out.length && same(p, out[out.length - 1]) && !full(p)) return; out.push(p); });
+  while (out.length > 1 && same(out[0], out[out.length - 1]) && !full(out[0])) out.shift();
+  return out;
+}
+// The loop with each edge cut at the midpoints between consecutive crossings (`hits(p, q, arc)`: ascending fractions),
+// so consecutive points are separated by at most one crossing.
+function refineLoop(loop, hits) {
+  const out = [];
+  for (let i = 0; i < loop.length; i++) {
+    const p = loop[(i + loop.length - 1) % loop.length], q = loop[i], a = q.arc, us = hits(p, q, a);
+    let last = 0;
+    for (let j = 0; j + 1 < us.length; j++) {
+      const um = (us[j] + us[j + 1]) / 2;
+      out.push({ ...edgePoint(p, q, a, um), arc: subArc(a, last, um) });
+      last = um;
+    }
+    out.push(last ? { x: q.x, y: q.y, arc: subArc(a, last, 1) } : q);
+  }
+  return out;
+}
+// The stretches of a refined loop outside a region (flags: inside), each from its exit point to its entry point, with
+// `cross(p, q, arc, atStart)` the crossing of an edge nearest its end (atStart: the edge comes out of the region) or its
+// start, as { u, ... } (`X` / `E`: where the stretch leaves / meets the region's boundary).
+function stretchesOf(walk, flags, cross) {
+  const m = walk.length, start = flags.findIndex((f, i) => !f && flags[(i + m - 1) % m]), out = [];
   let cur = null;
   for (let k = 0; k < m; k++) {
-    const i = (start + k) % m, prev = walk[(i + m - 1) % m];
+    const i = (start + k) % m, prev = walk[(i + m - 1) % m], w = walk[i];
     if (!flags[i]) {
       if (!cur) {
-        const x = cross(walk[i], prev) || nearest(walk[i]);
-        cur = { X: x, pts: [x.pt] };
-        stretches.push(cur);
-      }
-      cur.pts.push(walk[i]);
+        const h = cross(prev, w, w.arc, true);
+        cur = { X: h, pts: [edgePoint(prev, w, w.arc, h.u), { x: w.x, y: w.y, arc: subArc(w.arc, h.u, 1) }] };
+        out.push(cur);
+      } else cur.pts.push(w);
     } else if (cur) {
-      cur.E = cross(prev, walk[i]) || nearest(walk[i]);
-      cur.pts.push(cur.E.pt);
+      const h = cross(prev, w, w.arc, false);
+      cur.E = h;
+      cur.pts.push({ ...edgePoint(prev, w, w.arc, h.u), arc: subArc(w.arc, 0, h.u) });
       cur = null;
     }
   }
-  const area = (pts) => pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p.x * q.y - q.x * p.y; }, 0);
-  // Follow the cut's boundary against poly's turning direction.
-  const dir = Math.sign(area(poly)) === Math.sign(area(cut)) ? -1 : 1;
-  const wrap = (a) => ((a % perim) + perim) % perim;
+  return out;
+}
+// Joins the stretches into loops: from each stretch's entry E the region's boundary is followed to the nearest exit X
+// (`dist(E, X, j, s)`), `path(E, d)` giving the points passed on the way and the arc into that X.
+function linkStretches(stretches, dist, path) {
   const used = new Array(stretches.length).fill(false), result = [];
   for (let s0 = 0; s0 < stretches.length; s0++) {
     if (used[s0]) continue;
     const out = [];
-    let s = s0;
+    let s = s0, arc;
     while (!used[s] && stretches[s].E) {
       used[s] = true;
-      out.push(...stretches[s].pts);
-      const qE = stretches[s].E.s;
+      const pts = stretches[s].pts;
+      out.push(s === s0 ? pts[0] : { x: pts[0].x, y: pts[0].y, arc }, ...pts.slice(1));
       let best = -1, bestD = Infinity;
-      stretches.forEach((t, j) => {
-        let d = wrap(dir * (t.X.s - qE));
-        if (d < 1e-12 && j !== s) d = perim;
-        if (d < bestD) { bestD = d; best = j; }
-      });
-      // The cut's vertices passed on the way, nearest first.
-      const mids = [];
-      for (let k = 0; k < qn; k++) { const d = wrap(dir * (cum[k] - qE)); if (d > 1e-12 && d < bestD) mids.push({ d, p: cut[k] }); }
-      mids.sort((p, q) => p.d - q.d).forEach(v => out.push(v.p));
+      stretches.forEach((t, j) => { const d = dist(stretches[s].E, t.X, j, s); if (d < bestD) { bestD = d; best = j; } });
+      const way = path(stretches[s].E, bestD);
+      out.push(...way.verts);
+      arc = way.arc;
       s = best;
     }
-    if (out.length >= 3) result.push(out);
+    if (s === s0 && out.length) out[0] = { x: out[0].x, y: out[0].y, arc };
+    if (out.length >= 2) result.push(out);
   }
   return result;
 }
 
-// The polygon with the disc cut out of it, as a list of polygons (the cut can
-// split it): each is made of the original boundary outside the disc plus the
-// circle's own arc wherever the disc bites in, so no area inside the disc is left.
-// A polygon with no part in the disc is returned as is.
-// Where the boundary enters the disc it follows the circle (against the polygon's
-// own turning direction) to the next point where the boundary leaves it.
-export function subtractDisc(poly, center, radius) {
-  const n = poly.length;
-  if (n < 3) return [poly];
-  const inDisc = (p) => Math.hypot(p.x - center.x, p.y - center.y) < radius;
-  // The walk is the vertices plus, on an edge that crosses the circle, the point
-  // between its two crossings (exact crossings, no resampling).
-  const walk = [];
-  for (let i = 0; i < n; i++) {
-    const a = poly[i], b = poly[(i + 1) % n], ts = segmentCircleCrossings(a, b, center, radius);
-    walk.push(a);
-    if (ts.length === 2) {
-      const t = (ts[0] + ts[1]) / 2;
-      walk.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+// The loop `poly` with the loop `cut` cut out of it, as a list of loops (the cut can split it): the boundary of `poly`
+// outside `cut`, and wherever it enters `cut` the boundary of `cut` itself (against poly's turning direction) up to the
+// next point where poly's boundary leaves, its arcs kept as arcs. A position on the cut's boundary is k + u (edge k, from
+// cut[k] to cut[k + 1], at fraction u).
+export function subtractPolygon(poly, cut) {
+  poly = dedupeLoop(poly); cut = dedupeLoop(cut);
+  const n = poly.length, qn = cut.length;
+  if (n < 2 || qn < 2) return [poly];
+  const edges = cut.map((p, k) => { const q = cut[(k + 1) % qn], a = q.arc; return { p, q, a, box: edgeBox(p, q, a) }; });
+  const box = loopBox(cut);
+  // the crossings of the edge p -> q with the cut's boundary: { u, s } (s: the position on the cut)
+  const hitsOf = (p, q, a) => {
+    const eb = edgeBox(p, q, a), out = [];
+    if (!meet(eb, box)) return out;
+    edges.forEach((e, k) => {
+      if (!meet(eb, e.box)) return;
+      edgeEdgeHits(p, q, a, e.p, e.q, e.a).forEach(h => out.push({ u: h.u, s: k + h.s }));
+    });
+    return out.filter(h => h.u > 0 && h.u < 1).sort((x, y) => x.u - y.u);
+  };
+  const walk = refineLoop(poly, (p, q, a) => hitsOf(p, q, a).map(h => h.u));
+  const flags = walk.map(p => p.x >= box.x0 && p.x <= box.x1 && p.y >= box.y0 && p.y <= box.y1 && pointInLoop(p, cut));
+  if (!flags.some(Boolean)) return [poly];
+  if (flags.every(Boolean)) return [];
+  const nearest = (p) => { let best = 0, bd = Infinity; cut.forEach((c, k) => { const d = Math.hypot(c.x - p.x, c.y - p.y); if (d < bd) { bd = d; best = k; } }); return best; };
+  const stretches = stretchesOf(walk, flags, (p, q, a, atStart) => {
+    const hs = hitsOf(p, q, a);
+    if (!hs.length) return { u: atStart ? 0 : 1, s: nearest(atStart ? p : q) };
+    return atStart ? hs[hs.length - 1] : hs[0];
+  });
+  const dir = Math.sign(loopArea2(poly)) === Math.sign(loopArea2(cut)) ? -1 : 1;
+  const wrap = (x) => ((x % qn) + qn) % qn;
+  // From position s along the cut, `rem` of it in direction dir: the cut's points passed (with their arcs) and the arc of
+  // the last piece.
+  const along = (s, rem) => {
+    const verts = [];
+    for (let guard = 0; guard <= qn + 1; guard++) {
+      if (dir > 0) {
+        const k = Math.floor(s + 1e-12) % qn, u = Math.max(0, s - Math.floor(s + 1e-12)), e = edges[k];
+        if (rem <= 1 - u + 1e-12) return { verts, arc: subArc(e.a, u, u + rem) };
+        verts.push({ x: e.q.x, y: e.q.y, arc: subArc(e.a, u, 1) });
+        rem -= 1 - u; s = (k + 1) % qn;
+      } else {
+        const kk = Math.ceil(s - 1e-12) - 1, k = wrap(kk), u = s - kk, e = edges[k];
+        if (rem <= u + 1e-12) return { verts, arc: subArc(e.a, u, u - rem) };
+        verts.push({ x: e.p.x, y: e.p.y, arc: subArc(e.a, u, 0) });
+        rem -= u; s = k;
+      }
     }
-  }
-  const flags = walk.map(inDisc), m = walk.length;
+    return { verts, arc: undefined };
+  };
+  return linkStretches(stretches, (E, X, j, s) => {
+    let d = wrap(dir * (X.s - E.s));
+    if (d < 1e-12 && j !== s) d = qn;
+    return d;
+  }, (E, d) => along(E.s, d));
+}
+
+// The loop with the disc cut out of it, as a list of loops (the cut can split it): the boundary outside the disc and,
+// wherever it bites in, the circle's own arc (against the loop's turning direction, an exact arc) to the next point where
+// the boundary leaves the disc. A loop with no part in the disc is returned as is.
+export function subtractDisc(poly, center, radius) {
+  poly = dedupeLoop(poly);
+  if (poly.length < 2) return [poly];
+  const walk = refineLoop(poly, (p, q, a) => edgeCircleHits(p, q, a, center, radius));
+  const flags = walk.map(p => Math.hypot(p.x - center.x, p.y - center.y) < radius);
   if (!flags.some(Boolean)) return [poly];
   if (flags.every(Boolean)) return [];
   const angle = (p) => Math.atan2(p.y - center.y, p.x - center.x);
-  const onCircle = (a) => ({ x: center.x + radius * Math.cos(a), y: center.y + radius * Math.sin(a) });
-  const TWO = Math.PI * 2, wrap = (a) => ((a % TWO) + TWO) % TWO;
-  // Rotate so the walk starts just after the boundary leaves the disc.
-  const start = flags.findIndex((f, i) => !f && flags[(i + m - 1) % m]);
-  // Stretches outside the disc: each runs from an exit point X to the next entry point E.
-  const stretches = [];
-  let cur = null;
-  for (let k = 0; k <= m; k++) {
-    const i = (start + k) % m, prev = walk[(i + m - 1) % m];
-    if (k === m) { if (cur) { cur.E = cur.pts[cur.pts.length - 1]; } break; }
-    if (!flags[i]) {
-      if (!cur) {
-        const X = segmentCircleHit(walk[i], prev, center, radius) || onCircle(angle(walk[i]));
-        cur = { X, pts: [X] };
-        stretches.push(cur);
-      }
-      cur.pts.push(walk[i]);
-    } else if (cur) {
-      cur.E = segmentCircleHit(prev, walk[i], center, radius) || onCircle(angle(walk[i]));
-      cur.pts.push(cur.E);
-      cur = null;
+  const stretches = stretchesOf(walk, flags, (p, q, a, atStart) => {
+    const us = edgeCircleHits(p, q, a, center, radius);
+    const u = us.length ? (atStart ? us[us.length - 1] : us[0]) : (atStart ? 0 : 1);
+    return { u, ang: angle(edgePoint(p, q, a, u)) };
+  });
+  const dir = loopArea2(poly) >= 0 ? -1 : 1;
+  const wrap = (x) => ((x % TWO_PI) + TWO_PI) % TWO_PI;
+  const C = { x: center.x, y: center.y }, U = { x: radius, y: 0 }, V = { x: 0, y: radius };
+  return linkStretches(stretches, (E, X, j, s) => {
+    let d = wrap(dir * (X.ang - E.ang));
+    if (d < 1e-12 && j !== s) d = TWO_PI;
+    return d;
+  }, (E, d) => ({ verts: [], arc: { c: C, U, V, t0: E.ang, t1: E.ang + dir * d } }));
+}
+
+// The image of the unit circle h = (cos th, sin th, 1) under the plane homography H (rows x, y, w of 3 numbers each, so
+// the point is (x . h, y . h) / (w . h)), as an ellipse { c, U, V } (an arc without its range: its parameter is the
+// ellipse's own, not th; `arcParam` reads it from a point), or null if the image is not an ellipse (the line w . h = 0
+// meets the circle: a parabola or hyperbola). Its dual conic is H diag(1, 1, -1) H^T (no inverse, stable for thin ones),
+// which for the ellipse (x - c)^T P^-1 (x - c) = 1 is [[P - c c^T, -c], [-c^T, -1]] up to scale.
+export function homographyEllipse(H) {
+  const m = (i, j) => H[i][0] * H[j][0] + H[i][1] * H[j][1] - H[i][2] * H[j][2];
+  const w = m(2, 2);
+  if (!(w < 0)) return null;
+  const k = -1 / w, x = -k * m(0, 2), y = -k * m(1, 2);
+  const P00 = k * m(0, 0) + x * x, P01 = k * m(0, 1) + x * y, P11 = k * m(1, 1) + y * y;
+  const mean = (P00 + P11) / 2, diff = Math.hypot((P00 - P11) / 2, P01), l1 = mean + diff, l2 = Math.max(mean - diff, 0);
+  if (!(l1 > 0)) return null;
+  const ang = 0.5 * Math.atan2(2 * P01, P00 - P11), a = Math.sqrt(l1), b = Math.sqrt(l2), ca = Math.cos(ang), sa = Math.sin(ang);
+  return { c: { x, y }, U: { x: a * ca, y: a * sa }, V: { x: -b * sa, y: b * ca } };
+}
+// The parameter t of a point on the ellipse { c, U, V }: [cos t, sin t] = [U V]^-1 (p - c).
+export function arcParam(e, p) {
+  const dx = p.x - e.c.x, dy = p.y - e.c.y, det = e.U.x * e.V.y - e.U.y * e.V.x;
+  return Math.atan2((e.U.x * dy - e.U.y * dx) / det, (dx * e.V.y - dy * e.V.x) / det);
+}
+// The arc of the ellipse e from point p0 to point p1 through point pm, as an arc { c, U, V, t0, t1 }.
+export function arcThrough(e, p0, pm, p1) {
+  const t0 = arcParam(e, p0), mod = (x) => ((x % TWO_PI) + TWO_PI) % TWO_PI;
+  const s1 = mod(arcParam(e, p1) - t0), sm = mod(arcParam(e, pm) - t0);
+  return { c: e.c, U: e.U, V: e.V, t0, t1: sm <= s1 ? t0 + s1 : t0 - (TWO_PI - s1) };
+}
+
+// Positions along a loop: s = k + u on edge k (from loop[k] to loop[k + 1], the arc of loop[k + 1]) at fraction u.
+const loopEdge = (loop, k) => { const n = loop.length, q = loop[(k + 1) % n]; return { p: loop[k % n], q, a: q.arc }; };
+// The position of a point that lies on the loop (the edge it is nearest to).
+export function locateOnLoop(loop, P) {
+  let best = 0, bd = Infinity;
+  for (let k = 0; k < loop.length; k++) {
+    const { p, q, a } = loopEdge(loop, k);
+    let u;
+    if (a) {
+      u = fracOn(a, arcParam(a, P));
+      if (u === null) continue;
+    } else {
+      const dx = q.x - p.x, dy = q.y - p.y, l2 = dx * dx + dy * dy;
+      u = l2 > 0 ? Math.max(0, Math.min(1, ((P.x - p.x) * dx + (P.y - p.y) * dy) / l2)) : 0;
     }
+    const X = edgePoint(p, q, a, u), d = Math.hypot(X.x - P.x, X.y - P.y);
+    if (d < bd) { bd = d; best = k + u; }
   }
-  // The circle is followed against the polygon's turning direction.
-  const area = poly.reduce((s, p, i) => { const q = poly[(i + 1) % n]; return s + p.x * q.y - q.x * p.y; }, 0);
-  const dir = area >= 0 ? -1 : 1;
-  const used = new Array(stretches.length).fill(false), result = [];
-  for (let s0 = 0; s0 < stretches.length; s0++) {
-    if (used[s0]) continue;
-    const out = [];
-    let s = s0;
-    while (!used[s]) {
-      used[s] = true;
-      out.push(...stretches[s].pts);
-      // The next exit point along the circle from this entry point.
-      const aE = angle(stretches[s].E);
-      let best = -1, bestD = Infinity;
-      stretches.forEach((t, j) => {
-        let d = wrap(dir * (angle(t.X) - aE));
-        if (d < 1e-12 && j !== s) d = TWO;           // coincident points: not the next one
-        if (d < bestD) { bestD = d; best = j; }
-      });
-      const arcSteps = Math.max(1, Math.ceil(bestD / (Math.PI / 90)));
-      for (let q = 1; q < arcSteps; q++) out.push(onCircle(aE + dir * bestD * q / arcSteps));
-      s = best;
-    }
-    if (out.length >= 3) result.push(out);
+  return best;
+}
+export const loopPoint = (loop, s) => { const k = Math.floor(s), { p, q, a } = loopEdge(loop, k); return edgePoint(p, q, a, s - k); };
+// The loop from position s0 forward to s1 (wrapping): the points reached, each with the arc into it, the last at s1.
+export function loopPath(loop, s0, s1) {
+  const n = loop.length, out = [];
+  let s = s0, rem = ((s1 - s0) % n + n) % n;
+  for (let guard = 0; guard <= n + 1; guard++) {
+    const k = Math.floor(s + 1e-12) % n, u = Math.max(0, s - Math.floor(s + 1e-12)), { p, q, a } = loopEdge(loop, k);
+    if (rem <= 1 - u + 1e-12) { out.push({ ...edgePoint(p, q, a, u + rem), arc: subArc(a, u, u + rem) }); return out; }
+    out.push({ x: q.x, y: q.y, arc: subArc(a, u, 1) });
+    rem -= 1 - u; s = (k + 1) % n;
   }
-  return result;
+  return out;
+}
+// The first position from s0 forward to s1 where the loop crosses the circle, or null.
+export function loopCircleCross(loop, s0, s1, center, radius) {
+  const n = loop.length;
+  let s = s0, rem = ((s1 - s0) % n + n) % n;
+  for (let guard = 0; guard <= n + 1 && rem > 1e-12; guard++) {
+    const k = Math.floor(s + 1e-12) % n, u = Math.max(0, s - Math.floor(s + 1e-12)), { p, q, a } = loopEdge(loop, k), u1 = Math.min(1, u + rem);
+    const piece = a ? { ...subArc(a, u, u1) } : null, P = edgePoint(p, q, a, u), Q = edgePoint(p, q, a, u1);
+    const hits = (piece ? circleRoots(piece, center, radius) : edgeCircleHits(P, Q, null, center, radius)).filter(f => f >= 0 && f <= 1);
+    if (hits.length) return k + u + Math.min(...hits) * (u1 - u);
+    rem -= u1 - u; s = (k + 1) % n;
+  }
+  return null;
 }

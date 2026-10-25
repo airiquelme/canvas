@@ -10,10 +10,36 @@ export const meshes = {};
 let nextNodeId = 1;
 let nextMeshId = 1;
 
+// `squash` (and `axis`, which only an arch end keeps) is what the node asks for; finalizeShapes settles it once the meshes
+// are made.
 export function createNode(center, radius, { squash = 1, axis = { x: 0, y: 1, z: 0 }, cut } = {}) {
   const id = nextNodeId++;
-  nodes[id] = { id, center: { x: center.x, y: center.y, z: center.z ?? 0 }, radius, shape: makeShape(radius, squash, axis, cut) };
+  nodes[id] = { id, center: { x: center.x, y: center.y, z: center.z ?? 0 }, radius, shape: makeShape(radius, squash, axis, cut), spec: { squash, axis, cut } };
   return id;
+}
+
+// The rules for squashed nodes (CLAUDE.md "Squashed nodes"), applied once the meshes exist:
+//  - the free end of a plain 2-node mesh squashes along the axis to its partner (`shape.axial`): the hull of two bodies of
+//    revolution about the same axis is a circular cone, so every closed form of the round cones holds (splitRing.js
+//    coaxialCone);
+//  - an arch end (a skewed mesh's node) keeps its own axis: an arch is a sweep, each row a plane slice of an ellipsoid;
+//  - a node in several meshes, or in a 3+ node mesh, is made round: it can't be symmetric about every cone's axis.
+export function finalizeShapes() {
+  const all = Object.values(meshes);
+  Object.values(nodes).forEach(n => {
+    const spec = n.spec;
+    if (!spec || spec.squash === 1) return;
+    const own = all.filter(m => m.nodeIds.includes(n.id));
+    if (!own.length) return;                                  // a skew node (only a point) or unused
+    if (own.length === 1 && own[0].skew !== undefined) return;
+    if (own.length === 1 && own[0].nodeIds.length === 2) {
+      const o = nodes[own[0].nodeIds.find(id => id !== n.id)].center, c = n.center;
+      n.shape = { ...makeShape(n.radius, spec.squash, { x: o.x - c.x, y: o.y - c.y, z: o.z - c.z }, spec.cut), axial: true };
+      return;
+    }
+    console.warn(`node ${n.id}: squashed but shared or in a 3+ node mesh, made round`);
+    n.shape = makeShape(n.radius, 1, spec.axis, spec.cut);
+  });
 }
 
 // `skew`: id of a node that is not in `nodeIds`; the 2-node mesh then bends through it (skew.js).
@@ -66,36 +92,35 @@ export function buildBasicScene() {
   createMesh([createNode({ x: cx + 40, y: cy + 230, z: -40 }, 26, { squash: 0.45 }),
     createNode({ x: cx + 330, y: cy + 230, z: 40 }, 26, { squash: 0.5, axis: { x: 1, y: 1, z: 0 } })], '#ba68c8',
     { skew: createNode({ x: cx + 185, y: cy + 110 }, 6) });
+  finalizeShapes();
 }
 
 export function buildDemoScene() { buildFullScene(); }
 
 export function buildFullScene() {
-  // Left: two 2-node meshes sharing a joint node (a V). The joint node and the blue end are
-  // squashed (the general joint ring, jointCurveGeneral.js), and so is the orange end, the
-  // orange/yellow joint whose yellow cone is a split cone into the (squashed) pyramid.
+  // Left: two 2-node meshes sharing a joint node (a V). Shared nodes are round (finalizeShapes); the blue end is free,
+  // stretched along its cone's axis (a circular cone, so the joint ring is the closed form). The orange end is the
+  // orange/yellow joint whose yellow cone is a split cone into the pyramid.
   const S = 1.6;
   const cx = DESIGN_WIDTH / 2 - 180, cy = DESIGN_HEIGHT / 2 + 50 * S;
-  const jointNode = createNode({ x: cx, y: cy }, 35 * S, { squash: 0.7, axis: { x: 1, y: 1, z: 0 } });
-  const blueEnd = createNode({ x: cx - 110 * S, y: cy - 100 * S }, 30 * S, { squash: 1.5, axis: { x: 1, y: 0, z: 0 } });
+  const jointNode = createNode({ x: cx, y: cy }, 35 * S);
+  const blueEnd = createNode({ x: cx - 110 * S, y: cy - 100 * S }, 30 * S, { squash: 1.5 });
   createMesh([blueEnd, jointNode], '#4fc3f7');
-  const orangeEnd = createNode({ x: cx + 110 * S, y: cy - 100 * S, z: 40 * S }, 25 * S, { squash: 0.8, axis: { x: 1, y: 0, z: 1 } });
+  const orangeEnd = createNode({ x: cx + 110 * S, y: cy - 100 * S, z: 40 * S }, 25 * S);
   createMesh([jointNode, orangeEnd], '#ff8a65');
 
   // Right: a 4-node pyramid (triangular base in the x-z plane, apex above)...
   const px = DESIGN_WIDTH / 2 + 210, py = DESIGN_HEIGHT / 2;
-  // The pyramid's nodes are squashed too (the host of the split cone, whose shared node is one of them).
-  const pyramidShapes = [{ squash: 0.7, axis: { x: 1, y: 1, z: 0 } }, { squash: 1.4 }, { squash: 0.8, axis: { x: 1, y: 0, z: 1 } }];
+  // (Its nodes are in a 3+ node mesh, so they are round.)
   const pyrBase = [0, 1, 2].map(i => {
     const a = Math.PI / 2 + i * 2 * Math.PI / 3;
-    return createNode({ x: px + 110 * Math.cos(a), y: py + 90, z: 110 * Math.sin(a) }, 30, pyramidShapes[i]);
+    return createNode({ x: px + 110 * Math.cos(a), y: py + 90, z: 110 * Math.sin(a) }, 30);
   });
-  const pyrApex = createNode({ x: px, y: py - 110 }, 25, { squash: 0.75 });
+  const pyrApex = createNode({ x: px, y: py - 110 }, 25);
   createMesh([...pyrBase, pyrApex], '#a5d6a7');
 
-  // (A purple 2-node mesh on the apex, a second split cone, is left out for now
-  // to check the split with one shared mesh:
-  // createMesh([pyrApex, createNode({ x: px + 30, y: py - 200, z: -110 }, 22)], '#ce93d8').)
+  // A second split cone, on the apex, whose free far end is flattened along the cone's axis (a coin facing along it).
+  createMesh([pyrApex, createNode({ x: px + 30, y: py - 200, z: -110 }, 22, { squash: 0.5 })], '#ce93d8');
 
   // A bridge between the closest pair of nodes, one from the pyramid and one
   // from the other 2-node meshes: a joint at its 2-node end, a split cone at
@@ -112,35 +137,30 @@ export function buildFullScene() {
 
   // Squashed nodes (static) in plain meshes. They sit in the free bands above and below the
   // other figures, inside the view (about x 206-794, y 165-635 around the camera target).
-  // A figure is its squashed node plus `more` nodes (offsets from it, so a mesh of 2 or 3
-  // nodes). Bottom row: a sphere (control), a ball flattened along world y, a flatter one with
-  // two more nodes (a bounce), one flattened along a tilted axis with two more. Top row:
-  // stretched along y with two more, a stretched-along-x node meshed with a second squashed
-  // node and a sphere, and a pair stretched along z (end-on from some angles).
-  const squashed = (x, y, r, shape, color, more = [{ dx: 60, dy: 0 }]) => {
-    const ids = [createNode({ x, y }, r, shape)];
-    more.forEach(m => ids.push(createNode({ x: x + m.dx, y: y + m.dy, z: m.dz ?? 0 }, m.r ?? 11, m.shape)));
-    createMesh(ids, color);
+  // A squashed node squashes along the axis to its one partner (finalizeShapes), so each figure is a 2-node mesh:
+  // the squashed node and a partner (round, or squashed too). squash < 1 flattens it into a coin facing along the
+  // cone, > 1 stretches it along the cone. The partners are off the plane in z so the shapes turn as the camera orbits.
+  const pair2 = (x, y, r, squash, color, m) => {
+    createMesh([createNode({ x, y }, r, { squash }), createNode({ x: x + m.dx, y: y + m.dy, z: m.dz ?? 0 }, m.r ?? 11, { squash: m.squash ?? 1 })], color);
   };
-  squashed(520, 225, 26, { squash: 0.35 }, '#f06292', [{ dx: 60, dy: 0 }, { dx: 30, dy: -38, dz: 45 }]);
-  squashed(645, 225, 26, { squash: 0.45, axis: { x: 1, y: 1, z: 0 } }, '#ba68c8', [{ dx: 60, dy: 5 }, { dx: 25, dy: 40, dz: -45 }]);
-  // Small V joints (two 2-node meshes sharing a node) with squashed nodes, in view: the joint
-  // node squashed, only the arm ends squashed, and all three squashed (the general joint ring).
+  pair2(520, 225, 26, 0.35, '#f06292', { dx: 60, dy: -10, dz: 45 });
+  pair2(645, 225, 26, 0.45, '#ba68c8', { dx: 60, dy: 25, dz: -45 });
+  // Small V joints (two 2-node meshes sharing a node; the joint node is round), with squashed arm ends.
   // The arms are off the plane in z so the ring changes as the camera orbits.
-  const vee = (x, y, colorA, colorB, joint, armA = {}, armB = {}) => {
-    const j = createNode({ x, y }, 20, joint);
+  const vee = (x, y, colorA, colorB, armA = {}, armB = {}) => {
+    const j = createNode({ x, y }, 20);
     const a = createNode({ x: x - 52, y: y - 30, z: 25 }, 14, armA);
     const b = createNode({ x: x + 52, y: y - 30, z: -25 }, 13, armB);
     createMesh([a, j], colorA);
     createMesh([j, b], colorB);
   };
   vee(268, 225, '#e57373', '#4dd0e1', { squash: 0.5 });
-  vee(388, 225, '#9575cd', '#aed581', {}, { squash: 0.5, axis: { x: 1, y: 1, z: 0 } }, { squash: 1.7, axis: { x: 1, y: 0, z: 0 } });
-  vee(690, 575, '#a1887f', '#80cbc4', { squash: 0.35, axis: { x: 1, y: 1, z: 0 } }, { squash: 1.6, axis: { x: 0, y: 1, z: 0 } }, { squash: 0.6 });
-  squashed(270, 575, 20, { squash: 1.8 }, '#ffb74d', [{ dx: 60, dy: 0 }, { dx: 30, dy: -42, dz: 45 }]);
-  squashed(395, 575, 20, { squash: 1.8, axis: { x: 1, y: 0, z: 0 } }, '#81c784',
-    [{ dx: 75, dy: 0, r: 18, shape: { squash: 0.5, axis: { x: 0, y: 1, z: 1 } } }, { dx: 35, dy: 35, dz: 40 }]);
-  squashed(520, 575, 20, { squash: 1.8, axis: { x: 0, y: 0, z: 1 } }, '#64b5f6');
+  vee(388, 225, '#9575cd', '#aed581', { squash: 0.5 }, { squash: 1.7 });
+  vee(690, 575, '#a1887f', '#80cbc4', { squash: 1.6 }, { squash: 0.6 });
+  pair2(270, 575, 20, 1.8, '#ffb74d', { dx: 60, dy: -20, dz: 45 });
+  pair2(395, 575, 20, 1.8, '#81c784', { dx: 75, dy: 0, r: 18, squash: 0.5 });
+  pair2(520, 575, 20, 1.8, '#64b5f6', { dx: 60, dy: 0, dz: -60 });
+  finalizeShapes();
 
   // The split-cone figure, for the debug view to center on.
   return [...pyrBase, pyrApex];

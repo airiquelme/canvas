@@ -50,13 +50,31 @@ semi-diameters `(B - A) / 2` and `S - M`, so S is the apex even when off-center.
 only: each end's `shape.Q` is written in the arch's moving frame (tangent, in-plane normal, plane normal), the two forms are
 mixed with a smoothstep and turned back (`shapeAt`); the whole ellipsoid is swept, so a flat end's extent along the arch makes the band bulge where the arch bends. That is intended: sweeping only the cross-section (tried) leaves the ribbon drifting off the flat end discs, so the arch must start and end on the nodes' own shapes. The Debug view's section (`sectionAt`) is the true cut perpendicular to the arch, so it differs from the drawn bulge. So thickness and width are kept along the arch (no swelling from mixing
 differently oriented shapes in world coordinates). All-round ends use the circle path with a smoothstep radius. On screen the body
-is the union of capsules between consecutive projected circles / ellipses (`archSamples`, refined until in-between ones lie inside
-their neighbors' capsule; `traceEllipseCapsule` for squashed ends), traced into one nonzero path. v1 limits: plain meshes only
+is the union of the visible strips of its shading's exact rows (`outline` in `buildArch`, shading.js; built without light by
+`frame.archGeom` when the light is off): each strip is two exact elliptic arcs (the rows' visible halves, true perspective) and two
+chords, wound anticlockwise, all traced into one nonzero path; the visible surface covers the whole body on screen, so this is its
+outline from the same rows as its lit part (no offset between the two). A strip whose sides cross (a fold) is the hull of its row
+curves. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
 (skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
-(`buildSkewPrimitives`, overlapping by one sample past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
+(`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
 Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
+**Rules (axial squash, `finalizeShapes` in scene.js, run once the meshes exist).** Every squashed piece is closed form:
+- the free end of a plain 2-node mesh squashes only along the axis to its partner (`shape.axial`; squash < 1 a coin facing
+  along the cone, > 1 stretched along it). The hull of two bodies of revolution about the same axis is a circular cone,
+  tangent to each along a circle: `coaxialCone` (splitRing.js) solves its normal from the equal supports
+  sqrt(raN^2 s^2 + rpN^2 c^2) = D s + sqrt(raF^2 s^2 + rpF^2 c^2), a quadratic in sin^2 T (two spheres give `tangentCone`
+  bit for bit). Joints (round joint node) and split cones (round shared node and host) use it in their closed forms: a
+  cone tangent to a sphere along a circle is all the plane rule S = k L^2 needs;
+- a node in two or more meshes, or in a 3+ node mesh, is made round (`console.warn`): it can't be symmetric about every
+  cone's axis;
+- an arch end (skewed mesh) keeps its own `axis`: an arch is a sweep, every row a plane slice of an ellipsoid, exact for
+  any orientation (flat ribbons).
+The general machinery below (free-axis squashes: `jointCurveGeneral.js`, `hullCone.js`, `hostHull.js`,
+`findGeneralSplitRing` / `findUniformSplitRing`) is kept but no scene reaches it; it checks the closed forms (an axial joint
+ring matches `buildJointCurveGeneral` on the same bodies within 0.01 px, the split rings to 1e-13).
+
 A node is a spheroid: `createNode(center, radius, { squash, axis })`; `node.shape` (`makeShape`,
 `geometry.js`) has semi-axis `radius * squash` along `axis` and `radius / sqrt(squash)` across (same volume).
 `projectNode` gives its screen shadow `ellipse` `{a, b, angle}` (closed form, `shadowEllipse`) and `round`
@@ -72,9 +90,9 @@ a linear map: a node off the view axis shows its top or underside, and the shape
 no lens distortion (the cut always lies inside the silhouette). Spheres keep the plain camera basis, so
 they stay circles.
 
-**Joints with squashed nodes** (`computeJoints`, `render.js`). If any of a joint's three nodes is
-squashed, its ring is the general one (`jointCurveGeneral.js`); all-round joints keep the closed form
-(bit-identical output). The flat solid gives each node an ellipsoid (`ellipsoidShape`, `flatBody`): its
+**Joints with squashed nodes** (`computeJoints`, `render.js`). A round joint node with round or axial far ends takes the
+closed form (an axial far end is, in the flat solid, the spheroid about the flat axis with its own scale, `ra` / `rp`). A
+squashed joint node or a free-axis far end (no longer made by the scenes) takes the general ring (`jointCurveGeneral.js`). The flat solid gives each node an ellipsoid (`ellipsoidShape`, `flatBody`): its
 projected ellipse as the shadow along z (so the orthographic silhouette is exactly what is drawn) and the
 body's own half-extent along the view (`zRadius`) as the third axis. Cones are `hullCone.js` hulls of the
 joint body and each far body. The ring is not planar any more:
@@ -82,7 +100,7 @@ joint body and each far body. The ring is not planar any more:
   (azimuth psi) where hFB - hN changes sign; the front arc of psi is the one with hFB > hN (A's generatrix
   starts inside hull B there);
 - front: per psi, the point where A's generatrix leaves hull B. `hullSigned` is convex along a line, so Newton
-  from the far end converges monotonically (slope = probe normal . direction). 31 exact points
+  from the far end converges monotonically (slope = probe normal . direction). 8 exact points
   (cosine-spaced, warm-started), a cubic Hermite spline through them, and an exact point added wherever the
   spline's midpoint is off by more than half the chord tolerance, then chords within `tol`;
 - back: the plane through both touch points and the centroid of the exact front points cuts the joint
@@ -105,8 +123,8 @@ comes in front of the node's disc when its arm points at the camera, but a thin 
 about 0.3 and tilted: `jointFlat` in `jointRef.mjs`) lets a hull bulge in front of the node's rim, and a
 sliver of the disc's color (about 10 x 70 px, 0.2% of the samples in the worst of 6 angles) is painted
 where that cone should be. The demo's squash values (0.7, 1.5) are checked by `jointRef.mjs`'s `demoV`.
-**Split cones with squashed nodes** (`splitRing.js`; used when the shared node, the far node or any host node is squashed,
-else the closed forms below, bit-identical). Three cases, one definition of the ring. The ring is where the cone's
+**Split cones with squashed nodes** (`splitRing.js`; a round shared node and host with a round or axial far end take the
+closed forms with `coaxialCone`; the cases below are for squashed shared or host nodes or a free-axis far end, kept unused). Three cases, one definition of the ring. The ring is where the cone's
 cross-section by a *slicing plane* last meets the host; the planes are `{ (p - c_shared) . w = const }`, `w = Q_shared^-1 d`
 (d the unit axis, scaled so that the constant is the axial distance where the plane crosses the axis): planes
 perpendicular to the axis once the shared body is a sphere. For a round shared node w = d, the old definition.
@@ -131,8 +149,8 @@ shared body's support >= the far body's along the rim point's world normal `cx r
 `n . axis <= sinT` in general form; its ends by bisection); the far part (`drawSplitFarGeneral`) the hull of the ring and
 the far rim ellipse, with a chord instead of the cap at a joint. Both are `hullOutline`s (exact arcs). A split cone ending
 at a squashed joint aligns its ring to the flat capsule of the two ellipses (`alignToFlatEllipses`, from `ellipseCapsule`).
-The cone debug overlay skips squashed splits. The host is treated as convex. The demo's pyramid, its apex and the orange
-end are squashed.
+The cone debug overlay skips free-axis squashed splits. The host is treated as convex. The demo's squashed nodes are all
+free ends now (the blue end, the purple split cone's far end, the V arms, the small pairs).
 
 **Exact outlines** (`hullOutline`, `traceOutline` / `fillOutline`). The split cone parts of round nodes are hulls of
 ellipses and an arc, no sampled points: the projected ring and tangent circle are exact ellipses (`projectedCircleEllipse`:
@@ -143,8 +161,18 @@ an ellipse, common tangents of two ellipses, the ends of an arc's range: all clo
 `ctx.ellipse` arcs. The quartic for two ellipses' common tangents is ill-conditioned for some pairs (two far-apart, nearly
 parallel ellipses lost all their roots at orbit angles 5.59-5.60: the cone's capsule degenerated to one ellipse and the
 yellow cone vanished), so `ellipseTangentAngles` checks its roots against a 96-angle sign scan and falls back to the
-bisected scan when it finds fewer crossings. Where a polygon is needed (the joint bodies feed the polygon booleans) the rim points are
-chord-tolerance driven (`ellipsePolygon`, 2.5 x `CURVE_TOL_PX`) instead of a fixed 64 / 128.
+bisected scan when it finds fewer crossings. The joint bodies (`drawAtJoints`) are `hullOutline`s too, and their booleans
+work on *loops with arc edges* (geometry.js: a point may carry `arc` = { c, U, V, t0, t1 }, the edge into it is c + U cos t +
+V sin t, so an affine map carries it by mapping c, U, V; `subtractPolygon`, `subtractDisc`, `pointInLoop`, `loopArea2`; segment
+crossings closed form, arc / circle and arc / arc crossings a trigonometric quartic, `conicRoots`: the other conic's equation
+times det(J)^2 (well scaled for a thin ellipse), halved where a second-derivative bound can't rule a root out, bisected to
+machine precision): the far rims are arcs (sampled into chords within 2.5 x `CURVE_TOL_PX` only where an arc's box
+meets a cut's box), the joint ring is exact arcs (`screenLoop`, below), the ring loops are cut first, then the discs, whose cut is
+an exact arc (on a squashed joint mapped back to an arc of the node's ellipse). Seen nearly edge-on, the ring crosses itself on
+screen (a figure of eight, net area near zero); it is cut at its crossings into simple lobes (`untwistLoop`) before the booleans:
+as one loop its two lobes wound opposite ways, and the front's fill cancelled its own body along the joint (a background gap at
+1.8 in the squashed demo). The disc's terminator (`projectJointSplit`) is the same loop's stretch between the same ends: the
+3D polyline only decides which stretch faces the camera.
 
 **Frame pipeline (`render`):** project nodes → ownership map (node → meshes) →
 joint rings → one primitive per node pair (plus one per joint) → sort
@@ -170,13 +198,20 @@ algorithm on those constraints plus "slabs of one piece in strata order", taking
 strata order each time, so an entry that must wait is moved later). That keeps front body after back body, a
 joint disc after its bodies, and a split cone over its host when it faces the camera / under it when it faces
 away; without it, strata interleaved a cone with its host (green strips clipped over the yellow cone, a
-smoothly moving straight edge, at 2.47; the cone popping over/under the host between 0.76 and 1.25). The cut is
+smoothly moving straight edge, at 2.47; the cone popping over/under the host between 0.76 and 1.25). Pieces of the SAME
+mesh (a hull's edges, a skewed mesh's halves) are not constrained this way: every mesh is its own cluster, and chaining a
+hull's pieces whole pushed a piece's far slabs after another mesh's body lying between them in depth (the cyan triangle's
+node drawn over the green arch at 2.374). The cut is
 by depth along the piece's axis only: the fill triangle of a 3+ node mesh follows the capsule's ramp
 (approximate).
 
 **Border strokes** (`strokes` in `config.js`, the Strokes button; `drawPrimitives`, `paintRecorded`, `strokeUnder`). Where a
-mesh is drawn over ANOTHER mesh of the same color, its edge gets a black stroke of `strokes.px` canvas pixels (constant on
-screen: the line width is divided by `pxPerUnit`). Only colors worn by 2+ meshes take this path (`strokeColorsOf`); everything
+mesh is drawn over ANOTHER mesh of the same color, its edge gets a stroke of `strokes.px` canvas pixels (constant on
+screen: the line width is divided by `pxPerUnit`), one tone darker than the front's tone at that edge (Lit -> Twilight, Twilight ->
+Shade; Twilight with the light off) and only where the mesh behind has the same tone (`toneStroke`): a lit map of the stroked colors'
+fills so far (`updateLitMap`, scratch layer 3, `shading.paint` in mask mode) gives the back's tone; the front fill's lit and twilight
+masks, spread by the stroke's width (17 offset copies) to reach the stroke outside the fill, give the front's. Near a terminator
+crossing the edge the stroke can run up to `px` past it. Only colors worn by 2+ meshes take this path (`strokeColorsOf`); everything
 else is drawn exactly as before. Each fill of such a mesh (a batch flush, a clipped slab run, a joint disc / body, a split cone
 part) is recorded first (`record`), then replayed; before each fill its outline (a `Path2D`, transforms baked in) is stroked on an
 offscreen canvas at 2x the width, masked to the other same-colored meshes' fills painted so far (`painted`, so never over the
@@ -189,8 +224,8 @@ between the two meshes inside the lower one's area can get a stroke painted over
 not its visible pixels. Demo: the basic scene's pink arch is recolored to orange to show it.
 **Skewed halves.** The same stroke separates the two halves of one skewed mesh, always (no fold test: the stroke lengthens and
 shortens with the real overlap instead of switching on). Each half is its own ink owner (`"id.0"` / `"id.1"`, `meshOf`) and its
-own fill, so the one-sample overlap strip around the apex doubles the AA edge there. That strip is not a border: both halves'
-strokes have the body of the samples apex-1 .. apex+1 (plus the stroke's width) cut out (`strokeCut`, `destination-out`), so a
+own fill, so the overlap strip around the apex doubles the AA edge there. That strip is not a border: both halves'
+strokes have the body from 0.5 - DRAW_BAND to 0.5 + DRAW_BAND (plus the stroke's width) cut out (`strokeCut`, `destination-out`), so a
 real fold crossing the apex shows no stroke inside that strip. Which half is on top is the draw order (mean sample depth).
 
 **Light engine** (`light.js`, `shading.js`; `light` / `lighting` in `config.js`; the Light button). One directional world light
@@ -224,13 +259,31 @@ semi-diameters `(B - A) / 2` and `S - M`, so S is the apex even when off-center.
 only: each end's `shape.Q` is written in the arch's moving frame (tangent, in-plane normal, plane normal), the two forms are
 mixed with a smoothstep and turned back (`shapeAt`); the whole ellipsoid is swept, so a flat end's extent along the arch makes the band bulge where the arch bends. That is intended: sweeping only the cross-section (tried) leaves the ribbon drifting off the flat end discs, so the arch must start and end on the nodes' own shapes. The Debug view's section (`sectionAt`) is the true cut perpendicular to the arch, so it differs from the drawn bulge. So thickness and width are kept along the arch (no swelling from mixing
 differently oriented shapes in world coordinates). All-round ends use the circle path with a smoothstep radius. On screen the body
-is the union of capsules between consecutive projected circles / ellipses (`archSamples`, refined until in-between ones lie inside
-their neighbors' capsule; `traceEllipseCapsule` for squashed ends), traced into one nonzero path. v1 limits: plain meshes only
+is the union of the visible strips of its shading's exact rows (`outline` in `buildArch`, shading.js; built without light by
+`frame.archGeom` when the light is off): each strip is two exact elliptic arcs (the rows' visible halves, true perspective) and two
+chords, wound anticlockwise, all traced into one nonzero path; the visible surface covers the whole body on screen, so this is its
+outline from the same rows as its lit part (no offset between the two). A strip whose sides cross (a fold) is the hull of its row
+curves. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
 (skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
-(`buildSkewPrimitives`, overlapping by one sample past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
+(`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
 Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
+**Rules (axial squash, `finalizeShapes` in scene.js, run once the meshes exist).** Every squashed piece is closed form:
+- the free end of a plain 2-node mesh squashes only along the axis to its partner (`shape.axial`; squash < 1 a coin facing
+  along the cone, > 1 stretched along it). The hull of two bodies of revolution about the same axis is a circular cone,
+  tangent to each along a circle: `coaxialCone` (splitRing.js) solves its normal from the equal supports
+  sqrt(raN^2 s^2 + rpN^2 c^2) = D s + sqrt(raF^2 s^2 + rpF^2 c^2), a quadratic in sin^2 T (two spheres give `tangentCone`
+  bit for bit). Joints (round joint node) and split cones (round shared node and host) use it in their closed forms: a
+  cone tangent to a sphere along a circle is all the plane rule S = k L^2 needs;
+- a node in two or more meshes, or in a 3+ node mesh, is made round (`console.warn`): it can't be symmetric about every
+  cone's axis;
+- an arch end (skewed mesh) keeps its own `axis`: an arch is a sweep, every row a plane slice of an ellipsoid, exact for
+  any orientation (flat ribbons).
+The general machinery below (free-axis squashes: `jointCurveGeneral.js`, `hullCone.js`, `hostHull.js`,
+`findGeneralSplitRing` / `findUniformSplitRing`) is kept but no scene reaches it; it checks the closed forms (an axial joint
+ring matches `buildJointCurveGeneral` on the same bodies within 0.01 px, the split rings to 1e-13).
+
 A node is a spheroid: `createNode(center, radius, { squash, axis })`; `node.shape` (`makeShape`,
 `geometry.js`) has semi-axis `radius * squash` along `axis` and `radius / sqrt(squash)` across (same volume).
 `projectNode` gives its screen shadow `ellipse` `{a, b, angle}` (closed form, `shadowEllipse`) and `round`
@@ -246,9 +299,9 @@ a linear map: a node off the view axis shows its top or underside, and the shape
 no lens distortion (the cut always lies inside the silhouette). Spheres keep the plain camera basis, so
 they stay circles.
 
-**Joints with squashed nodes** (`computeJoints`, `render.js`). If any of a joint's three nodes is
-squashed, its ring is the general one (`jointCurveGeneral.js`); all-round joints keep the closed form
-(bit-identical output). The flat solid gives each node an ellipsoid (`ellipsoidShape`, `flatBody`): its
+**Joints with squashed nodes** (`computeJoints`, `render.js`). A round joint node with round or axial far ends takes the
+closed form (an axial far end is, in the flat solid, the spheroid about the flat axis with its own scale, `ra` / `rp`). A
+squashed joint node or a free-axis far end (no longer made by the scenes) takes the general ring (`jointCurveGeneral.js`). The flat solid gives each node an ellipsoid (`ellipsoidShape`, `flatBody`): its
 projected ellipse as the shadow along z (so the orthographic silhouette is exactly what is drawn) and the
 body's own half-extent along the view (`zRadius`) as the third axis. Cones are `hullCone.js` hulls of the
 joint body and each far body. The ring is not planar any more:
@@ -256,7 +309,7 @@ joint body and each far body. The ring is not planar any more:
   (azimuth psi) where hFB - hN changes sign; the front arc of psi is the one with hFB > hN (A's generatrix
   starts inside hull B there);
 - front: per psi, the point where A's generatrix leaves hull B. `hullSigned` is convex along a line, so Newton
-  from the far end converges monotonically (slope = probe normal . direction). 31 exact points
+  from the far end converges monotonically (slope = probe normal . direction). 8 exact points
   (cosine-spaced, warm-started), a cubic Hermite spline through them, and an exact point added wherever the
   spline's midpoint is off by more than half the chord tolerance, then chords within `tol`;
 - back: the plane through both touch points and the centroid of the exact front points cuts the joint
@@ -279,8 +332,8 @@ comes in front of the node's disc when its arm points at the camera, but a thin 
 about 0.3 and tilted: `jointFlat` in `jointRef.mjs`) lets a hull bulge in front of the node's rim, and a
 sliver of the disc's color (about 10 x 70 px, 0.2% of the samples in the worst of 6 angles) is painted
 where that cone should be. The demo's squash values (0.7, 1.5) are checked by `jointRef.mjs`'s `demoV`.
-**Split cones with squashed nodes** (`splitRing.js`; used when the shared node, the far node or any host node is squashed,
-else the closed forms below, bit-identical). Three cases, one definition of the ring. The ring is where the cone's
+**Split cones with squashed nodes** (`splitRing.js`; a round shared node and host with a round or axial far end take the
+closed forms with `coaxialCone`; the cases below are for squashed shared or host nodes or a free-axis far end, kept unused). Three cases, one definition of the ring. The ring is where the cone's
 cross-section by a *slicing plane* last meets the host; the planes are `{ (p - c_shared) . w = const }`, `w = Q_shared^-1 d`
 (d the unit axis, scaled so that the constant is the axial distance where the plane crosses the axis): planes
 perpendicular to the axis once the shared body is a sphere. For a round shared node w = d, the old definition.
@@ -305,8 +358,8 @@ shared body's support >= the far body's along the rim point's world normal `cx r
 `n . axis <= sinT` in general form; its ends by bisection); the far part (`drawSplitFarGeneral`) the hull of the ring and
 the far rim ellipse, with a chord instead of the cap at a joint. Both are `hullOutline`s (exact arcs). A split cone ending
 at a squashed joint aligns its ring to the flat capsule of the two ellipses (`alignToFlatEllipses`, from `ellipseCapsule`).
-The cone debug overlay skips squashed splits. The host is treated as convex. The demo's pyramid, its apex and the orange
-end are squashed.
+The cone debug overlay skips free-axis squashed splits. The host is treated as convex. The demo's squashed nodes are all
+free ends now (the blue end, the purple split cone's far end, the V arms, the small pairs).
 
 **Exact outlines** (`hullOutline`, `traceOutline` / `fillOutline`). The split cone parts of round nodes are hulls of
 ellipses and an arc, no sampled points: the projected ring and tangent circle are exact ellipses (`projectedCircleEllipse`:
@@ -317,8 +370,18 @@ an ellipse, common tangents of two ellipses, the ends of an arc's range: all clo
 `ctx.ellipse` arcs. The quartic for two ellipses' common tangents is ill-conditioned for some pairs (two far-apart, nearly
 parallel ellipses lost all their roots at orbit angles 5.59-5.60: the cone's capsule degenerated to one ellipse and the
 yellow cone vanished), so `ellipseTangentAngles` checks its roots against a 96-angle sign scan and falls back to the
-bisected scan when it finds fewer crossings. Where a polygon is needed (the joint bodies feed the polygon booleans) the rim points are
-chord-tolerance driven (`ellipsePolygon`, 2.5 x `CURVE_TOL_PX`) instead of a fixed 64 / 128.
+bisected scan when it finds fewer crossings. The joint bodies (`drawAtJoints`) are `hullOutline`s too, and their booleans
+work on *loops with arc edges* (geometry.js: a point may carry `arc` = { c, U, V, t0, t1 }, the edge into it is c + U cos t +
+V sin t, so an affine map carries it by mapping c, U, V; `subtractPolygon`, `subtractDisc`, `pointInLoop`, `loopArea2`; segment
+crossings closed form, arc / circle and arc / arc crossings a trigonometric quartic, `conicRoots`: the other conic's equation
+times det(J)^2 (well scaled for a thin ellipse), halved where a second-derivative bound can't rule a root out, bisected to
+machine precision): the far rims are arcs (sampled into chords within 2.5 x `CURVE_TOL_PX` only where an arc's box
+meets a cut's box), the joint ring is exact arcs (`screenLoop`, below), the ring loops are cut first, then the discs, whose cut is
+an exact arc (on a squashed joint mapped back to an arc of the node's ellipse). Seen nearly edge-on, the ring crosses itself on
+screen (a figure of eight, net area near zero); it is cut at its crossings into simple lobes (`untwistLoop`) before the booleans:
+as one loop its two lobes wound opposite ways, and the front's fill cancelled its own body along the joint (a background gap at
+1.8 in the squashed demo). The disc's terminator (`projectJointSplit`) is the same loop's stretch between the same ends: the
+3D polyline only decides which stretch faces the camera.
 
 **Frame pipeline (`render`):** project nodes → ownership map (node → meshes) →
 joint rings → one primitive per node pair (plus one per joint) → sort
@@ -344,13 +407,20 @@ algorithm on those constraints plus "slabs of one piece in strata order", taking
 strata order each time, so an entry that must wait is moved later). That keeps front body after back body, a
 joint disc after its bodies, and a split cone over its host when it faces the camera / under it when it faces
 away; without it, strata interleaved a cone with its host (green strips clipped over the yellow cone, a
-smoothly moving straight edge, at 2.47; the cone popping over/under the host between 0.76 and 1.25). The cut is
+smoothly moving straight edge, at 2.47; the cone popping over/under the host between 0.76 and 1.25). Pieces of the SAME
+mesh (a hull's edges, a skewed mesh's halves) are not constrained this way: every mesh is its own cluster, and chaining a
+hull's pieces whole pushed a piece's far slabs after another mesh's body lying between them in depth (the cyan triangle's
+node drawn over the green arch at 2.374). The cut is
 by depth along the piece's axis only: the fill triangle of a 3+ node mesh follows the capsule's ramp
 (approximate).
 
 **Border strokes** (`strokes` in `config.js`, the Strokes button; `drawPrimitives`, `paintRecorded`, `strokeUnder`). Where a
-mesh is drawn over ANOTHER mesh of the same color, its edge gets a black stroke of `strokes.px` canvas pixels (constant on
-screen: the line width is divided by `pxPerUnit`). Only colors worn by 2+ meshes take this path (`strokeColorsOf`); everything
+mesh is drawn over ANOTHER mesh of the same color, its edge gets a stroke of `strokes.px` canvas pixels (constant on
+screen: the line width is divided by `pxPerUnit`), one tone darker than the front's tone at that edge (Lit -> Twilight, Twilight ->
+Shade; Twilight with the light off) and only where the mesh behind has the same tone (`toneStroke`): a lit map of the stroked colors'
+fills so far (`updateLitMap`, scratch layer 3, `shading.paint` in mask mode) gives the back's tone; the front fill's lit and twilight
+masks, spread by the stroke's width (17 offset copies) to reach the stroke outside the fill, give the front's. Near a terminator
+crossing the edge the stroke can run up to `px` past it. Only colors worn by 2+ meshes take this path (`strokeColorsOf`); everything
 else is drawn exactly as before. Each fill of such a mesh (a batch flush, a clipped slab run, a joint disc / body, a split cone
 part) is recorded first (`record`), then replayed; before each fill its outline (a `Path2D`, transforms baked in) is stroked on an
 offscreen canvas at 2x the width, masked to the other same-colored meshes' fills painted so far (`painted`, so never over the
@@ -363,8 +433,8 @@ between the two meshes inside the lower one's area can get a stroke painted over
 not its visible pixels. Demo: the basic scene's pink arch is recolored to orange to show it.
 **Skewed halves.** The same stroke separates the two halves of one skewed mesh, always (no fold test: the stroke lengthens and
 shortens with the real overlap instead of switching on). Each half is its own ink owner (`"id.0"` / `"id.1"`, `meshOf`) and its
-own fill, so the one-sample overlap strip around the apex doubles the AA edge there. That strip is not a border: both halves'
-strokes have the body of the samples apex-1 .. apex+1 (plus the stroke's width) cut out (`strokeCut`, `destination-out`), so a
+own fill, so the overlap strip around the apex doubles the AA edge there. That strip is not a border: both halves'
+strokes have the body from 0.5 - DRAW_BAND to 0.5 + DRAW_BAND (plus the stroke's width) cut out (`strokeCut`, `destination-out`), so a
 real fold crossing the apex shows no stroke inside that strip. Which half is on top is the draw order (mean sample depth).
 
 **Light engine** (`light.js`, `shading.js`; `light` / `lighting` in `config.js`; the Light button). One directional world light
@@ -389,10 +459,10 @@ axis) continues the cone's straight border across the seam without a corner. The
 (light along the axis gives nothing lit, and the lit side flips as the axis passes through the light's direction). `hull(meshId, nodes)`
 (3+ node meshes) uses the light itself for spheres, cones and faces, so they agree wherever they meet (the normal is continuous); each
 piece paints its own two spheres, its cone and the mesh's faces. Borders can kink at a node where several cones meet. A split cone's
-host-colored part = all of the host's elements (it is painted over the host's own pieces, so its Twilight base would otherwise cover them) + the cone lit by L itself (`shading.cone`), so the light model only changes on the split ring, where the color does; every host piece's shared-node sphere gives way to the split cones there (`hull.elements(frame.splitFarsOf)`, not skipped: a host piece drawn after the host part would cover the cap with its base). A joint disc has per-fill elements (`{ fills: [...] }`, like `owners`): each region gets its own tube's joint sphere and cone (`pair`, cached by the unordered pair), so each cone's straight border runs on across the disc and the tube changes only on the ring. The arch's shading (`arch(key, samples, cutAt)`) is always cut into sheets at the apex (a soft cut: no cover on the strips beside it) besides its folds (below), each sheet tagged with its `half`. The half drawn LATER (smaller key) paints every sheet: its round end disc reaches well past the apex, and painting only its own part left that disc in the base tone (a moon-phase look at the skew node, which itself is never drawn). The half drawn first paints only its own sheets (a sheet's `half` is read from the far row of its first strip: the strip across the apex cut starts on the sample before it): the other half's sheets are the 3D surface, not that half's drawn outline (a chain of flat circles), and where they reached past it they stayed on the earlier half (the front half's shading past its edge and border stroke, a base-tone band along the apex; top orange arch at 2.02). Its own disc past the apex is the later half's circle at that sample, so it is covered. Each end cap closes with a ring at its pole. A shaded
+host-colored part = all of the host's elements (it is painted over the host's own pieces, so its Twilight base would otherwise cover them) + the cone lit by L itself (`shading.cone`), so the light model only changes on the split ring, where the color does; every host piece's shared-node sphere gives way to the split cones there (`hull.elements(frame.splitFarsOf)`, not skipped: a host piece drawn after the host part would cover the cap with its base). A joint disc has per-fill elements (`{ fills: [...] }`, like `owners`): each region gets its own tube's joint sphere and cone (`pair`, cached by the unordered pair), so each cone's straight border runs on across the disc and the tube changes only on the ring. The arch's shading (`arch(key, samples, cuts)`) is always cut into sheets (soft cuts: no cover on the strips beside them) at `cuts.lo` / `cuts.hi`, 1/16 of the arch each way from the apex (`SHARED_BAND`; when the outline was a chain of flat circles, off the true surface by about a pixel near the apex, the later half's fill missed the start of its own surface beside the skew node, a hairline of the earlier half's base tone at 2.144), inserted into the shading samples, besides its folds (below); each sheet is tagged with its `half`: 0, 1, or 'both' for the band where the two fills overlap. The half drawn LATER (smaller key) paints every sheet; the half drawn first paints its own sheets and the 'both' band. Painting only its own part left its round end past the apex in the base tone (a moon-phase look at the skew node, which itself is never drawn); painting everything put the other half's 3D surface past that half's drawn outline (a chain of flat circles) onto the earlier half (top orange arch at 2.02); a single cut at the apex left the strip between the apex and the last drawn sample, which lies along the outline where the arch points at the camera, to neither half (a ring of base tone around the skew node at 1.577). Rows: placed by the view (`refine` in `buildArch`): 16 uniform steps plus apex / lo / hi, each bisected (up to 6 times; the caps, from the end row to the pole, 4 steps bisected up to 4 times) while a tracked curve (the visible and lit arcs' ends, i.e. silhouette and terminator) leaves the chord between two rows by more than 0.5 px on screen or the arcs change between them; the rows' world samples are cached per mesh while its nodes stay put (`archSampleCache`, render.js). Each row is a planar 3D conic (a circle on a round arch, the ellipsoid's cut by t^T Q x = 0 on a squashed one), so its screen image is an exact ellipse in closed form (`projectedEllipse`: the projection is projective, the image's dual conic is H diag(1, 1, -1) H^T with H = [U V C]; the conic itself, H^-T diag(1, 1, -1) H^-1, blew a flat ribbon's thin rows up to thousands of pixels) and its arcs are drawn with `ellipse`; only the strips' sides are chords (an edge-on row is a polyline). A squashed end's cap is sliced by planes parallel to its end row (`sliceRing`: with the conjugate semi-diameters T along the tangent and U0 / V0 of the end row, each slice is c + sign sin a T + cos a (U0 cos phi + V0 sin phi), and facing / lit are each y^T K w >= 0, linear in cos / sin phi: closed form); the rings of constant normal angle it used before are not planar on an ellipsoid. The sheets' overlap and order tests run on coarse polylines of the same arcs (5 steps), with boxes per strip and sheet and memoized pair tests. Each end cap closes with a ring at its pole. A shaded
 piece drawn through a depth-strata strip (`partial`) is built on a transparent group layer (`scratchLayers(ctx)[2]`) and composited once
 through the strip's clip: painted directly, its base tone and lit part would each blend over what the neighboring strip painted through
-the antialiased clip edge and leave a trace of the lower layer. **Skewed arches** (`buildArch`, `shading.arch`, in WORLD space; 65 uniform samples of the arch, independent of the drawn chain): each sample has its body's form K (x^T K x = 1: `inverse(shapeAt(...)(t))`, since `shape.Q` is S^2, or I/r^2 for round ends). The swept body's surface is the envelope of its ellipsoids: its point with unit normal n (n perpendicular to the arch's tangent) is c + S n / sqrt(n^T S n), S = K^-1. Per sample the normals are a circle n(phi) in the plane perpendicular to the tangent, so n . L >= 0 is exactly one arc of phi and n . v >= 0 (facing the viewer) another; the lit visible surface is their intersection (`meet`), whose ends are the terminator (independent of the camera) or the silhouette. Consecutive samples' arcs, cut into 5 steps, make quads in ONE path (no seam); the ends are capped with 10 rings n = cos(a) n(phi) + sin(a) out, with arcs cos(phi - phiL) >= -tan(a) (out . L) / |L_e|. Where one ring has lit arcs and the next has none (a lit patch starting between them, mostly on the caps), each arc tapers to a point halfway to the other ring; with 1 vs 2 arcs the strip is skipped. Where the two arcs are on different sides of the body (centers more than 1 rad apart: light from nearly behind, a rim sliver that shrinks to nothing where the light lines up with the view and comes back on the other silhouette), joining them crossed the whole arch as a thin lit wedge (2.465), and skipping the strip made each sliver end square (a break at 2.02); each sliver now tapers to a point on its silhouette, at the fraction of the step where the widths reach zero. Arc ends on the silhouette are pushed out 1.5 px (`ARCH_SEAM_PX`) so the lit part reaches the drawn outline. Folds: the arch is not convex, and a wide band turning past edge-on at a bend lies over itself on screen (the green ribbon at 4.04: t < 0.33 over t 0.33-0.5 in one half), so one lit path showed the hidden layer's light through the front one. The visible surface is front-facing everywhere, so a fold is not an orientation flip but a contour across the band: a silhouette point (an end of a row's visible arc) jumps across the band between two samples (`crosses`, never inside an end cap). The strips are cut into sheets there, and also where a strip overlaps on screen a non-neighbor (3+ strips back) of its sheet: a tube bending toward the camera hides its own earlier strips behind later ones with no contour across it (a lit rim crescent showed through at the apex of the threaded orange arch at 2.02); painted back to front (ordered by their depths at probe points where they overlap); a sheet that overlaps one painted before it first fills its visible quads in the base tone (`cover`), then its lit quads. The Debug view draws the terminator (the visible ends of the lit arcs) in magenta. Not shaded yet: squashed nodes of plain meshes, and the tone-aware border stroke color (still black).
+the antialiased clip edge and leave a trace of the lower layer. **Skewed arches, tube mode** (`lighting.archTube`, on): like the straight cones' tube light, not realistic but simpler to render. Each row of the arch is lit on one fixed half of its cross-section in the arch's own frame (e1 = the arch plane's normal made perpendicular to the tangent, e2 = t x e1), centered on the tube light at the skew node (`phiS`: the light without its part along the tangent there), so the shade lines are the Debug view's cyan curves (`archBorderCurves`) from end to end, matching them exactly (same samples' tangents `t` and, on round arches, the radius' tilt `sinT` as the rows' angle `a`); the end caps take the same half (cos(phi - phiS) >= 0 on every ring). Everything below (visibility, sheets, halves) is unchanged. **Skewed arches** (`buildArch`, `shading.arch`, in WORLD space; with `archTube` off, lit by the light itself; its own rows, independent of the drawn chain): each sample has its body's form K (x^T K x = 1: `inverse(shapeAt(...)(t))`, since `shape.Q` is S^2, or I/r^2 for round ends). The swept body's surface is the envelope of its ellipsoids: its point with unit normal n (n perpendicular to the arch's tangent) is c + S n / sqrt(n^T S n), S = K^-1. Per sample the normals are a circle n(phi) in the plane perpendicular to the tangent, so n . L >= 0 is exactly one arc of phi and n . v >= 0 (facing the viewer) another; the lit visible surface is their intersection (`meet`), whose ends are the terminator (independent of the camera) or the silhouette. Consecutive samples' arcs, make strips (two elliptic arcs and two chords) in ONE path (no seam); the ends are capped with rings n = cos(a) n(phi) + sin(a) out, with arcs cos(phi - phiL) >= -tan(a) (out . L) / |L_e|. Where one ring has lit arcs and the next has none (a lit patch starting between them, mostly on the caps), each arc tapers to a point halfway to the other ring, at the arc's end nearest the other ring's visible arc (aimed at its middle, the tip could face away there and project across the tube); with 1 vs 2 arcs the strip is skipped. Where the two arcs are on different sides of the body (centers more than 1 rad apart: light from nearly behind, a rim sliver that shrinks to nothing where the light lines up with the view and comes back on the other silhouette), joining them crossed the whole arch as a thin lit wedge (2.465), and skipping the strip made each sliver end square (a break at 2.02); each sliver now tapers to a point on its silhouette, at the fraction of the step where the widths reach zero. Arc ends on the silhouette are pushed out 1.5 px (`ARCH_SEAM_PX`) so the lit part reaches the drawn outline. Folds: the arch is not convex, and a wide band turning past edge-on at a bend lies over itself on screen (the green ribbon at 4.04: t < 0.33 over t 0.33-0.5 in one half), so one lit path showed the hidden layer's light through the front one. The visible surface is front-facing everywhere, so a fold is not an orientation flip but a contour across the band: a silhouette point (an end of a row's visible arc) jumps across the band between two samples (`crosses`, never inside an end cap). The strips are cut into sheets there, and also where a strip overlaps on screen a non-neighbor (at least 3/64 of the arch back, not 3 strips: rows are denser where the arch points at the camera) of its sheet: a tube bending toward the camera hides its own earlier strips behind later ones with no contour across it (a lit rim crescent showed through at the apex of the threaded orange arch at 2.02); two strips overlap where their row curves cross or a point of one lies inside the other, on their true projection (`raw`: before the ARCH_SEAM_PX push, which would make strips of an ordinary bend touch), end points included: counting sample points inside missed the thin crescents of a tube pointing at the camera (a lit hook at the skew node at 2.0), and leaving the end points out missed strips that overlap only along the silhouette (a lit rim near the apex showing through a nearer unlit part as a sliver beside the skew node, 4.256); across a cut that is not a contour (soft, self-overlap) the sheet painted later also fills the neighbor's adjacent strip's lit part (underpaint, rule 1), so no hairline of the base tone is left on the cut row inside a lit part; a sheet paints its cover when it overlaps a sheet painted before it by the probes' order OR by the strips' own overlap test (the probes, a few points inside each strip, missed a thin overlap along a junction, and the thin tube's lit tip showed through the nearer big tube beside the skew node at 2.146); painted back to front (ordered by their depths at probe points where they overlap); a sheet that overlaps one painted before it first fills its visible quads in the base tone (`cover`), then its lit quads. The Debug view draws the terminator (the visible ends of the lit arcs) in magenta. It also draws, in cyan, the shade borders a straight cone would have, computed in WORLD space (tube light: the light without its part along the axis; fixed on the object as the camera orbits): for each round 2-node mesh the two border generatrices (`tubeBorderLines`, dashed where they face away), and on each skewed arch two dots where they would cross the skew node's cross-section taken as a straight cone's (`tubeBorderDebug`: on a round arch, the middle of the border generatrices of the tangent cone of the arch's spheres just before and after the skew node, the same `tubeBorders` as the lines, so its normals tilt by sinT where the radius changes; on a squashed arch, the normals perpendicular to the tangent mapped onto the body). Through each dot runs a cyan curve along the whole arch, end node to end node (`archBorderCurves`, world space): it keeps the dot's angle around the arch in the arch's own frame (e1 = the arch plane's normal made perpendicular to the tangent, e2 = t x e1; the arch is planar, so the frame turns with it without twisting), with the radius' tilt sinT on round arches and mapped onto the body on squashed ones. The drawn tube shading is computed in the flat solid instead and slides about +-10 degrees around the tube over an orbit (blue tube: 55-71 vs 61.2 degrees). Not shaded yet: squashed nodes of plain meshes.
 
 ## Concepts
 - **Mesh pieces.** Each node pair of a mesh is a *capsule* (two circles joined
@@ -432,7 +502,11 @@ the antialiased clip edge and leave a trace of the lower layer. **Skewed arches*
     cos/sin once multiplied by the denominator) is at an angle given by
     a + b cos th + c sin th = 0. The ring is the run of arcs between those angles that
     ends at touch points on both sides (else the longest), cut into chords within
-    `CURVE_TOL_PX` of the curve (`render.js`), not sampled at fixed angles. Marching A's generatrices out of
+    `CURVE_TOL_PX` of the curve (`render.js`), not sampled at fixed angles. On screen (`screenLoop`) it is two exact
+    arcs: the back is a circle (an ellipse seen along z) and the front is the plane's cut of cone A, the central
+    projection from the cone's apex of its tangent circle onto the plane, so a homography of a circle
+    (`homographyEllipse`: the dual conic H diag(1, 1, -1) H^T); a front that is a hyperbola keeps its chords. A squashed
+    joint's back (the plane's cut of its ellipsoid) is an exact arc too; its front, the crease of two hulls, is chords. Marching A's generatrices out of
     B's sdf instead (and taking the longest run) flipped to the other crossing conic
     for single frames when the two were almost equally long (the ring went off
     course, e.g. at 2.904 in the focus view) and lost its ends near the touch points;
@@ -591,12 +665,23 @@ the antialiased clip edge and leave a trace of the lower layer. **Skewed arches*
 
 ## Optimization backlog (these change pixels; verify each with the AA sim)
 - Batch joint capsules and the split cone into unions too (rule 3).
-- The joint bodies' polygons (ring loops of ~150 points, the polygon booleans) are the largest remaining source of
-  path operations; an outline with arc edges through `subtractDisc` / `subtractPolygon` would remove it.
+- The squashed joint's front ring (the crease of two hull cones) has no closed form: chords through a spline of exact points.
 - `firstContact`'s capsule between two non-shared host spheres scans 72 angles as seeds and refines the two best peaks
   by a golden section (cached, so it only runs when a node moves); a closed form is a high-degree polynomial.
 
 ## Performance notes
+- Axial squash (no squashed joint node or host any more): the squashed joints' and split rings' Newton solves are gone; the
+  root search for arcs (`conicRoots`) bounds the second derivative, as the first-order bound piled up millions of halves
+  around the double roots where a ring's two arcs meet tangentially. Full scene (rebuilt) 2.4 ms per frame.
+- Joint bodies and rings with exact arcs (no far-rim polygon in the booleans, no 2-degree disc arc, a round ring is 2 arcs instead
+  of ~150 chords), and the squashed ring's solves (8 starting nodes instead of 12: 18 solves per joint instead of 23; a hull probe
+  whose window misses the maximum climbs on from its edge instead of scanning all 96 generatrices: 3 full scans per joint instead
+  of 46; Newton warm-started 0.02 past the last frame's root): full scene 5.45 -> 5.0 ms per frame against the version before
+  (JS only), with the bodies' booleans now on arcs.
+- Skewed arches (basic scene: 26 -> 7 ms per frame, JS only; the outline is the shading's strips, no capsule chain to trace): the shading's rows are exact projected conics placed by a screen
+  tolerance (31-53 main rows instead of 64 + bisections), the sheet tests use boxes and memos, and a flat ribbon's capsules between
+  grains thinner than the chord tolerance are the hull of the segments' ends (no common-tangent quartic). `ellipseTangentAngles`'
+  Newton polish stops once converged.
 Per frame, normal view, about half the time of the previous version (profile with a
 Node harness, see Debugging). What is closed form or cached now:
 - `findSplitRing` / `findLastContact` are cached per cone against a snapshot of the
@@ -615,7 +700,7 @@ Node harness, see Debugging). What is closed form or cached now:
   is not traced. `drawTriangle` / `drawPairCapsule` were unreachable and are gone.
 - Squashed joints (demo: 5 of them; 39 ms -> 7 ms per frame): hull cones and probes work on scalars (`shape.Q`, no
   {x, y, z} objects in the inner loops) and every normal is exact (Newton on g from an interpolated phi, no
-  interpolation used as the answer); the ring is a few exact solves (about 28, was 195) plus a Hermite spline whose tangents
+  interpolation used as the answer); the ring is a few exact solves (about 18, was 195) plus a Hermite spline whose tangents
   are the exact `nA x nB` with lengths `2 L / (1 + T . c)` (exact for a circle), checked by the distance from an exact point
   to the spline (not by comparing the spline at an equal parameter value, which measures the speed, not the shape); each
   solve starts from the last frame's `t` / azimuth (`MEMORY` in `jointCurveGeneral.js`, keyed by the joint node) and an

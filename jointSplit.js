@@ -3,7 +3,7 @@
 // faces the camera separates the two colors, so that part, clipped to the
 // node circle, is the terminator; the rim arc on the dominant mesh's side
 // closes the dominant region.
-import { segmentCircleHit } from './geometry.js';
+import { segmentCircleHit, locateOnLoop, loopPath, loopPoint, loopCircleCross } from './geometry.js';
 import { facesCamera } from './jointCurve.js';
 
 const TWO_PI = Math.PI * 2;
@@ -53,7 +53,10 @@ function visibleRun(curve, view) {
 // mesh's far node (it tells which side of the terminator is dominant).
 // Returns { terminator: [{x, y}], th0, th1, domIncreasing, span } or null when
 // the curve gives no usable split (the caller falls back to one color).
-export function projectJointSplit(curve, center, radius, view, dominantFar) {
+// `loop2D`: the ring on screen with its exact arcs (jointCurve.js screenLoop, in the same space as `view`): the
+// terminator is then that loop's stretch between the same ends (its points carry their arcs, geometry.js loops),
+// the chords only deciding which stretch.
+export function projectJointSplit(curve, center, radius, view, dominantFar, loop2D = null) {
   const T = visibleRun(curve, view);
   if (!T) return null;
 
@@ -75,8 +78,17 @@ export function projectJointSplit(curve, center, radius, view, dominantFar) {
   const stretch = T.slice(best.start, best.end + 1).map(q => ({ x: q.x, y: q.y }));
   const entry = best.start > 0 ? segmentCircleHit(T[best.start - 1], T[best.start], center, radius) : null;
   const exit = best.end < T.length - 1 ? segmentCircleHit(T[best.end], T[best.end + 1], center, radius) : null;
-  const terminator = [entry || snap(stretch[0]), ...stretch, exit || snap(stretch[stretch.length - 1])];
-  if (terminator.length < 3) return null;
+  let terminator = [entry || snap(stretch[0]), ...stretch, exit || snap(stretch[stretch.length - 1])];
+  if (loop2D) {
+    // the same stretch of the exact loop: from its crossing with the circle (or the snapped first point) to the next one
+    const at = (p) => locateOnLoop(loop2D, p), sIn = at(stretch[0]), sOut = at(stretch[stretch.length - 1]);
+    const s0 = entry ? loopCircleCross(loop2D, at(T[best.start - 1]), sIn, center, radius) : null;
+    const s1 = exit ? loopCircleCross(loop2D, sOut, at(T[best.end + 1]), center, radius) : null;
+    const head = s0 !== null ? loopPoint(loop2D, s0) : null;
+    terminator = [head || snap(stretch[0]), ...(head ? [] : [loopPoint(loop2D, sIn)]), ...loopPath(loop2D, s0 ?? sIn, s1 ?? sOut)];
+    if (s1 === null) terminator.push(snap(stretch[stretch.length - 1]));
+  }
+  if (terminator.length < 3 && !(terminator.length === 2 && terminator[1].arc)) return null;
 
   const e0 = terminator[0], e1 = terminator[terminator.length - 1];
   const th0 = Math.atan2(e0.y - center.y, e0.x - center.x), th1 = Math.atan2(e1.y - center.y, e1.x - center.x);
