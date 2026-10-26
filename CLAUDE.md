@@ -65,7 +65,16 @@ is closer at the last depth; a range ends on its row's exact visible arc, or at 
 ellipse (the polar plane section, `contourOf`), its whole ellipse when the end row is hidden. The strips (the shading's quads) are only
 a fallback for a row whose whole ring faces the camera. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
 (skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
-(`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
+(`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam). A half is
+cut only where it must be, not at every stratum (`drawPrimitives`, `slice.cutAt`): at the depths of the entries of OTHER meshes
+that overlap it on screen (a sliced piece's slab by its own part of the capsule, `shapeOf`) and sort inside its depth range; an
+entry in stratum k with key K becomes the depth clamp(K, k BIN, (k + 1) BIN), another arch's half its key. The center's depth along the
+arch is a sinusoid in th = PI (1 - t), so the cuts are closed form and rows of the arch (`cuts.slabs`); each slab (one per depth
+interval, at most two ranges of t) sorts by its mean depth, strictly between its cuts, so on the right side of every cutter. With no
+cutter a half is one piece, as before. Consecutive slabs still merge unless a piece between them overlaps one of the slabs that would
+move before it (by the slabs' own capsules), so a cut where the other mesh only meets the farther part draws whole. A run that can't
+merge is no clip strip but its own exact outline over its ranges (`archPartial`), each end that meets a slab drawn later reaching
+`seam` on screen past it (`slice.ext`, also rows). Overlap tests use about 8 capsules along each half.
 Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
@@ -195,8 +204,10 @@ slab per stratum it spans; slabs are drawn farthest stratum first and, inside a 
 key (`depth`), so every rule that works on piece keys (the layered split cone keys, `orderJointBodies`, the
 joint disc after its bodies) still holds inside a stratum. Pieces without a ramp (joint discs, the split
 node's shared part) sit in the stratum of `binDepth`. A piece is drawn whole, exactly as an uncut piece
-(batched, no clip, no seam), when its slabs can be put together: only pieces whose screen box (`boxOf`)
-overlaps it and that have another color are in the way, so the rest between its slabs don't count. Otherwise
+(batched, no clip, no seam), when its slabs can be put together: only pieces of OTHER meshes whose screen shape
+(`piecesOverlap`) overlaps it are in the way, whatever their color (a same-colored mesh shows which is in front by its border stroke
+and its own shading: skipping it drew the top orange arch whole at its farthest stratum, behind the threaded one, at 3.128), so the
+rest between its slabs don't count. Otherwise
 a run of its slabs is drawn through a clip strip along its slice axis (its outline recorded once and
 replayed), widened by `SEAM_PX` toward each neighboring slab that is drawn LATER so the earlier one reaches
 under the later one (rule 1; strip edges are straight, so rule 4 holds). Strata decide between SEPARATE meshes only.
@@ -283,7 +294,16 @@ is closer at the last depth; a range ends on its row's exact visible arc, or at 
 ellipse (the polar plane section, `contourOf`), its whole ellipse when the end row is hidden. The strips (the shading's quads) are only
 a fallback for a row whose whole ring faces the camera. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
 (skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
-(`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
+(`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam). A half is
+cut only where it must be, not at every stratum (`drawPrimitives`, `slice.cutAt`): at the depths of the entries of OTHER meshes
+that overlap it on screen (a sliced piece's slab by its own part of the capsule, `shapeOf`) and sort inside its depth range; an
+entry in stratum k with key K becomes the depth clamp(K, k BIN, (k + 1) BIN), another arch's half its key. The center's depth along the
+arch is a sinusoid in th = PI (1 - t), so the cuts are closed form and rows of the arch (`cuts.slabs`); each slab (one per depth
+interval, at most two ranges of t) sorts by its mean depth, strictly between its cuts, so on the right side of every cutter. With no
+cutter a half is one piece, as before. Consecutive slabs still merge unless a piece between them overlaps one of the slabs that would
+move before it (by the slabs' own capsules), so a cut where the other mesh only meets the farther part draws whole. A run that can't
+merge is no clip strip but its own exact outline over its ranges (`archPartial`), each end that meets a slab drawn later reaching
+`seam` on screen past it (`slice.ext`, also rows). Overlap tests use about 8 capsules along each half.
 Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
@@ -413,8 +433,10 @@ slab per stratum it spans; slabs are drawn farthest stratum first and, inside a 
 key (`depth`), so every rule that works on piece keys (the layered split cone keys, `orderJointBodies`, the
 joint disc after its bodies) still holds inside a stratum. Pieces without a ramp (joint discs, the split
 node's shared part) sit in the stratum of `binDepth`. A piece is drawn whole, exactly as an uncut piece
-(batched, no clip, no seam), when its slabs can be put together: only pieces whose screen box (`boxOf`)
-overlaps it and that have another color are in the way, so the rest between its slabs don't count. Otherwise
+(batched, no clip, no seam), when its slabs can be put together: only pieces of OTHER meshes whose screen shape
+(`piecesOverlap`) overlaps it are in the way, whatever their color (a same-colored mesh shows which is in front by its border stroke
+and its own shading: skipping it drew the top orange arch whole at its farthest stratum, behind the threaded one, at 3.128), so the
+rest between its slabs don't count. Otherwise
 a run of its slabs is drawn through a clip strip along its slice axis (its outline recorded once and
 replayed), widened by `SEAM_PX` toward each neighboring slab that is drawn LATER so the earlier one reaches
 under the later one (rule 1; strip edges are straight, so rule 4 holds). Strata decide between SEPARATE meshes only.

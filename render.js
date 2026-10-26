@@ -112,6 +112,10 @@ const slabsOf = rawSlabs;
 function rawSlabs(prim) {
   const bin = (d) => Math.floor(d / DEPTH_BIN), sl = prim.slice;
   if (!sl) return [{ prim, bin: bin(prim.binDepth ?? prim.depth), lo: -Infinity, hi: Infinity }];
+  // A skewed arch's half (buildSkewPrimitives): its slabs from the cuts drawPrimitives found (`slice.cutAt`), each with its ranges of
+  // t, its own key and bin and `seq` (far to near); uncut, one slab in the stratum of its key, as an unsliced piece.
+  if (sl.kind === 'arch') return (sl.slabs || [{ ranges: [[sl.t0, sl.t1]], depth: prim.depth, bin: bin(prim.depth), seq: 0 }])
+    .map(s => ({ prim, ...s, shape: sl.slabs ? sl.shapeOfRanges(s.ranges) : prim, lo: -Infinity, hi: Infinity }));
   const dmin = Math.min(sl.d0, sl.d1), dmax = Math.max(sl.d0, sl.d1), kLo = bin(dmin), kHi = bin(dmax);
   if (kLo === kHi) return [{ prim, bin: kHi, lo: -Infinity, hi: Infinity }];
   const sAt = (d) => sl.s0 + ((d - sl.d0) / (sl.d1 - sl.d0)) * (sl.s1 - sl.s0);
@@ -632,20 +636,97 @@ function buildSkewPrimitives(frame, mesh) {
   // edge, which lets the background through (rule 1); `lo` / `hi`, where the shading's sheets are cut, SHARED_BAND each way (its 'both'
   // band: the half drawn first paints its own sheets and that band, see below).
   const DRAW_BAND = 1 / 32, SHARED_BAND = 1 / 16;
-  const cuts = { apex: 0.5, lo: 0.5 - SHARED_BAND, hi: 0.5 + SHARED_BAND, draw: [0.5 - DRAW_BAND, 0.5 + DRAW_BAND] };
-  const all = () => frame.archGeom.arch(mesh.id, sampleAt, cuts);
-  // A half: the visible strips of the arch's exact rows from t0 to t1 (shading.js `outline`), the same surface as its shading. Its box
-  // and depth key come from the chain of screen circles `list` (archSamples).
-  const half = (list, t0, t1) => {
+  // Layering (CLAUDE.md "Layering"): a half is cut only where a piece of another mesh that overlaps it on screen sorts between its parts
+  // in depth (`slice.cutAt`, called by drawPrimitives once those pieces' entries are known), not at every stratum. The center's depth
+  // along the arch is forward . (c(t) - camPos) = dA + dB cos th + dC sin th (th = PI (1 - t), archAt), so where it crosses a given depth
+  // is closed form, and over half a period the sinusoid rises or falls at most once (a depth interval holds at most two ranges of t).
+  // Each cut is a row of the arch (`cuts.slabs`), and so are the ends where a slab reaches past it under the slab drawn later (rule 1):
+  // `seam` on screen, from the center's screen speed there.
+  const fw = frame.basis.forward, cp = frame.camPos;
+  const Mc = { x: (A.center.x + B.center.x) / 2, y: (A.center.y + B.center.y) / 2, z: (A.center.z + B.center.z) / 2 };
+  const dA = fw.x * (Mc.x - cp.x) + fw.y * (Mc.y - cp.y) + fw.z * (Mc.z - cp.z);
+  const dB = fw.x * (B.center.x - A.center.x) / 2 + fw.y * (B.center.y - A.center.y) / 2 + fw.z * (B.center.z - A.center.z) / 2;
+  const dC = fw.x * (S.center.x - Mc.x) + fw.y * (S.center.y - Mc.y) + fw.z * (S.center.z - Mc.z);
+  const depthAt = (t) => { const th = Math.PI * (1 - t); return dA + dB * Math.cos(th) + dC * Math.sin(th); };
+  // the mean depth over [t0, t1] (the sinusoid's integral)
+  const meanDepth = (t0, t1) => {
+    if (t1 - t0 < 1e-9) return depthAt(t0);
+    const h0 = Math.PI * (1 - t0), h1 = Math.PI * (1 - t1);
+    return dA + (dB * (Math.sin(h0) - Math.sin(h1)) + dC * (Math.cos(h1) - Math.cos(h0))) / (Math.PI * (t1 - t0));
+  };
+  const R = Math.hypot(dB, dC), ph = Math.atan2(dC, dB), wrap2 = (th) => ((th % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  // the t's in (0, 1) where the center's depth is D
+  const tsAt = (D) => {
+    const x = (D - dA) / R;
+    if (!(R > 1e-12) || Math.abs(x) > 1) return [];
+    return [ph + Math.acos(x), ph - Math.acos(x)].map(th => 1 - wrap2(th) / Math.PI).filter(t => t > 1e-6 && t < 1 - 1e-6);
+  };
+  // the depth range over [t0, t1]: its ends and the sinusoid's extremum if inside
+  const depthRange = (t0, t1) => {
+    const th0 = Math.PI * (1 - t1), th1 = Math.PI * (1 - t0);
+    const ds = [depthAt(t0), depthAt(t1), ...[ph, ph + Math.PI, ph - Math.PI].filter(th => th > th0 && th < th1).map(th => dA + R * Math.cos(th - ph))];
+    return [Math.min(...ds), Math.max(...ds)];
+  };
+  const seam = 2 * frame.underlap, extOf = new Map();
+  const cuts = { apex: 0.5, lo: 0.5 - SHARED_BAND, hi: 0.5 + SHARED_BAND, draw: [0.5 - DRAW_BAND, 0.5 + DRAW_BAND], slabs: [] };
+  // a cut at tc, and the two ends of its reach (all rows of the arch)
+  const addCut = (tc) => {
+    if (extOf.has(tc)) return;
+    const p0 = projectPoint(at(Math.max(0, tc - 1e-4)).center), p1 = projectPoint(at(Math.min(1, tc + 1e-4)).center);
+    const speed = Math.hypot(p1.x - p0.x, p1.y - p0.y) / 2e-4, dt = Math.min(0.02, seam / Math.max(speed, 1e-9));
+    extOf.set(tc, [Math.max(1e-6, tc - dt), Math.min(1 - 1e-6, tc + dt)]);
+    cuts.slabs.push(tc, ...extOf.get(tc));
+  };
+  // (built on first use, once both halves' cuts are in: its rows depend on them)
+  const all = () => frame.archGeom.arch(mesh.id + '|' + cuts.slabs.join(','), sampleAt, cuts);
+  // The slabs of [t0, t1] cut at the depths `depths` (inside its range): one per depth interval that it crosses, with its ranges of t
+  // (at most two), its key the mean depth over them, its bin that key's stratum and `seq` its place far to near.
+  const cutsOf = (t0, t1, depths) => {
+    const ts = [...new Set(depths.flatMap(tsAt))].filter(t => t > t0 + 1e-9 && t < t1 - 1e-9).sort((p, q) => p - q);
+    ts.forEach(addCut);
+    const groups = new Map(), ends = [t0, ...ts, t1];
+    for (let i = 0; i + 1 < ends.length; i++) {
+      const d = depthAt((ends[i] + ends[i + 1]) / 2), k = depths.filter(D => D < d).length;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push([ends[i], ends[i + 1]]);
+    }
+    return [...groups.values()].map(ranges => {
+      const w = ranges.reduce((acc, [a, b]) => acc + (b - a), 0) || 1, depth = ranges.reduce((acc, [a, b]) => acc + meanDepth(a, b) * (b - a), 0) / w;
+      return { ranges, depth, bin: Math.floor(depth / DEPTH_BIN) };
+    }).sort((p, q) => q.depth - p.depth).map((s, seq) => ({ ...s, seq }));
+  };
+  // Capsules along a chain of screen circles (about 8), for `piecesOverlap`: each the chord's capsule, widened by how far the circles
+  // between bow off it.
+  const capsOf = (list) => {
+    const caps = [], step = Math.max(1, Math.ceil((list.length - 1) / 8));
+    if (list.length === 1) { const c = list[0].c; return [{ x0: c.x, y0: c.y, x1: c.x, y1: c.y, r: c.r + 3 }]; }
+    for (let i = 0; i + 1 < list.length; i += step) {
+      const run = list.slice(i, Math.min(i + step, list.length - 1) + 1).map(s => s.c), p = run[0], q = run[run.length - 1];
+      const bow = Math.max(0, ...run.map(c => Math.sqrt(pointSeg2(c.x, c.y, { x0: p.x, y0: p.y, x1: q.x, y1: q.y }))));
+      caps.push({ x0: p.x, y0: p.y, x1: q.x, y1: q.y, r: Math.max(...run.map(c => c.r)) + bow + 3 });
+    }
+    return caps;
+  };
+  // A half: the arch's exact outline from t0 to t1 (shading.js `outline`). Its key is the mean depth along it (closed form); its box and
+  // its capsules for the overlap tests (`piecesOverlap`, about 8 along it) come from the chain of screen circles `list` (archSamples).
+  const half = (list, t0, t1, sliced = true) => {
     const tracePath = (c = frame.ctx) => all().outline(t0, t1)(c);
     const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
-    let depth = 0;
     list.forEach(({ c }) => {
       box.x0 = Math.min(box.x0, c.x - c.r - 3); box.x1 = Math.max(box.x1, c.x + c.r + 3);
       box.y0 = Math.min(box.y0, c.y - c.r - 3); box.y1 = Math.max(box.y1, c.y + c.r + 3);
-      depth += c.depth / list.length;
     });
-    return { cluster: frame.clusterOf[mesh.id], depth, binDepth: depth, slice: null, box, meshId: mesh.id, color: mesh.color, tracePath };
+    const caps = capsOf(list);
+    const depth = meanDepth(t0, t1), [dmin, dmax] = depthRange(t0, t1);
+    // (a slab's own shape: the circles of its ranges, with the one before and after each, for the overlap tests in drawPrimitives)
+    const shapeOfRanges = (ranges) => {
+      const sub = list.filter((s, i) => ranges.some(([a, b]) => (s.t >= a && s.t <= b) || (list[i + 1] && list[i + 1].t > a && s.t < a) || (list[i - 1] && list[i - 1].t < b && s.t > b)));
+      return { box, caps: capsOf(sub) };
+    };
+    const slice = sliced ? { kind: 'arch', ext: extOf, t0, t1, dmin, dmax, slabs: null, shapeOfRanges, cutAt: (depths) => cutsOf(t0, t1, depths) } : null;
+    // (a run of slabs: the outlines of its ranges in one path, `partial`)
+    const traceRanges = (ranges, c) => ranges.forEach(([a, b]) => all().outline(a, b)(c));
+    return { cluster: frame.clusterOf[mesh.id], depth, binDepth: depth, slice, box, caps: caps.length ? caps : undefined, meshId: mesh.id, color: mesh.color, tracePath, traceRanges };
   };
   // (the circles reaching past each half's end, for the boxes)
   const upTo = (t) => { const k = samples.findIndex(s => s.t >= t); return k < 0 ? samples.length : k + 1; };
@@ -656,7 +737,7 @@ function buildSkewPrimitives(frame, mesh) {
   // wherever one half is drawn over the other the nearer one gets its edge stroked, growing and shrinking with the overlap.
   // The strip where the halves reach into each other around the apex is not a border: both strokes leave it out
   // (`strokeCut`: the body from draw[0] to draw[1], traced on demand).
-  const strip = half([], cuts.draw[0], cuts.draw[1]);
+  const strip = half([], cuts.draw[0], cuts.draw[1], false);
   const strokeCut = { trace: strip.tracePath };
   first.owners = [`${mesh.id}.0`]; first.strokeCut = strokeCut;
   second.owners = [`${mesh.id}.1`]; second.strokeCut = strokeCut;
@@ -976,9 +1057,42 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
       T[m](...args);
     }
   };
-  let entries = primitives.flatMap(slabsOf);
-  entries.sort((p, q) => (q.bin - p.bin) || (q.prim.depth - p.prim.depth));
-  entries.forEach((e, i) => { e.idx = i; (e.prim.slabMap ||= new Map()).set(e.bin, e); });
+  // Skewed arches are cut only where they must be (CLAUDE.md "Layering"): at the depths of the entries of OTHER meshes that overlap
+  // the half on screen and sort inside its depth range. An entry in stratum k with key K sorts after every arch part deeper than
+  // clamp(K, k BIN, (k + 1) BIN) (its stratum, or the same stratum and a larger key) and before every part nearer, so that depth is
+  // the cut; another arch's half counts by its key (its own cuts are not known yet).
+  const archs = primitives.filter(p => p.slice && p.slice.kind === 'arch'), archSet = new Set(archs);
+  let entries = primitives.filter(p => !archSet.has(p)).flatMap(slabsOf);
+  // (a slab of a sliced piece by its own part: the piece's capsules cut to the slab's strip [lo, hi] along the slice axis)
+  const shapeOf = (e) => {
+    if (e.shape) return e.shape;          // an arch slab
+    const q = e.prim, sl = q.slice;
+    if (!sl || sl.kind === 'arch' || !q.caps || (!Number.isFinite(e.lo) && !Number.isFinite(e.hi))) return q;
+    const caps = q.caps.map(c => {
+      const sa = c.x0 * sl.ax + c.y0 * sl.ay, sb = c.x1 * sl.ax + c.y1 * sl.ay, ds = sb - sa;
+      if (Math.abs(ds) < 1e-9) return sa >= e.lo - c.r && sa <= e.hi + c.r ? c : null;
+      // (the strip widened by the capsule's radius, so the round ends count)
+      const u0 = Math.max(0, Math.min(1, ((ds > 0 ? e.lo - c.r : e.hi + c.r) - sa) / ds)), u1 = Math.max(0, Math.min(1, ((ds > 0 ? e.hi + c.r : e.lo - c.r) - sa) / ds));
+      if (u1 <= u0) return null;
+      return { x0: c.x0 + (c.x1 - c.x0) * u0, y0: c.y0 + (c.y1 - c.y0) * u0, x1: c.x0 + (c.x1 - c.x0) * u1, y1: c.y0 + (c.y1 - c.y0) * u1, r: c.r };
+    }).filter(Boolean);
+    return { box: q.box, caps };
+  };
+  archs.forEach(p => {
+    const sl = p.slice, depths = new Set();
+    const add = (k, K) => { const d = Math.min(Math.max(K, k * DEPTH_BIN), (k + 1) * DEPTH_BIN); if (d > sl.dmin && d < sl.dmax) depths.add(d); };
+    entries.forEach(e => {
+      if (e.prim.meshId === p.meshId) return;
+      const sh = shapeOf(e);
+      if ((!sh.caps || sh.caps.length) && piecesOverlap(p, sh)) add(e.bin, e.depth ?? e.prim.depth);
+    });
+    archs.forEach(q => { if (q.meshId !== p.meshId && piecesOverlap(p, q)) add(Math.floor(q.depth / DEPTH_BIN), q.depth); });
+    sl.slabs = sl.cutAt([...depths].sort((a, b) => a - b));
+  });
+  entries.push(...archs.flatMap(slabsOf));
+  // (inside a stratum by the piece's key, or a skewed arch slab's own)
+  entries.sort((p, q) => (q.bin - p.bin) || ((q.depth ?? q.prim.depth) - (p.depth ?? p.prim.depth)));
+  entries.forEach((e, i) => { e.idx = i; (e.prim.slabMap ||= new Map()).set(e.seq !== undefined ? 's' + e.seq : e.bin, e); });
   entries = orderByCluster(entries);
   entries.forEach((e, i) => { e.idx = i; });
   // Runs of slabs of one piece, drawn at the position of their first slab.
@@ -990,10 +1104,18 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
     let last = e;
     for (let j = e.idx + 1; j < entries.length && run.entries.length < p.slabMap.size; j++) {
       const f = entries[j];
-      if (f.prim === p) { if (f.bin !== last.bin - 1) break; f.run = run; run.entries.push(f); last = f; continue; }
+      // (the next slab of the piece: the next stratum, or an arch's next slab)
+      if (f.prim === p) { if (f.seq !== undefined ? f.seq !== last.seq + 1 : f.bin !== last.bin - 1) break; f.run = run; run.entries.push(f); last = f; continue; }
       if (f.run) continue;                    // already moved into an earlier run: not in the way here
-      const sameInk = p.color && f.prim.color && p.color === f.prim.color;
-      if (!sameInk && piecesOverlap(p, f.prim)) break;
+      // (a piece of the same mesh is not in the way; another mesh is, whatever its color: a same-colored mesh shows which is in front
+      // by its border stroke and its own shading, and skipping it drew the top orange arch whole at its farthest stratum, behind the
+      // threaded one through it, at 3.128)
+      const sameMesh = p.meshId !== undefined && p.meshId === f.prim.meshId;
+      if (sameMesh) continue;
+      // An arch's slabs that would move before f are the ones after it (seq past the last one taken): f is in the way only if it
+      // overlaps one of those (by its own part, `shapeOf`); a cut where f only meets the farther part merges back.
+      const isArch = p.slice && p.slice.kind === 'arch';
+      if (isArch ? [...p.slabMap.values()].some(s => s.seq > last.seq && piecesOverlap(s.shape, shapeOf(f))) : piecesOverlap(p, f.prim)) break;
     }
     runs.push(run);
   });
@@ -1050,7 +1172,28 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
     return fills <= 1 ? path : null;
   };
   const replay = (ops) => ops.forEach(([m, args]) => (m[0] === '=' ? (ctx[m.slice(1)] = args) : ctx[m](...args)));
+  // A run of a skewed arch's slabs: no clip strip, its own exact outline over the run's ranges of t, each end that meets a slab drawn
+  // LATER reaching past it under that slab (rule 1; the reach's end is a row of the arch, `slice.ext`).
+  const archPartial = (p, run) => {
+    flush();
+    const sl = p.slice, mine = new Set(run.entries);
+    const ivs = run.entries.flatMap(e => e.ranges.map(r => r.slice())).sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    ivs.forEach(iv => { const l = merged[merged.length - 1]; if (l && Math.abs(l[1] - iv[0]) < 1e-12) l[1] = iv[1]; else merged.push(iv); });
+    const later = (t) => [...p.slabMap.values()].some(n => !mine.has(n) && n.run && n.run.pos > run.pos && n.ranges.some(r => Math.abs(r[0] - t) < 1e-12 || Math.abs(r[1] - t) < 1e-12));
+    merged.forEach(iv => {
+      if (iv[0] > sl.t0 + 1e-12 && sl.ext.has(iv[0]) && later(iv[0])) iv[0] = sl.ext.get(iv[0])[0];
+      if (iv[1] < sl.t1 - 1e-12 && sl.ext.has(iv[1]) && later(iv[1])) iv[1] = sl.ext.get(iv[1])[1];
+    });
+    const trace = record(c => p.traceRanges(merged, c));
+    if (recorded(p)) { paintRecorded([['beginPath', []], ...trace, ['=fillStyle', p.color], ['fill', []]], ownersOf(p), p.box, null, p.strokeCut, shading && p.shade && p.shade()); return; }
+    ctx.beginPath();
+    replay(trace);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+  };
   const partial = (p, run) => {
+    if (p.slice && p.slice.kind === 'arch') { archPartial(p, run); return; }
     flush();
     const first = run.entries[0], last = run.entries[run.entries.length - 1], sl = p.slice;
     let lo = Math.min(...run.entries.map(e => e.lo)), hi = Math.max(...run.entries.map(e => e.hi));

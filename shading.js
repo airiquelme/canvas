@@ -427,7 +427,7 @@ export function makeShading({ basis, tol, px, camPos, projectPoint, lit = true }
     // (in tube mode a round arch's rows take the radius' tilt, sinT: the normals of the swept spheres' surface, like the curves)
     const tilt = (s) => (tube ? Math.asin(Math.max(-1, Math.min(1, s.sinT || 0))) : 0);
     const mainRow = (t) => { const s = sampleAt(t); return makeRow(s, tilt(s), 1); };
-    const ts = [...new Set([...Array.from({ length: 17 }, (_, i) => i / 16), ...(cutsT ? [cutsT.apex, cutsT.lo, cutsT.hi, ...(cutsT.draw || [])] : [])])].sort((p, q) => p - q);
+    const ts = [...new Set([...Array.from({ length: 17 }, (_, i) => i / 16), ...(cutsT ? [cutsT.apex, cutsT.lo, cutsT.hi, ...(cutsT.draw || []), ...(cutsT.slabs || [])] : [])])].sort((p, q) => p - q);
     const main = [mainRow(ts[0])];
     for (let k = 1; k < ts.length; k++) refine(ts[k - 1], main[main.length - 1], ts[k], mainRow(ts[k]), mainRow, MAIN_DEPTH, main);
     // The borders (the outline's two silhouettes, see `outline`): per main row the two ends of the visible arc on screen, exact, with
