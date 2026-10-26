@@ -342,12 +342,13 @@ export function makeShading({ basis, tol, px, camPos, projectPoint, lit = true }
     const sliceRing = (s, a, sign) => {
       const { T, U0, V0 } = triple(s), sa = Math.sin(a) * sign, ca = Math.cos(a);
       // y^T K w >= 0 as cos(phi - c) >= -C / R: { c, w } (w the half-width), w = PI when it always holds, null when never
-      const half = (w) => {
-        const Kw = Qm(s.Q, w), A = ca * dot(U0, Kw), B = ca * dot(V0, Kw), C = sa * dot(T, Kw), R = Math.hypot(A, B);
+      // (`one`: y^T K w >= one; facing the camera in perspective is (K w) . y >= 1 with w = camPos - c, the point's own view ray)
+      const half = (w, one = 0) => {
+        const Kw = Qm(s.Q, w), A = ca * dot(U0, Kw), B = ca * dot(V0, Kw), C = sa * dot(T, Kw) - one, R = Math.hypot(A, B);
         if (R < 1e-12 * (Math.abs(C) + 1e-300)) return C >= 0 ? { c: 0, w: Math.PI } : { c: 0, w: null };
         return { c: Math.atan2(B, A), w: halfWidth(C / R) };
       };
-      const f = prep(s), V = half(unit(sub(cp, s.c)));
+      const f = prep(s), V = half(sub(cp, s.c), 1);
       const dark = !lit || (tube && tubeDark);
       const L = dark ? null : half(tube ? { x: Math.cos(phiS) * f.e1.x + Math.sin(phiS) * f.e2.x, y: Math.cos(phiS) * f.e1.y + Math.sin(phiS) * f.e2.y, z: Math.cos(phiS) * f.e1.z + Math.sin(phiS) * f.e2.z } : Lw);
       const vis = V.w === null ? null : [V.c - V.w, V.c + V.w];
@@ -357,12 +358,31 @@ export function makeShading({ basis, tol, px, camPos, projectPoint, lit = true }
     };
     const ring = (s, a, sign) => {
       if (isSlice(s, a)) return sliceRing(s, a, sign);
-      const { e1, e2, t } = prep(s), v = unit(sub(cp, s.c));
-      const hL = Math.hypot(dot(Lw, e1), dot(Lw, e2)), hV = Math.hypot(dot(v, e1), dot(v, e2));
-      if (hV < 1e-9) return null;
+      const f = prep(s), { e1, e2, t } = f, w = sub(cp, s.c), w1 = dot(w, e1), w2 = dot(w, e2);
+      const hL = Math.hypot(dot(Lw, e1), dot(Lw, e2)), hW = Math.hypot(w1, w2);
+      if (hW < 1e-9 * len(w)) return null;
       // (no light: an instance for the outline only, `lit` false, or the light along the tangent: the visible arc alone)
       const dark = !lit || (tube ? tubeDark : hL < 1e-9);
-      const ta = Math.tan(a), phiV = Math.atan2(dot(v, e2), dot(v, e1)), wV = halfWidth(ta * sign * dot(v, t) / hV);
+      const ta = Math.tan(a);
+      // The visible arc in perspective: a point x faces the camera where its normal n has n . (camPos - x) >= 0, so the arc's ends are
+      // on the exact contour (the silhouette the outline follows, and the cap's contour ellipse at the end rows). On a round row x =
+      // c + r n, n = cos a n(phi) + sin a t: cos a hW cos(phi - phiW) + sin a (t . w) >= r. On a squashed row (a = 0) x = c + S n / k,
+      // k = sqrt(n^T S n): n . w >= k, i.e. (n . w)^2 - n^T S n >= 0 on the side n . w > 0, a quadratic form in (cos phi, sin phi).
+      let phiV = Math.atan2(w2, w1), wV;
+      if (f.round) wV = halfWidth((Math.sin(a) * sign * dot(w, t) - f.r) / (Math.cos(a) * hW));
+      else {
+        const Se1 = Qm(f.S, e1), Se2 = Qm(f.S, e2);
+        const A = w1 * w1 - dot(e1, Se1), B = w1 * w2 - dot(e1, Se2), C = w2 * w2 - dot(e2, Se2);
+        const m = (A + C) / 2, R = Math.hypot((A - C) / 2, B);
+        if (R < 1e-12 * Math.abs(m)) wV = m >= 0 ? Math.PI / 2 : null;
+        else if (-m / R <= -1) wV = Math.PI / 2;
+        else if (-m / R >= 1) wV = null;
+        else {
+          const psi = 0.5 * Math.atan2(B, (A - C) / 2);
+          phiV = Math.cos(psi - phiV) >= 0 ? psi : psi + Math.PI;
+          wV = Math.acos(-m / R) / 2;
+        }
+      }
       const phiL = tube ? phiS : dark ? 0 : Math.atan2(dot(Lw, e2), dot(Lw, e1));
       const wL = dark ? null : tube ? Math.PI / 2 : halfWidth(ta * sign * dot(Lw, t) / hL);
       const vis = wV === null ? null : [phiV - wV, phiV + wV];     // the visible arc (lit or not)
@@ -410,6 +430,107 @@ export function makeShading({ basis, tol, px, camPos, projectPoint, lit = true }
     const ts = [...new Set([...Array.from({ length: 17 }, (_, i) => i / 16), ...(cutsT ? [cutsT.apex, cutsT.lo, cutsT.hi, ...(cutsT.draw || [])] : [])])].sort((p, q) => p - q);
     const main = [mainRow(ts[0])];
     for (let k = 1; k < ts.length; k++) refine(ts[k - 1], main[main.length - 1], ts[k], mainRow(ts[k]), mainRow, MAIN_DEPTH, main);
+    // The borders (the outline's two silhouettes, see `outline`): per main row the two ends of the visible arc on screen, exact, with
+    // their screen tangents, which are the row ellipse's tangents there (a curve on the surface through a contour point projects tangent
+    // to the silhouette). Between two rows a border is a cubic through both ends with those tangents (lengths as jointCurveGeneral.js:
+    // exact for a circular arc); a row is added between them wherever the exact point at the middle t is off the cubic by BEZ_TOL.
+    const BEZ_TOL = 0.25 * px, BEZ_DEPTH = 5, DPHI = 1e-4;
+    const silOf = (r) => {
+      if (r.sil !== undefined) return r.sil;
+      const g = r.ring;
+      if (!g || !g.vis || g.vis[1] - g.vis[0] >= TWO_PI - 1e-9) return (r.sil = null);
+      // (a tangent is left out, d null, where the row runs nearly along the view ray at the point: seen edge-on there, its screen
+      // image has a cusp and its direction says nothing about the border's; the border's neighbors give it instead, `border`)
+      return (r.sil = g.vis.map(phi => {
+        const p = onScreen(r, phi), a = onScreen(r, phi - DPHI), b = onScreen(r, phi + DPHI), dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy);
+        const A = at(r, phi - DPHI), B = at(r, phi + DPHI), l3 = len(sub(B, A)) * projectPoint(at(r, phi)).scale;
+        return { p, d: l > 1e-12 && l > 0.1 * l3 ? [dx / l, dy / l] : null };
+      }));
+    };
+    const bezOf = (A, B) => {
+      const cx = B.p[0] - A.p[0], cy = B.p[1] - A.p[1], L = Math.hypot(cx, cy);
+      if (L < 1e-9) return { kind: 'bez', p0: A.p, c1: A.p, c2: B.p, p1: B.p };
+      const ux = cx / L, uy = cy / L;
+      // (each tangent signed along the chord)
+      const dir = (d) => (!d ? [ux, uy] : d[0] * ux + d[1] * uy < 0 ? [-d[0], -d[1]] : d);
+      const T0 = dir(A.d), T1 = dir(B.d);
+      const m0 = 2 * L / (1 + T0[0] * ux + T0[1] * uy) / 3, m1 = 2 * L / (1 + T1[0] * ux + T1[1] * uy) / 3;
+      return { kind: 'bez', p0: A.p, c1: [A.p[0] + T0[0] * m0, A.p[1] + T0[1] * m0], c2: [B.p[0] - T1[0] * m1, B.p[1] - T1[1] * m1], p1: B.p };
+    };
+    const bezAt = (z, u) => {
+      const v = 1 - u, a = v * v * v, b = 3 * v * v * u, c = 3 * v * u * u, d = u * u * u;
+      return [a * z.p0[0] + b * z.c1[0] + c * z.c2[0] + d * z.p1[0], a * z.p0[1] + b * z.c1[1] + c * z.c2[1] + d * z.p1[1]];
+    };
+    const bezDist = (z, p) => {
+      let best = Infinity, prev = z.p0;
+      for (let j = 1; j <= 24; j++) {
+        const q = bezAt(z, j / 24), dx = q[0] - prev[0], dy = q[1] - prev[1], l2 = dx * dx + dy * dy;
+        const u = l2 > 0 ? Math.max(0, Math.min(1, ((p[0] - prev[0]) * dx + (p[1] - prev[1]) * dy) / l2)) : 0;
+        best = Math.min(best, Math.hypot(prev[0] + u * dx - p[0], prev[1] + u * dy - p[1]));
+        prev = q;
+      }
+      return best;
+    };
+    // In perspective a row can face away entirely (a tube pointing at the camera: its sides are hidden), so the visible surface is
+    // one disc per run of rows that have a visible arc. Where the arc vanishes between two rows, a row is added just on the visible
+    // side of that t (bisected): there the two borders meet. The arc can also shrink to a sliver on one side of the body and grow
+    // back on the other (a thin ribbon turning from one face to the other as seen: its row seen edge-on), with every row keeping a
+    // sliver: its center jumps by about pi and the two ends swap edges. That is a split too: both rows next to the jump are bisected
+    // in and the first is marked `flipNext`, so each face is its own disc (joined, one loop crossed the band twice and wound the
+    // second face backwards, which cancelled where the two overlapped: a bulge near the green ribbon's skew node at 0.124).
+    {
+      const seen = (r) => !!(r.ring && r.ring.vis), mid = (r) => (r.ring.vis[0] + r.ring.vis[1]) / 2;
+      const flips = (a, b) => seen(a) && seen(b) && Math.abs(wrap(mid(a) - mid(b))) > Math.PI / 2;
+      const out = [main[0]];
+      const bisect = (a, b, same) => {
+        let lo = a, hi = b;
+        for (let j = 0; j < 40 && hi.s.tv - lo.s.tv > 1e-10; j++) { const m = mainRow((lo.s.tv + hi.s.tv) / 2); if (same(m)) lo = m; else hi = m; }
+        return [lo, hi];
+      };
+      for (let k = 1; k < main.length; k++) {
+        const a = main[k - 1], b = main[k];
+        if (seen(a) !== seen(b)) {
+          const [lo, hi] = bisect(a, b, (m) => seen(m) === seen(a)), pick = seen(a) ? lo : hi;
+          if (pick !== a && pick !== b) out.push(pick);
+        } else if (flips(a, b)) {
+          const [lo, hi] = bisect(a, b, (m) => seen(m) && !flips(a, m));
+          if (lo !== a) out.push(lo);
+          lo.flipNext = true;
+          if (hi !== b) out.push(hi);
+        }
+        out.push(b);
+      }
+      main.splice(0, main.length, ...out);
+    }
+    // (the distance from a point to the polyline through some points)
+    const polyDist = (p, pts) => pts.slice(1).reduce((best, q, i) => {
+      const o = pts[i], dx = q[0] - o[0], dy = q[1] - o[1], l2 = dx * dx + dy * dy;
+      const u = l2 > 0 ? Math.max(0, Math.min(1, ((p[0] - o[0]) * dx + (p[1] - o[1]) * dy) / l2)) : 0;
+      return Math.min(best, Math.hypot(o[0] + u * dx - p[0], o[1] + u * dy - p[1]));
+    }, Infinity);
+    const straightOf = (A, B) => ({ kind: 'bez', p0: A.p, c1: A.p, c2: B.p, p1: B.p });
+    {
+      const fitted = [main[0]];
+      // A cubic's error against the exact border, both ways: the exact middle point to the cubic, and the cubic's middle to the exact
+      // points (where the border sweeps across a thin ribbon's face almost at once, the exact middle sits near an end, and so does the
+      // cubic, which swung out on its end tangents, along the edges, in a loop: a bulge beside the green ribbon's skew node at 3.178).
+      const errOf = (z, A, M, B) => Math.max(bezDist(z, M.p), polyDist(bezAt(z, 0.5), [A.p, M.p, B.p]));
+      const fit = (rA, rB, depth) => {
+        const SA = silOf(rA), SB = silOf(rB);
+        if (SA && SB && !rA.flipNext) {
+          const rm = mainRow((rA.s.tv + rB.s.tv) / 2), Sm = silOf(rm);
+          const errs = Sm ? [0, 1].map(j => errOf(bezOf(SA[j], SB[j]), SA[j], Sm[j], SB[j])) : [0, 0];
+          if (errs.some(e => e > BEZ_TOL)) {
+            if (depth > 0) { fit(rA, rm, depth - 1); fit(rm, rB, depth - 1); return; }
+            // still not a cubic at the last depth (such a sweep): the chord where it is closer
+            rA.straight = [0, 1].map(j => errs[j] > BEZ_TOL && errOf(straightOf(SA[j], SB[j]), SA[j], Sm[j], SB[j]) < errs[j]);
+          }
+        }
+        fitted.push(rB);
+      };
+      for (let k = 1; k < main.length; k++) fit(main[k - 1], main[k], BEZ_DEPTH);
+      main.splice(0, main.length, ...fitted);
+    }
     const samples = main.map(r => r.s), n = samples.length;
     const indexOf = (t) => samples.findIndex(s => s.tv === t);
     const cuts = cutsT ? { lo: indexOf(cutsT.lo), hi: indexOf(cutsT.hi) } : null;
@@ -616,13 +737,120 @@ export function makeShading({ basis, tol, px, camPos, projectPoint, lit = true }
     };
     const tvOf = (k) => samples[rows[k].i].tv;
     // the strips from t0 to t1 (an end cap goes with its end)
-    const outline = (t0, t1) => (path) => strips.forEach(st => {
+    const stripOutline = (t0, t1) => (path) => strips.forEach(st => {
       if (tvOf(st.k) < t0 - 1e-12 || tvOf(st.k + 1) > t1 + 1e-12) return;
       const o = outlineOf(st);
       if (!o) return;
       if (o.shape) trace(path, o.shape, true);
       else { o.hull.forEach((q, j) => (j ? path.lineTo(q[0], q[1]) : path.moveTo(q[0], q[1]))); path.closePath(); }
     });
+    // The body's outline from t0 to t1 as ONE closed curve, no inner edges (CLAUDE.md "Skewed meshes"). The visible surface is a disc in
+    // (t, phi) (one visible arc per row) mapped onto the screen without mirroring anywhere, so its boundary, filled nonzero, covers
+    // exactly the body's screen area, folds included: border 0 (the visible arcs' first ends) from t0 to t1, the end at t1, border 1
+    // back, the end at t0. An end is the row's own visible arc (an exact ellipse arc) or, at t = 0 / 1, the cap: half of the end node's
+    // ellipsoid, whose screen outline is an arc of the ellipsoid's exact silhouette (its contour is the plane section x^T K w = 1, w =
+    // camPos - c, projected by `projectedEllipse`) between the two borders' ends, on the cap's side of the end row. Segments: { kind:
+    // 'bez', p0, c1, c2, p1 }, { kind: 'arc', e, from, to, ccw, P0, P1 } (ctx.ellipse's terms), { kind: 'poly', pts } (an edge-on row).
+    // null where a row has no proper visible arc (looking along the tangent): the strips are used there instead.
+    const revSeg = (g) => (g.kind === 'bez' ? { kind: 'bez', p0: g.p1, c1: g.c2, c2: g.c1, p1: g.p0 }
+      : g.kind === 'arc' ? { kind: 'arc', e: g.e, from: g.to, to: g.from, ccw: !g.ccw, P0: g.P1, P1: g.P0 } : { kind: 'poly', pts: g.pts.slice().reverse() });
+    const rowArc = (r) => {
+      const c = chain(r, r.ring.vis);
+      return c.draw ? { kind: 'arc', e: c.draw.e, from: c.draw.from, to: c.draw.to, ccw: c.draw.ccw, P0: c.P0, P1: c.P1 } : { kind: 'poly', pts: c.raw };
+    };
+    // the cap at the end row r (sign -1 at t = 0, +1 at t = 1), from border 0's end to border 1's
+    // the end node's contour: center c + S p / (p^T S p), p = K w, conjugate semi-diameters u1, u2 in its plane (p . y = 0) with
+    // y^T K y = rho2 = 1 - 1 / (p^T S p); `side(X)` > 0 on the cap's side of the end row's plane (normal K t through the row's center,
+    // offset along t on a tilted round row). null with the camera inside the node.
+    const contourOf = (r, sign) => {
+      const s = r.s, f = prep(s), K = s.Q;
+      const p = Qm(K, sub(cp, s.c)), Sp = Qm(f.S, p), pSp = dot(p, Sp), rho2 = 1 - 1 / pSp;
+      if (!(pSp > 0) || !(rho2 > 1e-12)) return null;
+      const C = { x: s.c.x + Sp.x / pSp, y: s.c.y + Sp.y / pSp, z: s.c.z + Sp.z / pSp };
+      const pu = unit(p), onto = (u) => { const k = Math.sqrt(rho2 / dot(u, Qm(K, u))); return { x: u.x * k, y: u.y * k, z: u.z * k }; };
+      const u1 = onto(unit(cross(pu, Math.abs(pu.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 1, z: 0 }))), u2 = onto(unit(cross(p, Qm(K, u1))));
+      const e = projectedEllipse(C, u1, u2);
+      if (!e || !(e.b > 1e-9)) return null;
+      const Ku1 = Qm(K, u1), Ku2 = Qm(K, u2);
+      const ptAt = (th) => ({ x: C.x + u1.x * Math.cos(th) + u2.x * Math.sin(th), y: C.y + u1.y * Math.cos(th) + u2.y * Math.sin(th), z: C.z + u1.z * Math.cos(th) + u2.z * Math.sin(th) });
+      const thetaOf = (X) => { const y = sub(X, C); return Math.atan2(dot(y, Ku2), dot(y, Ku1)); };
+      const nP = Qm(K, f.t), off = f.round ? f.r * Math.sin(r.a) * r.sign : 0, Cr = { x: s.c.x + off * f.t.x, y: s.c.y + off * f.t.y, z: s.c.z + off * f.t.z };
+      return { e, ptAt, thetaOf, side: (X) => sign * dot(nP, sub(X, Cr)) };
+    };
+    const capArc = (r, sign) => {
+      const S2 = silOf(r), k = S2 && contourOf(r, sign);
+      if (!k) return null;
+      const th0 = k.thetaOf(at(r, r.ring.vis[0])), th1 = k.thetaOf(at(r, r.ring.vis[1])), thm = th0 + mod(th1 - th0) / 2;
+      const mid = k.side(k.ptAt(thm)) > 0 ? k.ptAt(thm) : k.ptAt(thm + Math.PI), qm = projectPoint(mid), e = k.e;
+      const P0 = S2[0].p, P1 = S2[1].p, q0 = paramOn(e, P0), q1 = paramOn(e, P1), pm = paramOn(e, [qm.x, qm.y]);
+      const dir = mod(pm - q0) < mod(q1 - q0) ? 1 : -1, span = dir > 0 ? mod(q1 - q0) : mod(q0 - q1);
+      return { kind: 'arc', e, from: q0, to: q0 + dir * span, ccw: dir < 0, P0, P1 };
+    };
+    // an end row with no visible arc: its contour does not cross the row, so the cap shows its whole contour or nothing
+    const capWhole = (r, sign) => {
+      const k = contourOf(r, sign);
+      if (!k || !(k.side(k.ptAt(0)) > 0)) return [];
+      const P = pointOn(k.e, 0);
+      return [[{ kind: 'arc', e: k.e, from: 0, to: TWO_PI, ccw: false, P0: P, P1: P }]];
+    };
+    const startOf = (g) => (g.kind === 'bez' ? g.p0 : g.kind === 'arc' ? g.P0 : g.pts[0]);
+    // a polyline along the loop (for its winding)
+    const loopPoly = (segs) => segs.flatMap(g => (g.kind === 'bez' ? [0, 0.25, 0.5, 0.75].map(u => bezAt(g, u))
+      : g.kind === 'arc' ? Array.from({ length: 8 }, (_, j) => pointOn(g.e, g.from + (g.to - g.from) * j / 8)) : g.pts.slice(0, -1)));
+    const loopMemo = new Map();
+    const loopOf = (t0, t1) => {
+      const key = t0 + ':' + t1;
+      if (loopMemo.has(key)) return loopMemo.get(key);
+      const i0 = main.findIndex(r => r.s.tv === t0), i1 = main.findIndex(r => r.s.tv === t1);
+      // (a row whose whole ring faces the camera has no silhouette: the strips are used for that range)
+      const whole = (r) => r.ring && r.ring.vis && !silOf(r);
+      let loops = null;
+      if (i0 >= 0 && i1 > i0 && !main.slice(i0, i1 + 1).some(whole)) {
+        loops = [];
+        // one loop per run of rows with a visible arc; a run's end is the cap at t = 0 / 1, else its row's visible arc
+        for (let a = i0; a <= i1 && loops; ) {
+          if (!silOf(main[a])) { a++; continue; }
+          let b = a;
+          while (b + 1 <= i1 && silOf(main[b + 1]) && !main[b].flipNext) b++;
+          if (b === a) { a++; continue; }               // (a single row: no area)
+          // (a point without a tangent takes the direction through its neighbors on the border)
+          const border = (j) => {
+            const pts = main.slice(a, b + 1).map(r => silOf(r)[j]);
+            const dirOf = (k) => {
+              if (pts[k].d) return pts[k];
+              const P = pts[Math.max(k - 1, 0)].p, Q = pts[Math.min(k + 1, pts.length - 1)].p, dx = Q[0] - P[0], dy = Q[1] - P[1], l = Math.hypot(dx, dy);
+              return { p: pts[k].p, d: l > 1e-12 ? [dx / l, dy / l] : null };
+            };
+            const T = pts.map((_, k) => dirOf(k));
+            return T.slice(1).map((B, k) => (main[a + k].straight && main[a + k].straight[j] ? straightOf(T[k], B) : bezOf(T[k], B)));
+          };
+          const endB = b === n - 1 ? capArc(main[b], 1) : rowArc(main[b]), endA = a === 0 ? capArc(main[a], -1) : rowArc(main[a]);
+          if (!endA || !endB) { loops = null; break; }
+          loops.push([...border(0), endB, ...border(1).reverse().map(revSeg), revSeg(endA)]);
+          a = b + 1;
+        }
+        if (loops && i0 === 0 && !silOf(main[0])) loops.push(...capWhole(main[0], -1));
+        if (loops && i1 === n - 1 && !silOf(main[n - 1])) loops.push(...capWhole(main[n - 1], 1));
+        // each wound anticlockwise on screen (the batching rule); a loop's area is the sum of the layers it covers, so its sign is reliable
+        if (loops) loops = loops.map(segs => (area(loopPoly(segs)) > 0 ? segs.reverse().map(revSeg) : segs));
+      }
+      loopMemo.set(key, loops);
+      return loops;
+    };
+    const outline = (t0, t1) => (path) => {
+      const loops = loopOf(t0, t1);
+      if (!loops) { stripOutline(t0, t1)(path); return; }
+      loops.forEach(segs => {
+        const s0 = startOf(segs[0]);
+        path.moveTo(s0[0], s0[1]);
+        segs.forEach(g => {
+          if (g.kind === 'bez') path.bezierCurveTo(g.c1[0], g.c1[1], g.c2[0], g.c2[1], g.p1[0], g.p1[1]);
+          else if (g.kind === 'arc') { path.lineTo(g.P0[0], g.P0[1]); path.ellipse(g.e.x, g.e.y, g.e.a, g.e.b, g.e.angle, g.from, g.to, g.ccw); }
+          else g.pts.forEach(q => path.lineTo(q[0], q[1]));
+        });
+        path.closePath();
+      });
+    };
     const overlaps = (p, q) => {
       if (!boxesMeet(p.box, q.box)) return false;
       const within = (pt, s) => inBox(pt[0], pt[1], s.box) && inside(pt, s.poly);

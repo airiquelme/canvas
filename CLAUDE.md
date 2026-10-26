@@ -50,11 +50,20 @@ semi-diameters `(B - A) / 2` and `S - M`, so S is the apex even when off-center.
 only: each end's `shape.Q` is written in the arch's moving frame (tangent, in-plane normal, plane normal), the two forms are
 mixed with a smoothstep and turned back (`shapeAt`); the whole ellipsoid is swept, so a flat end's extent along the arch makes the band bulge where the arch bends. That is intended: sweeping only the cross-section (tried) leaves the ribbon drifting off the flat end discs, so the arch must start and end on the nodes' own shapes. The Debug view's section (`sectionAt`) is the true cut perpendicular to the arch, so it differs from the drawn bulge. So thickness and width are kept along the arch (no swelling from mixing
 differently oriented shapes in world coordinates). All-round ends use the circle path with a smoothstep radius. On screen the body
-is the union of the visible strips of its shading's exact rows (`outline` in `buildArch`, shading.js; built without light by
-`frame.archGeom` when the light is off): each strip is two exact elliptic arcs (the rows' visible halves, true perspective) and two
-chords, wound anticlockwise, all traced into one nonzero path; the visible surface covers the whole body on screen, so this is its
-outline from the same rows as its lit part (no offset between the two). A strip whose sides cross (a fold) is the hull of its row
-curves. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
+is ONE closed curve per range of t, no inner edges (`outline` / `loopOf` in `buildArch`, shading.js; built without light by
+`frame.archGeom` when the light is off): the visible surface is a disc in (t, phi) seen without mirroring, so its boundary filled
+nonzero is exactly the body on screen, folds included. Border 0 and border 1 are the ends of each row's visible arc, on the exact
+perspective contour (n . (camPos - x) = 0, closed form per row; a tube pointing at the camera has rows with no visible point, so a range
+can be several loops, with a row bisected in where the arc vanishes or flips to the other side of the body: a thin ribbon turning
+from one face to the other as seen keeps a sliver on every row while its center jumps by about pi; joined, that loop wound the second
+face backwards, a bulge near the green ribbon's skew node at 0.124; a border point whose row runs along the view ray takes its
+tangent from its neighbors), drawn as cubics through the exact points with the row ellipses'
+tangents (a surface curve through a contour point projects tangent to the silhouette), a row added where the cubic is off by more than 0.25 px
+both ways (the exact midpoint to the cubic and the cubic's middle to the exact points: one way only missed a cubic swinging out in a
+loop on its end tangents where a thin ribbon's contour sweeps across its face almost at once, a bulge at 3.178), the chord where that
+is closer at the last depth; a range ends on its row's exact visible arc, or at t = 0 / 1 on the cap: an arc of the end node's exact contour
+ellipse (the polar plane section, `contourOf`), its whole ellipse when the end row is hidden. The strips (the shading's quads) are only
+a fallback for a row whose whole ring faces the camera. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
 (skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
 (`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
 Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
@@ -259,11 +268,20 @@ semi-diameters `(B - A) / 2` and `S - M`, so S is the apex even when off-center.
 only: each end's `shape.Q` is written in the arch's moving frame (tangent, in-plane normal, plane normal), the two forms are
 mixed with a smoothstep and turned back (`shapeAt`); the whole ellipsoid is swept, so a flat end's extent along the arch makes the band bulge where the arch bends. That is intended: sweeping only the cross-section (tried) leaves the ribbon drifting off the flat end discs, so the arch must start and end on the nodes' own shapes. The Debug view's section (`sectionAt`) is the true cut perpendicular to the arch, so it differs from the drawn bulge. So thickness and width are kept along the arch (no swelling from mixing
 differently oriented shapes in world coordinates). All-round ends use the circle path with a smoothstep radius. On screen the body
-is the union of the visible strips of its shading's exact rows (`outline` in `buildArch`, shading.js; built without light by
-`frame.archGeom` when the light is off): each strip is two exact elliptic arcs (the rows' visible halves, true perspective) and two
-chords, wound anticlockwise, all traced into one nonzero path; the visible surface covers the whole body on screen, so this is its
-outline from the same rows as its lit part (no offset between the two). A strip whose sides cross (a fold) is the hull of its row
-curves. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
+is ONE closed curve per range of t, no inner edges (`outline` / `loopOf` in `buildArch`, shading.js; built without light by
+`frame.archGeom` when the light is off): the visible surface is a disc in (t, phi) seen without mirroring, so its boundary filled
+nonzero is exactly the body on screen, folds included. Border 0 and border 1 are the ends of each row's visible arc, on the exact
+perspective contour (n . (camPos - x) = 0, closed form per row; a tube pointing at the camera has rows with no visible point, so a range
+can be several loops, with a row bisected in where the arc vanishes or flips to the other side of the body: a thin ribbon turning
+from one face to the other as seen keeps a sliver on every row while its center jumps by about pi; joined, that loop wound the second
+face backwards, a bulge near the green ribbon's skew node at 0.124; a border point whose row runs along the view ray takes its
+tangent from its neighbors), drawn as cubics through the exact points with the row ellipses'
+tangents (a surface curve through a contour point projects tangent to the silhouette), a row added where the cubic is off by more than 0.25 px
+both ways (the exact midpoint to the cubic and the cubic's middle to the exact points: one way only missed a cubic swinging out in a
+loop on its end tangents where a thin ribbon's contour sweeps across its face almost at once, a bulge at 3.178), the chord where that
+is closer at the last depth; a range ends on its row's exact visible arc, or at t = 0 / 1 on the cap: an arc of the end node's exact contour
+ellipse (the polar plane section, `contourOf`), its whole ellipse when the end row is hidden. The strips (the shading's quads) are only
+a fallback for a row whose whole ring faces the camera. The chain of screen circles (`archSamples`) only gives each half's box and depth key. v1 limits: plain meshes only
 (skewed meshes are left out of `buildOwnership`, so no joints or split cones), two primitives split at the skew node
 (`buildSkewPrimitives`, overlapping by `DRAW_BAND` = 1/32 of t past the apex on each side so a ribbon's two halves have no seam, `slice: null`, key = the mean sample depth of each half), box-only overlap tests.
 Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).

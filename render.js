@@ -1027,7 +1027,7 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
   const BIG = 1e5;
   // A piece drawn in several runs builds its outline once: its canvas calls are recorded the first time
   // (the drawing functions take the context as an argument) and replayed under each clip strip.
-  const RECORDED = ['beginPath', 'moveTo', 'lineTo', 'closePath', 'arc', 'ellipse', 'fill', 'save', 'restore', 'transform', 'translate', 'scale', 'stroke', 'rect'];
+  const RECORDED = ['beginPath', 'moveTo', 'lineTo', 'bezierCurveTo', 'closePath', 'arc', 'ellipse', 'fill', 'save', 'restore', 'transform', 'translate', 'scale', 'stroke', 'rect'];
   const record = (fn) => {
     const ops = [], rec = {};
     RECORDED.forEach(m => { rec[m] = (...args) => { ops.push([m, args]); }; });
@@ -1037,7 +1037,7 @@ function drawPrimitives(ctx, primitives, seam, pxPerUnit, shading) {
   };
   // A piece that is one path and one fill (a traced piece, a joint body, a split cone part) can be built once as a
   // Path2D and filled under each clip strip; anything else (several fills, transforms) is replayed. null without Path2D.
-  const PATH_OPS = ['moveTo', 'lineTo', 'closePath', 'arc', 'ellipse', 'rect'];
+  const PATH_OPS = ['moveTo', 'lineTo', 'bezierCurveTo', 'closePath', 'arc', 'ellipse', 'rect'];
   const pathOf = (ops) => {
     if (typeof Path2D === 'undefined') return null;
     const path = new Path2D();
