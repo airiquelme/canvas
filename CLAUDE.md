@@ -41,8 +41,8 @@ sim" notes elsewhere in this file.
 | `hostHull.js` | A split cone's host mesh as the convex hull of its node bodies (hosts with squashed nodes): exact signed distance (`hostProbe`): a table of 4096 normals only says which bodies are in play, then the candidates (each body's nearest-point normal, each pair's ruled curve, each triple's face normal) are evaluated with the true support |
 | `shapeDebug.js` | Debug button's overlay: dotted screen outline of every node (+ cut and axes of squashed ones); a skew node shows instead the body's cross-section at that point of the arch (`sectionAt`, `skew.js`) |
 | `main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
-| `shell.js` | Shells: the store, `createShell`, cut helpers (`hemisphere`, `band`, `wedge`, `box`, `panel`, `plane`), `capRegion` (boundary of an intersection of caps on the unit sphere), `shellPieces`, `shellRange` |
-| `shellRender.js` | `renderShells`: the `?scene=shells` frame (order, exact arcs, debug circles) |
+| `shell.js` | Shells: the store, `createShell`, cut helpers (`hemisphere`, `band`, `wedge`, `box`, `panel`, `plane`), `capRegion` (boundary of an intersection of caps on the unit sphere), `shellPieces`, `shellRange`, `joint` (ball + limbs, below), `jointOrder`, `tubeLight` |
+| `shellRender.js` | `renderShells`: the shells frame (`orderShells`, exact arcs, joint painting, strokes, the Debug view) |
 | `tools/` | Headless Node checks (copy the modules first, they need `"type":"module"`): `trace.mjs` records the canvas calls over the orbit to diff two copies (`SPHERES=1` makes every node round), `shapeCheck.mjs` spheroid math, `hullCheck.mjs` ellipse capsule vs brute-force hull, `orientCheck`/`perspectiveCheck`/`silhouetteCheck` node ellipses vs the 3D body, `coneCheck.mjs` / `ellipsoidCheck.mjs` `hullCone.js` vs the sphere cone and a brute-force hull, `jointParity.mjs` the general joint ring with spheres vs the closed form, `jointCheck.mjs` its invariants and timing on squashed bodies, `jointSweep.mjs` frame-to-frame continuity of the demo's joint over the orbit, `jointRef.mjs` painted colors of a squashed V vs an exact ray cast of its flat solid (`STEP=4 node tools/jointRef.mjs <dir> all 6 <png-prefix>` writes drawn | reference | mismatch images), `meshCheck.mjs` rasterizes the squashed meshes' fills in real frames and compares them with the hull of their node ellipses, `outlineCheck.mjs` the exact ellipse / outline / conic math against brute force, `hostCheck.mjs` `hostProbe` against a brute-force hill climb, `splitCheck.mjs` the uniform closed form and the numeric split ring against each other and the sphere closed form, `frameTime.mjs` ms per `render()` of the demo (`SPHERES=1`: all round) |
 
 ## Shells (the default scene, separate from the meshes)
@@ -58,11 +58,46 @@ base and its lit part over it (Lit tones only with the light off; `innerColor` d
 `capRegion` intersects the circles pairwise in closed form, keeps the arcs whose middle lies in every other cap and chains them
 into loops (region on the left; a band is an annulus, filled nonzero). Each circle is a planar 3D ellipse, drawn with
 `makeConicProjector` (camera.js, shared with shading.js) as `ctx.ellipse` arcs; a screen ellipse thinner than 1e-3 px (a flat
-shell's cut edge) is a line. Order (`orderShells`): center depth, except a flat shell and a shell wholly on one side of its plane
-(`shellRange`, the exact range of the cut region along a direction) are ordered by that plane. Limits: other overlapping shells only
-by center depth (intersecting / nested ones can mis-order); a shell crossing the camera plane or containing the camera is skipped;
+shell's cut edge) is a line. Order (`orderShells`): one sort by the straight-line distance from the camera to a unit's center, farthest first (a joint is one
+unit), O(n log n), nothing pairwise; each flat shell (a floor) is then moved into place: units wholly on its camera side draw after it,
+wholly behind it before it, a unit crossing the plane by its center's side (a bounding-sphere test first, `shellRange` only when that is
+inconclusive). Limits: other overlapping shells only by center distance (intersecting / nested ones can mis-order; model around it, the
+engine does no shell-vs-shell clipping); a shell crossing the camera plane or containing the camera is skipped;
 the lit part's outer edge sits on the base's, a sub-pixel Twilight fringe. Border strokes (`drawUnits`, the Strokes button): each face of a shell is one fill with its own owner (`id.inner` / `id.outer`), so a face drawn over an earlier same-colored face (another shell's, or its own other face: a rim over its lining) gets a stroke under it, `strokes.px` wide outside its edge, one tone darker than the front's tone there, only where the face behind has the same tone. Each face carries its tone regions (`tones`: Lit = cuts ∩ face ∩ sun, Twilight = cuts ∩ face ∩ not-sun, exact cap regions); per tone, the region's share of the face outline (`traceRegion(..., edgesOnly)`: its arcs minus the terminator's, the cap tagged `term`, as open runs) is stroked, so the stroke switches tone exactly where the terminator crosses the edge, then masked to where a same-colored earlier face is on top (eroded by `ERODE_PX`: a shell's two faces meet on the contour with coincident edges) and to the *tone map* (`TONE_LAYERS`: one scratch layer per tone, opaque where the face on top has that tone; a new tone such as cast shadows' Shade adds a layer and its regions). About 5 canvas operations per tone per stroked face. Replaced: spreading the front's lit / twilight masks by 17 offset copies, which let a thin band of one tone along the edge be claimed by the other (strokes where the tones differed) and built AA residues up to opaque. Debug: cut circles dashed gray, silhouette purple. The
 Roundness slider drives the demo's pane.
+
+## Joints (shells): ball + limbs
+`joint({ center, radius, limbs: [{ dir, length, color }], color, joined, tube })` (`shell.js`): a ball (sphere, radius r) and one limb per
+entry, a half prolate spheroid of the same equatorial radius whose equator is a great circle of the ball, so the two surfaces are tangent
+at the rim (the radii must match; a limb longer than r). One `group` (= the ball's id); `zone` = the ball: border strokes (when on) are
+exempt only inside the ball's silhouette. `joined: false` makes plain shells. The members tile one surface:
+- the ball keeps the part outside the limbs (a plane `-dX . x >= 0` per limb, a wedge for two);
+- two limbs meet in a plane through the ball's center: x^T (QB^-1 - QA^-1) x = 0 with Q^-1 = I / r^2 - k d d^T, k = 1 / r^2 - 1 / h^2
+  factors as sqrt(kA) x.dA = +- sqrt(kB) x.dB, and A keeps `sqrt(kA) x.dA - sqrt(kB) x.dB >= 0` (a cap per pair, closed form);
+- every cut is pushed `underlapPx` (1.5 world units) into the neighbor so the seam has no hairline; the cap carries `nominal`, the d of
+  the plane itself.
+**Draw order inside a joint.** The members overlap on screen (a bend's inside is concave) though they tile in 3D, so a fixed order is
+wrong (192 of 8k rays). `jointOrder(members, camPos)`: the camera's side of the separating plane (limb rim, or the stop plane) is in
+front, exact, acyclic. A joint's linings (inner faces) are painted before its outer faces.
+**Shading.** Every shell is lit by its own exact normals. A face's dark area is that of the shell as a LONE FULL SPHEROID (`shellPieces`
+with `cuts: []`: front/back and not-sun regions), clipped to the surface the face has (its cuts). Joint outer faces are painted from the
+`nominal` cuts (the seams at their own planes) as a lit region and a dark region (each pixel covered once: a Twilight base under a Lit
+overlay antialiases the face edge twice and leaves a dark fringe along every seam), over an underpaint of the overlapped faces in their own
+tones (`cover`) laid AFTER the linings and before the outer faces (earlier, the lining, lit where the outside is dark, showed through the
+seams as a thin lit line). Not-joint shells keep Twilight base + Lit overlay. `tube: true` instead lights a two-limb joint with the bent
+tube light (`tubeLight`: the light loses its part along the tube, the lit half-section fixed in a parallel-transported frame, the ball's
+border the small circle `u . e1 = c` tangent to both limbs' borders); off by default.
+**Tried and dropped** (don't redo): letting any member's dark area show through the nearest face (the "union"): it fixes a sliver at one
+angle (3.654) but leaks a farther member's shade through a nearer lit surface at another (2.818); a bridge triangle between the two shade
+lines (neighbor's line continued until it meets this limb's): exact (cap intersections) but it only helps when the lines cross near the
+joint (3 of 6 test bends) and was hard to read; stroking a thin cover line over the seams: the cause was the double antialiasing.
+Defaults now: lighting on, strokes OFF (the stroke pass costs ~80 canvas calls per shell, ~15-20 per face per tone; make it cheaper before
+turning it on). Demo scene: one purple arm at the orbit's center.
+**Debug view (shells).** Per shell, its terminator as a lone full spheroid (front half solid, back half dashed), the dark area (`darkFull`
+clipped to the face) in pitch black, the cuts at their `nominal` planes (a shared plane once), layer numbers (the draw order, 1 = first),
+red dots where a solid line reaches another outer face of its joint. In Debug the joint faces are painted from the nominal cuts too, so
+fill, lines and dots agree. **Focus** (shells scene): one fixed zoom at which the arm's outline fits `focus.shellFill` of the half-height
+from every orbit angle (72 sampled), the camera on the centroid of the ball and the limb tips.
 
 ## Skewed meshes
 `createMesh([a, b], color, { skew: nodeId })` bends a 2-node mesh through a third node (`skew.js`, `buildSkewPrimitives` in
@@ -802,7 +837,11 @@ Node harness, see Debugging). What is closed form or cached now:
 - The **Focus** button (`focus` in `config.js`, off at load) centers the camera on the bounding sphere of the first mesh of 3+ nodes (`focus.meshId` picks another) and magnifies until all of it fits on screen at any orbit angle (`focus.fill` of the half-height); it draws only that mesh and the meshes sharing a node with it (`focus.meshIds`, set in `main.js` `focusFrame`). Everything is still computed with all the meshes.
 - The **Dark mode** button swaps the background between white and black.
   Light gaps show on black, dark ones on white.
-- The browser can't be seen from Claude Code. Geometry is verified with
+- Chrome is installed (`C:\Program Files\Google\Chrome\Application\chrome.exe`), so a frame CAN be looked at: copy the modules and a small test page
+  (import `renderShells`, set `camera.orbitAngle` / `zoom`, `debug.on`) to a scratch folder, serve it with `python -m http.server`, and
+  `chrome --headless=new --disable-gpu --window-size=1000,700 --virtual-time-budget=4000 --screenshot=out.png <url>`; `--dump-dom` returns
+  numbers computed in the page (pixel diffs of two renders). Software rendering: a GPU may antialias differently. Use it for a reported bug.
+- The browser can't be seen from Claude Code otherwise. Geometry is verified with
   headless Node harnesses: the modules are bundled into one script, run in a
   `vm` with a stubbed canvas context, and sampled over the camera orbit. Use a
   point-sampled raster to diff against a reference copy, and a
