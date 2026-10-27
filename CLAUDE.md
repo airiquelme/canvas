@@ -41,7 +41,28 @@ sim" notes elsewhere in this file.
 | `hostHull.js` | A split cone's host mesh as the convex hull of its node bodies (hosts with squashed nodes): exact signed distance (`hostProbe`): a table of 4096 normals only says which bodies are in play, then the candidates (each body's nearest-point normal, each pair's ruled curve, each triple's face normal) are evaluated with the true support |
 | `shapeDebug.js` | Debug button's overlay: dotted screen outline of every node (+ cut and axes of squashed ones); a skew node shows instead the body's cross-section at that point of the arch (`sectionAt`, `skew.js`) |
 | `main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
+| `shell.js` | Shells: the store, `createShell`, cut helpers (`hemisphere`, `band`, `wedge`, `box`, `panel`, `plane`), `capRegion` (boundary of an intersection of caps on the unit sphere), `shellPieces`, `shellRange` |
+| `shellRender.js` | `renderShells`: the `?scene=shells` frame (order, exact arcs, debug circles) |
 | `tools/` | Headless Node checks (copy the modules first, they need `"type":"module"`): `trace.mjs` records the canvas calls over the orbit to diff two copies (`SPHERES=1` makes every node round), `shapeCheck.mjs` spheroid math, `hullCheck.mjs` ellipse capsule vs brute-force hull, `orientCheck`/`perspectiveCheck`/`silhouetteCheck` node ellipses vs the 3D body, `coneCheck.mjs` / `ellipsoidCheck.mjs` `hullCone.js` vs the sphere cone and a brute-force hull, `jointParity.mjs` the general joint ring with spheres vs the closed form, `jointCheck.mjs` its invariants and timing on squashed bodies, `jointSweep.mjs` frame-to-frame continuity of the demo's joint over the orbit, `jointRef.mjs` painted colors of a squashed V vs an exact ray cast of its flat solid (`STEP=4 node tools/jointRef.mjs <dir> all 6 <png-prefix>` writes drawn | reference | mismatch images), `meshCheck.mjs` rasterizes the squashed meshes' fills in real frames and compares them with the hull of their node ellipses, `outlineCheck.mjs` the exact ellipse / outline / conic math against brute force, `hostCheck.mjs` `hostProbe` against a brute-force hill climb, `splitCheck.mjs` the uniform closed form and the numeric split ring against each other and the sphere closed form, `frameTime.mjs` ms per `render()` of the demo (`SPHERES=1`: all round) |
+
+## Shells (the default scene, separate from the meshes)
+A shell is a part of a spheroid drawn as an open, two-sided surface: `createShell({ center, radius, roundness, axis, spin, cuts,
+color, innerColor })` (`shell.js`). `x = c + T u`, u on the unit sphere, `T = [r e1, r e2, r roundness a]`: roundness 1 a sphere,
+< 1 oblate, 0 a flat disc (curvature at the pole = roundness / r), > 1 prolate. T is affine, so every test is a cap `n . u >= d` on
+the unit sphere: the cuts (u-space, so a part keeps its outline as the roundness changes: `hemisphere()`, `band(lat0, lat1)` a
+ribbon, `wedge(phi0, phi1)` up to PI, `box(wx, wy)`, `panel(wx, wy)` = hemisphere + box, a floor or pane at roundness 0), the
+front face `u . p >= 1/|p|` direction p = T^-1 (camPos - c) (its circle is the contour) and the lit side `u . T^-1 L >= 0` (a great
+circle; the inside is lit on the complement). Flat: front = the hemisphere on the camera's side of the axis, lit = the one on the
+light's (no inverse). Pieces, back to front: inside (cuts ∩ not-front, `innerColor`) then outside (cuts ∩ front), each its Twilight
+base and its lit part over it (Lit tones only with the light off; `innerColor` defaults to `color`, the demo's dome sets a lining); inside before outside is exact within one convex shell.
+`capRegion` intersects the circles pairwise in closed form, keeps the arcs whose middle lies in every other cap and chains them
+into loops (region on the left; a band is an annulus, filled nonzero). Each circle is a planar 3D ellipse, drawn with
+`makeConicProjector` (camera.js, shared with shading.js) as `ctx.ellipse` arcs; a screen ellipse thinner than 1e-3 px (a flat
+shell's cut edge) is a line. Order (`orderShells`): center depth, except a flat shell and a shell wholly on one side of its plane
+(`shellRange`, the exact range of the cut region along a direction) are ordered by that plane. Limits: other overlapping shells only
+by center depth (intersecting / nested ones can mis-order); a shell crossing the camera plane or containing the camera is skipped;
+the lit part's outer edge sits on the base's, a sub-pixel Twilight fringe. Border strokes (`drawUnits`, the Strokes button): each face of a shell is one fill with its own owner (`id.inner` / `id.outer`), so a face drawn over an earlier same-colored face (another shell's, or its own other face: a rim over its lining) gets a stroke under it, `strokes.px` wide outside its edge, one tone darker than the front's tone there, only where the face behind has the same tone. Each face carries its tone regions (`tones`: Lit = cuts ∩ face ∩ sun, Twilight = cuts ∩ face ∩ not-sun, exact cap regions); per tone, the region's share of the face outline (`traceRegion(..., edgesOnly)`: its arcs minus the terminator's, the cap tagged `term`, as open runs) is stroked, so the stroke switches tone exactly where the terminator crosses the edge, then masked to where a same-colored earlier face is on top (eroded by `ERODE_PX`: a shell's two faces meet on the contour with coincident edges) and to the *tone map* (`TONE_LAYERS`: one scratch layer per tone, opaque where the face on top has that tone; a new tone such as cast shadows' Shade adds a layer and its regions). About 5 canvas operations per tone per stroked face. Replaced: spreading the front's lit / twilight masks by 17 offset copies, which let a thin band of one tone along the edge be claimed by the other (strokes where the tones differed) and built AA residues up to opaque. Debug: cut circles dashed gray, silhouette purple. The
+Roundness slider drives the demo's pane.
 
 ## Skewed meshes
 `createMesh([a, b], color, { skew: nodeId })` bends a 2-node mesh through a third node (`skew.js`, `buildSkewPrimitives` in
@@ -75,7 +96,7 @@ cutter a half is one piece, as before. Consecutive slabs still merge unless a pi
 move before it (by the slabs' own capsules), so a cut where the other mesh only meets the farther part draws whole. A run that can't
 merge is no clip strip but its own exact outline over its ranges (`archPartial`), each end that meets a slab drawn later reaching
 `seam` on screen past it (`slice.ext`, also rows). Overlap tests use about 8 capsules along each half.
-Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
+Scenes: the shells scene (default, `buildShellScene`), `?scene=basic` (`buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
 **Rules (axial squash, `finalizeShapes` in scene.js, run once the meshes exist).** Every squashed piece is closed form:
@@ -304,7 +325,7 @@ cutter a half is one piece, as before. Consecutive slabs still merge unless a pi
 move before it (by the slabs' own capsules), so a cut where the other mesh only meets the farther part draws whole. A run that can't
 merge is no clip strip but its own exact outline over its ranges (`archPartial`), each end that meets a slab drawn later reaching
 `seam` on screen past it (`slice.ext`, also rows). Overlap tests use about 8 capsules along each half.
-Scenes: `?scene=basic` (default, `buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
+Scenes: the shells scene (default, `buildShellScene`), `?scene=basic` (`buildBasicScene`) and `?scene=full` (`buildFullScene`, the squashed demo).
 
 ## Squashed nodes
 **Rules (axial squash, `finalizeShapes` in scene.js, run once the meshes exist).** Every squashed piece is closed form:

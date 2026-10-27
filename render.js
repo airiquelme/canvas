@@ -55,7 +55,7 @@ function strokeColorsOf(primitives) {
 // Scratch canvases the size of the main one, kept between frames: stroke, mask, piece group, and for the strokes' tones
 // the frame's lit map, the front fill's lit mask and a dilation layer.
 let layerCache = null;
-function scratchLayers(ctx) {
+export function scratchLayers(ctx) {
   const { width, height } = ctx.canvas;
   if (!layerCache || layerCache[0].width !== width || layerCache[0].height !== height) {
     const make = () => (typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(width, height) : Object.assign(document.createElement('canvas'), { width, height }));
@@ -130,7 +130,7 @@ function rawSlabs(prim) {
   return out;
 }
 
-function applyDesignSpaceTransform(ctx, canvas) {
+export function applyDesignSpaceTransform(ctx, canvas) {
   const scale = Math.min(canvas.width / DESIGN_WIDTH, canvas.height / DESIGN_HEIGHT);
   ctx.translate(canvas.width / 2, canvas.height / 2);
   ctx.scale(scale, scale);

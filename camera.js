@@ -86,3 +86,42 @@ export function makeProjector(camPos, basis) {
     },
   };
 }
+
+// Exact screen images of planar 3D conics for one frame's camera (shading.js arches, shell.js shells).
+export function makeConicProjector(camPos, basis, projectPoint) {
+  // The perspective projection in homogeneous form: camera space (X, Y, Z) -> (s X + cx Z, -s Y + cy Z, Z) (projectToScreen).
+  const projK = (() => {
+    const Z0 = 100, f = basis.forward, q = projectPoint({ x: camPos.x + f.x * Z0, y: camPos.y + f.y * Z0, z: camPos.z + f.z * Z0 });
+    return { cx: q.x, cy: q.y, s: q.scale * Z0 };
+  })();
+  const hom = (w, isPoint) => {
+    const d = isPoint ? vecSub(w, camPos) : w, X = vecDot(d, basis.right), Y = vecDot(d, basis.up), Z = vecDot(d, basis.forward);
+    return [projK.s * X + projK.cx * Z, -projK.s * Y + projK.cy * Z, Z];
+  };
+  // The screen image of the 3D ellipse C + U cos th + V sin th, in closed form: the projection is a projective map H = [U V C] (homogeneous
+  // columns), so the image is the conic H^-T diag(1, 1, -1) H^-1, whose dual (its tangent lines) is H diag(1, 1, -1) H^T: no inverse,
+  // so a thin row (a flat ribbon's, U or V tiny) stays well-conditioned (inverting H blew such a conic up to thousands of pixels). The
+  // dual of the ellipse (x - c)^T P^-1 (x - c) = 1 is [[P - c c^T, -c], [-c^T, -1]], which gives the center and P. As { x, y, a, b, angle }
+  // (ctx.ellipse's terms), or null if it is not a proper ellipse (the row crosses the camera's plane).
+  const projectedEllipse = (C, U, V) => {
+    const u = hom(U, false), v = hom(V, false), c = hom(C, true);
+    const m = (i, j) => u[i] * u[j] + v[i] * v[j] - c[i] * c[j];
+    const w = m(2, 2);
+    if (!(w < 0)) return null;
+    const k = -1 / w, x = -k * m(0, 2), y = -k * m(1, 2);
+    const P00 = k * m(0, 0) + x * x, P01 = k * m(0, 1) + x * y, P11 = k * m(1, 1) + y * y;
+    const mean = (P00 + P11) / 2, diff = Math.hypot((P00 - P11) / 2, P01), l1 = mean + diff, l2 = mean - diff;
+    if (!(l1 > 0)) return null;
+    return { x, y, a: Math.sqrt(l1), b: Math.sqrt(Math.max(l2, 0)), angle: 0.5 * Math.atan2(2 * P01, P00 - P11) };
+  };
+  // A screen point's parameter on an ellipse (ctx.ellipse's angle) and back.
+  const paramOn = (e, p) => {
+    const dx = p[0] - e.x, dy = p[1] - e.y, ca = Math.cos(e.angle), sa = Math.sin(e.angle);
+    return Math.atan2((dy * ca - dx * sa) / e.b, (dx * ca + dy * sa) / e.a);
+  };
+  const pointOn = (e, psi) => {
+    const ca = Math.cos(e.angle), sa = Math.sin(e.angle), c = Math.cos(psi), s = Math.sin(psi);
+    return [e.x + e.a * c * ca - e.b * s * sa, e.y + e.a * c * sa + e.b * s * ca];
+  };
+  return { projectedEllipse, paramOn, pointOn };
+}

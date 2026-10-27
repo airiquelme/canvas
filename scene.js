@@ -1,5 +1,6 @@
 import { DESIGN_WIDTH, DESIGN_HEIGHT } from './config.js';
 import { makeShape } from './geometry.js';
+import { createShell, panel, hemisphere, band, wedge } from './shell.js';
 
 // Node = { id, center: {x, y, z}, radius, shape }. `radius` is the radius of the
 // sphere of equal volume; `shape` (makeShape, geometry.js) is the spheroid: semi-axis
@@ -164,4 +165,15 @@ export function buildFullScene() {
 
   // The split-cone figure, for the debug view to center on.
   return [...pyrBase, pyrApex];
+}
+
+// The shells demo (?scene=shells, CLAUDE.md "Shells"): a floor, a dome resting on it, a tilted ribbon, a half shell and a curved
+// pane whose roundness the Roundness slider drives. Returns the pane's id.
+export function buildShellScene() {
+  const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2, up = { x: 0, y: 1, z: 0 };
+  createShell({ center: { x: cx, y: cy - 140, z: 0 }, radius: 260, roundness: 0, axis: up, cuts: panel(0.9, 0.9), color: '#c8bfa4' });
+  createShell({ center: { x: cx - 120, y: cy - 140, z: 60 }, radius: 90, roundness: 0.6, axis: up, cuts: hemisphere(), color: '#4a90d9', innerColor: '#f2c14e' });
+  createShell({ center: { x: cx + 120, y: cy, z: -40 }, radius: 80, roundness: 1, axis: { x: 0.3, y: 1, z: 0.2 }, cuts: band(-0.3, 0.3), color: '#e05a47' });
+  createShell({ center: { x: cx + 60, y: cy - 70, z: 120 }, radius: 70, roundness: 1, axis: up, cuts: wedge(0, Math.PI), color: '#5cb85c' });
+  return createShell({ center: { x: cx - 80, y: cy + 20, z: -120 }, radius: 110, roundness: 0.15, axis: { x: 0, y: 0.3, z: 1 }, cuts: panel(0.75, 0.5), color: '#9fd8e8' });
 }

@@ -1,8 +1,10 @@
 // Entry point: canvas setup, UI buttons, animation loop. See CLAUDE.md.
 import { camera } from './camera.js';
 import { debug, focus, strokes, lighting, DESIGN_WIDTH, DESIGN_HEIGHT } from './config.js';
-import { buildBasicScene, buildFullScene, nodes, meshes } from './scene.js';
+import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from './scene.js';
 import { render } from './render.js';
+import { renderShells } from './shellRender.js';
+import { shells } from './shell.js';
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -15,8 +17,12 @@ resizeCanvas();
 // Resizing clears the canvas; redraw so a paused view doesn't stay blank.
 window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 
-// ?scene=full is the squashed-nodes demo; the default is the small skew scene.
-(new URLSearchParams(location.search).get('scene') === 'full' ? buildFullScene : buildBasicScene)();
+// The default is the shells scene (CLAUDE.md "Shells"); ?scene=basic is the small skew scene, ?scene=full the squashed-nodes demo.
+const sceneName = new URLSearchParams(location.search).get('scene');
+const shellScene = sceneName !== 'basic' && sceneName !== 'full';
+const paneId = shellScene ? buildShellScene() : null;
+if (!shellScene) (sceneName === 'full' ? buildFullScene : buildBasicScene)();
+if (shellScene) camera.height = 180;   // look down on the floor
 
 // Focus view: one mesh of 3+ nodes (and the meshes sharing a node with it), the camera on its bounding sphere, magnified until all of
 // it fits (config.js focus). A point at distance d from the view axis is drawn at zoom * orbitRadius / depth px per unit, and the
@@ -47,7 +53,7 @@ let paused = false;
 let darkMode = false;
 
 function drawFrame() {
-  render(ctx, canvas, { darkMode });
+  (shellScene ? renderShells : render)(ctx, canvas, { darkMode });
 }
 
 const pauseBtn = document.getElementById('pauseBtn');
@@ -82,6 +88,23 @@ if (strokeBtn) {
   const label = () => { strokeBtn.textContent = strokes.on ? 'Strokes: on' : 'Strokes: off'; strokeBtn.style.background = strokes.on ? '#1b5e20' : '#333'; };
   label();
   strokeBtn.addEventListener('click', () => { strokes.on = !strokes.on; label(); drawFrame(); });
+}
+
+const lightBtn = document.getElementById('lightBtn');
+if (lightBtn) {
+  const label = () => { lightBtn.textContent = lighting.on ? 'Light: on' : 'Light: off'; lightBtn.style.background = lighting.on ? '#1b5e20' : '#333'; };
+  label();
+  lightBtn.addEventListener('click', () => { lighting.on = !lighting.on; label(); drawFrame(); });
+}
+
+// Roundness slider (shells scene only): the curved pane, from flat (0) to a dome.
+const roundBox = document.getElementById('roundBox');
+if (roundBox && shellScene) {
+  roundBox.style.display = 'flex';
+  const slider = document.getElementById('roundSlider'), label = document.getElementById('roundLabel');
+  slider.value = shells[paneId].roundness;
+  label.textContent = Number(slider.value).toFixed(2);
+  slider.addEventListener('input', () => { shells[paneId].roundness = Number(slider.value); label.textContent = Number(slider.value).toFixed(2); drawFrame(); });
 }
 
 const debugBtn =document.getElementById('debugBtn');
