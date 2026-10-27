@@ -1,5 +1,5 @@
 // Entry point: canvas setup, UI buttons, animation loop. See CLAUDE.md.
-import { camera } from './camera.js';
+import { camera, getCameraPosition, computeViewBasis, makeProjector } from './camera.js';
 import { debug, focus, strokes, lighting, DESIGN_WIDTH, DESIGN_HEIGHT } from './config.js';
 import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from './scene.js';
 import { render } from './render.js';
@@ -28,7 +28,37 @@ if (shellScene) camera.height = 180;   // look down on the floor
 // it fits (config.js focus). A point at distance d from the view axis is drawn at zoom * orbitRadius / depth px per unit, and the
 // nearest point of the sphere is orbitRadius - R from the camera.
 const home = { target: { ...camera.target }, zoom: camera.zoom };
+// The shells scene: the first joint (ball and limbs). Its bounding sphere is the ball's center and the limbs' tips, and the same fit.
+function shellFocusFrame() {
+  const ball = Object.values(shells).find(s => s.group != null && s.id === s.group);
+  if (!ball) return null;
+  const pts = [ball.center];
+  Object.values(shells).forEach(s => {
+    if (s.group !== ball.group || s === ball) return;
+    const a = Math.hypot(s.axis.x, s.axis.y, s.axis.z), h = s.radius * s.roundness;
+    pts.push({ x: s.center.x + s.axis.x / a * h, y: s.center.y + s.axis.y / a * h, z: s.center.z + s.axis.z / a * h });
+  });
+  const target = { x: 0, y: 0, z: 0 };
+  pts.forEach(p => { target.x += p.x / pts.length; target.y += p.y / pts.length; target.z += p.z / pts.length; });
+  // One zoom that stays: the largest at which the arm's outline (the key points and the ball's radius, projected) fits `focus.shellFill`
+  // of the half-height from every orbit angle. A point's offset from the view center and its scale both grow with the zoom, so each
+  // angle's fit is a ratio of the numbers at the current zoom.
+  const saved = { target: camera.target, angle: camera.orbitAngle, zoom: camera.zoom };
+  camera.target = target; camera.zoom = 1;
+  let ext = 0;
+  for (let k = 0; k < 72; k++) {
+    camera.orbitAngle = k * Math.PI * 2 / 72;
+    const camPos = getCameraPosition(), { projectPoint } = makeProjector(camPos, computeViewBasis(camPos, target));
+    for (const p of pts) {
+      const q = projectPoint(p);
+      ext = Math.max(ext, Math.hypot(q.x - DESIGN_WIDTH / 2, q.y - DESIGN_HEIGHT / 2) + ball.radius * q.scale);
+    }
+  }
+  camera.target = saved.target; camera.orbitAngle = saved.angle; camera.zoom = saved.zoom;
+  return { target, zoom: ext > 1e-6 ? Math.min(Math.max(focus.shellFill * Math.min(DESIGN_WIDTH, DESIGN_HEIGHT) / 2 / ext, home.zoom), 12) : home.zoom };
+}
 function focusFrame() {
+  if (shellScene) return shellFocusFrame();
   const mesh = focus.meshId !== null ? meshes[focus.meshId] : Object.values(meshes).find(m => m.nodeIds.length > 2);
   if (!mesh) return null;
   const ns = mesh.nodeIds.map(id => nodes[id]), n = ns.length;

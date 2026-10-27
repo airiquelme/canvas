@@ -11,12 +11,121 @@ export const shells = {};
 let nextShellId = 1;
 
 // `cuts`: a list of caps (the helpers below, concatenated). `spin` turns e1 about the axis (radians).
-export function createShell({ center, radius, roundness = 1, axis = { x: 0, y: 1, z: 0 }, spin = 0, cuts = [], color, innerColor = color }) {
+// `group`: same-colored shells that read as one surface never stroke each other. With `zone` (a shell id, a joint's ball) they are
+// exempt only where that shell's silhouette covers them, so outside it they stroke and clip as separate shells.
+export function createShell({ center, radius, roundness = 1, axis = { x: 0, y: 1, z: 0 }, spin = 0, cuts = [], color, innerColor = color, group = null, zone = null }) {
   const id = nextShellId++;
-  shells[id] = { id, center, radius, roundness, axis, spin, cuts, color, innerColor };
+  shells[id] = { id, center, radius, roundness, axis, spin, cuts, color, innerColor, group, zone };
   return id;
 }
 
+// The tube light of a joint of two limbs (axes dA, dB pointing away from the ball): the engine's tube light, bent through the ball.
+// The light loses its part along the tube and the lit half-section stays fixed in the frame carried along the path (e1 = the bend
+// plane's normal, e2 = tangent x e1, tangents -dA into the ball and dB out of it), at the angle phiL the light has at the ball.
+// A limb's border is then a straight generatrix; the ball's is the small circle u . e1 = c through the border points on its wedge,
+// tangent to both generatrices there, so the border is continuous and tangent at both rims. null: the light runs along the tube.
+function tubeLight(dA, dB, L) {
+  const cr = vecCross(dA, dB), straight = vecDot(cr, cr) < 1e-8, t = straight ? dB : vecNormalize(vecSub(dB, dA));
+  const k = vecDot(L, t), l = { x: L.x - k * t.x, y: L.y - k * t.y, z: L.z - k * t.z }, ll = Math.hypot(l.x, l.y, l.z);
+  if (ll < 1e-6) return null;
+  const b1 = straight ? { x: l.x / ll, y: l.y / ll, z: l.z / ll } : vecNormalize(cr);
+  const tA = { x: -dA.x, y: -dA.y, z: -dA.z }, e2 = (tt) => vecCross(tt, b1);
+  const phiL = Math.atan2(vecDot(l, e2(t)), vecDot(l, b1));
+  // The unit vector of the cross-section at tube angle phi, in the frame of tangent tt.
+  const at = (tt, phi) => { const q = e2(tt), c = Math.cos(phi), s = Math.sin(phi); return { x: c * b1.x + s * q.x, y: c * b1.y + s * q.y, z: c * b1.z + s * q.z }; };
+  return { b1, phiL, tA, tB: dB, at };
+}
+
+// A joint (CLAUDE.md "Shells"): a ball of `radius` at `center` and one limb per `{ dir, length, color }`, a half prolate spheroid of the
+// same equatorial radius whose equator is a great circle of the ball, so the two surfaces are tangent there. The ball keeps only the
+// part outside the limbs (a plane per limb through its center, pushed `underlapPx` into the limb so it underpaints the rim). All are
+// one group (unless `joined` is false: plain shells), exempt from strokes only inside the ball's silhouette. Each is lit by its own exact normals;
+// `tube` lights the joint with the bent-tube light instead (`tubeLight`: one border running through the ball, tangent at both rims). Returns { ball, limbs }.
+export function joint({ center, radius, limbs, color, innerColor = color, underlapPx = 1.5, joined = true, tube = false }) {
+  const ball = createShell({ center, radius, color, innerColor });
+  const f = shellFrame(shells[ball]), eps = underlapPx / radius;
+  shells[ball].cuts = limbs.flatMap(l => { const u = f.toU(vecNormalize(l.dir)), k = Math.hypot(...u); return plane([-u[0] / k, -u[1] / k, -u[2] / k], -eps).map(c => ({ ...c, nominal: 0 })); });
+  const g = joined ? ball : null;
+  shells[ball].group = shells[ball].zone = g;
+  const ids = limbs.map(l => {
+    const d = vecNormalize(l.dir), id = createShell({ center, radius, roundness: l.length / radius, axis: d, cuts: hemisphere(), color: l.color || color, innerColor: l.color || innerColor, group: g, zone: g });
+    shells[id].depthPoint = { x: center.x + d.x * l.length / 2, y: center.y + d.y * l.length / 2, z: center.z + d.z * l.length / 2 };
+    return id;
+  });
+  // Where two limbs meet their surfaces cross in a plane through the center (two spheroids with one equatorial radius r and semi-axes
+  // h: x^T (Q_B^-1 - Q_A^-1) x = 0 with Q^-1 = I / r^2 - k d d^T, k = 1 / r^2 - 1 / h^2, i.e. sqrt(kA) x.dA = +- sqrt(kB) x.dB). A's
+  // visible part is the side sqrt(kA) x.dA - sqrt(kB) x.dB >= 0 (the points with x.dB < 0 are outside B's half anyway), so the limbs
+  // tile the surface and each one's shade region ends at that edge. Pushed `underlapPx` (world units) into the other limb so the seam underpaints.
+  if (joined) {
+    const k = limbs.map(l => 1 / (radius * radius) - 1 / (l.length * l.length)), dirs = limbs.map(l => vecNormalize(l.dir));
+    ids.forEach((id, i) => {
+      if (!(k[i] > 0)) return;
+      const fl = shellFrame(shells[id]), extra = [];
+      ids.forEach((_, j) => {
+        if (j === i || !(k[j] > 0)) return;
+        const sa = Math.sqrt(k[i]), sb = Math.sqrt(k[j]);
+        const w = { x: sa * dirs[i].x - sb * dirs[j].x, y: sa * dirs[i].y - sb * dirs[j].y, z: sa * dirs[i].z - sb * dirs[j].z };
+        const u = [fl.r * vecDot(w, fl.e1), fl.r * vecDot(w, fl.e2), fl.h * vecDot(w, fl.a)], len = Math.hypot(...u);
+        if (len > 1e-12) extra.push(...plane([u[0] / len, u[1] / len, u[2] / len], -underlapPx * Math.hypot(w.x, w.y, w.z) / len).map(c => ({ ...c, nominal: 0 })));   // underlapPx in world units across the plane
+      });
+      shells[id].cuts = [...shells[id].cuts, ...extra];
+    });
+  }
+  if (tube && joined && limbs.length === 2) {   // the bent-tube light (off: every shell is lit by its own exact normals)
+    const dA = vecNormalize(limbs[0].dir), dB = vecNormalize(limbs[1].dir), HALF = Math.PI / 2;
+    // The ball: the small circle u . b1 = c through the border point on A's rim that lies in the wedge, lit on the side toward phiL.
+    shells[ball].sunCap = (L, fb) => {
+      const tl = tubeLight(dA, dB, L);
+      if (!tl) return null;
+      const { b1, phiL, tA, at } = tl;
+      let s = 1, p = at(tA, phiL + HALF);
+      if (vecDot(p, dB) > 0) { s = -1; p = at(tA, phiL - HALF); }
+      const c = vecDot(p, b1), sg = vecDot(at(tA, phiL + s * HALF - s * 0.1), b1) < c ? -1 : 1;
+      return { n: [sg * vecDot(b1, fb.e1), sg * vecDot(b1, fb.e2), sg * vecDot(b1, fb.a)], d: sg * c };
+    };
+    // A limb: the plane through its axis, lit toward m = the lit direction of the cross-section in its own frame.
+    [[ids[0], 'tA'], [ids[1], 'tB']].forEach(([id, key]) => {
+      shells[id].sunCap = (L, fl) => {
+        const tl = tubeLight(dA, dB, L);
+        if (!tl) return null;
+        const m = tl.at(tl[key], tl.phiL), u = [fl.r * vecDot(m, fl.e1), fl.r * vecDot(m, fl.e2), fl.h * vecDot(m, fl.a)], k = Math.hypot(...u);
+        return { n: [u[0] / k, u[1] / k, u[2] / k], d: 0 };
+      };
+    });
+  }
+  return { ball, limbs: ids };
+}
+
+// The draw order of one joint's members (its shells, ball = the shell whose id is the group), farthest first. The members tile the surface,
+// but on screen they can overlap (a bend's inner side is concave), and what is in front is exact: two members are separated by a plane
+// through the ball's center (limb | ball: the limb's rim plane, limb | limb: the stop plane sqrt(kX) x.dX = sqrt(kY) x.dY), and a ray
+// from the camera meets the camera's side of any plane first. Members with no such plane (a limb no longer than its radius) go by
+// the distance of their middle to the camera.
+export function jointOrder(members, camPos) {
+  const ball = members.find(s => s.id === s.group), J = ball ? ball.center : members[0].center;
+  const rel = vecSub(camPos, J), dir = (s) => vecNormalize(s.axis);
+  const k = (s) => 1 / (s.radius * s.radius) - 1 / (s.radius * s.roundness) ** 2;
+  const near = (X, Y) => {   // is X in front of Y?
+    const limbs = [X, Y].filter(s => s !== ball);
+    if (limbs.length === 2 && k(X) > 0 && k(Y) > 0) {
+      const a = dir(X), b = dir(Y), sx = Math.sqrt(k(X)), sy = Math.sqrt(k(Y));
+      return sx * vecDot(a, rel) - sy * vecDot(b, rel) > 0;
+    }
+    if (limbs.length === 1) { const s = vecDot(dir(limbs[0]), rel); if (Math.abs(s) > 1e-12) return (X === ball) === (s < 0); }
+    const dist = (s) => { const p = s.depthPoint || s.center; return Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z); };
+    return dist(X) < dist(Y);
+  };
+  const left = [...members].sort((p, q) => (q === ball) - (p === ball)), out = [];
+  while (left.length) {
+    // The next one to draw is behind every other that is left.
+    let i = left.findIndex(m => left.every(o => o === m || near(o, m)));
+    if (i < 0) i = 0;
+    out.push(left.splice(i, 1)[0]);
+  }
+  return out;
+}
+
+// A cap pushed past its plane for an underlap carries `nominal`, the d of the plane itself (the Debug view draws that one).
 // Cut helpers, in u-space (e1, e2, axis): each returns a list of caps.
 const cap = (n, d) => { const l = Math.hypot(n[0], n[1], n[2]); return { n: [n[0] / l, n[1] / l, n[2] / l], d: d / l }; };
 export const plane = (n, d = 0) => [cap(n, d)];
@@ -187,6 +296,8 @@ export function shellPieces(s, camPos, lightDir, lit = true) {
     front = { n: [p[0] / pl, p[1] / pl, p[2] / pl], d: 1 / pl };
     const l = f.toU(lightDir), ll = Math.hypot(...l);
     sun = { n: [l[0] / ll, l[1] / ll, l[2] / ll], d: 0, term: true };
+    const own = s.sunCap && s.sunCap(lightDir, f);   // a joint's tube light
+    if (own) sun = { n: own.n, d: own.d, term: true };
   }
   const out = [];
   const add = (face, isLit, caps, dark = false) => { const region = capRegion([...s.cuts, ...caps]); if (!region.empty) out.push({ face, lit: isLit, dark, region, frame: f }); };

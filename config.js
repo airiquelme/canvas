@@ -16,7 +16,7 @@ export const SEAM_PX = 1.5;
 // Border strokes (the Strokes button): where a mesh lies over another mesh of the SAME color and the same tone, its edge gets a
 // stroke one tone darker than the front's (Lit -> Twilight, Twilight -> Shade), `px` canvas pixels thick (the visible, outer half
 // of a stroke centered on the edge), whatever the zoom. No stroke where the two tones differ.
-export const strokes = { on: true, px: 2 };
+export const strokes = { on: false, px: 2 };
 
 // Light engine (the Light button; light.js, shading.js). One directional world light (`dir`: unit vector toward the light, world
 // axes, fixed in the world so the lit side stays put on the objects as the camera orbits; here upper-left-front of the camera's
@@ -36,5 +36,6 @@ export const light = { dir: { x: 100 / lightLen, y: 110 / lightLen, z: 200 / lig
 
 // Focus view (the Focus button): the camera centers on one mesh of 3+ nodes (`meshId`, default the first one) and magnifies until all
 // of it fits on screen (its bounding sphere takes `fill` of the half-height of the view, at any orbit angle). Only that mesh and the
-// meshes sharing a node with it (`meshIds`, set by main.js) are drawn.
-export const focus = { on: false, meshId: null, fill: 0.7, meshIds: [] };
+// meshes sharing a node with it (`meshIds`, set by main.js) are drawn. In the shells scene it targets the first joint instead, with one fixed zoom
+// at which the arm fits `shellFill` of the half-height from every orbit angle.
+export const focus = { on: false, meshId: null, fill: 0.7, shellFill: 0.9, meshIds: [] };

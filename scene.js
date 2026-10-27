@@ -1,6 +1,6 @@
 import { DESIGN_WIDTH, DESIGN_HEIGHT } from './config.js';
 import { makeShape } from './geometry.js';
-import { createShell, panel, hemisphere, band, wedge } from './shell.js';
+import { createShell, panel, hemisphere, band, wedge, joint } from './shell.js';
 
 // Node = { id, center: {x, y, z}, radius, shape }. `radius` is the radius of the
 // sphere of equal volume; `shape` (makeShape, geometry.js) is the spheroid: semi-axis
@@ -175,5 +175,11 @@ export function buildShellScene() {
   createShell({ center: { x: cx - 120, y: cy - 140, z: 60 }, radius: 90, roundness: 0.6, axis: up, cuts: hemisphere(), color: '#4a90d9', innerColor: '#f2c14e' });
   createShell({ center: { x: cx + 120, y: cy, z: -40 }, radius: 80, roundness: 1, axis: { x: 0.3, y: 1, z: 0.2 }, cuts: band(-0.3, 0.3), color: '#e05a47' });
   createShell({ center: { x: cx + 60, y: cy - 70, z: 120 }, radius: 70, roundness: 1, axis: up, cuts: wedge(0, Math.PI), color: '#5cb85c' });
-  return createShell({ center: { x: cx - 80, y: cy + 20, z: -120 }, radius: 110, roundness: 0.15, axis: { x: 0, y: 0.3, z: 1 }, cuts: panel(0.75, 0.5), color: '#9fd8e8' });
+  const pane = createShell({ center: { x: cx - 80, y: cy + 20, z: -120 }, radius: 110, roundness: 0.15, axis: { x: 0, y: 0.3, z: 1 }, cuts: panel(0.75, 0.5), color: '#9fd8e8' });
+
+  // An arm (`joint`, shell.js): a ball and two half-spheroid limbs.
+  const dir = (deg) => ({ x: Math.cos(deg * Math.PI / 180), y: Math.sin(deg * Math.PI / 180), z: 0 });
+  const arm = (x, y, z, r, a, b, len, color, joined = true) => joint({ center: { x, y, z }, radius: r, color, joined, limbs: [{ dir: dir(a), length: len }, { dir: dir(b), length: len }] });
+  arm(cx, cy + 40, 0, 26, 160, 40, 110, '#ab47bc');   // at the orbit's center, clear of the dome and the floor
+  return pane;
 }
