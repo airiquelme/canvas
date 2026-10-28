@@ -22,19 +22,21 @@ const sceneName = new URLSearchParams(location.search).get('scene');
 const shellScene = sceneName !== 'basic' && sceneName !== 'full';
 const paneId = shellScene ? buildShellScene() : null;
 if (!shellScene) (sceneName === 'full' ? buildFullScene : buildBasicScene)();
-if (shellScene) camera.height = 180;   // look down on the floor
+if (shellScene) { camera.height = 180; camera.zoom = 2.6; }   // look down on the hand, magnified (the hand is ~230 units tall)
 
 // Focus view: one mesh of 3+ nodes (and the meshes sharing a node with it), the camera on its bounding sphere, magnified until all of
 // it fits (config.js focus). A point at distance d from the view axis is drawn at zoom * orbitRadius / depth px per unit, and the
 // nearest point of the sphere is orbitRadius - R from the camera.
 const home = { target: { ...camera.target }, zoom: camera.zoom };
-// The shells scene: the first joint (ball and limbs). Its bounding sphere is the ball's center and the limbs' tips, and the same fit.
+// The shells scene: every joint (the balls and the limbs' tips).
 function shellFocusFrame() {
-  const ball = Object.values(shells).find(s => s.group != null && s.id === s.group);
-  if (!ball) return null;
-  const pts = [ball.center];
-  Object.values(shells).forEach(s => {
-    if (s.group !== ball.group || s === ball) return;
+  const members = Object.values(shells).filter(s => s.group != null);
+  if (!members.length) return null;
+  // The joints' balls and the limbs' tips (a rig's bones end in its balls); `pad`: the thickest member.
+  const pts = [], pad = Math.max(...members.map(s => s.radius));
+  members.forEach(s => {
+    if (s.rig && s.rig.ends) return;
+    if (s.id === s.group || (s.rig && s.rig.ball)) { pts.push(s.center); return; }
     const a = Math.hypot(s.axis.x, s.axis.y, s.axis.z), h = s.radius * s.roundness;
     pts.push({ x: s.center.x + s.axis.x / a * h, y: s.center.y + s.axis.y / a * h, z: s.center.z + s.axis.z / a * h });
   });
@@ -51,7 +53,7 @@ function shellFocusFrame() {
     const camPos = getCameraPosition(), { projectPoint } = makeProjector(camPos, computeViewBasis(camPos, target));
     for (const p of pts) {
       const q = projectPoint(p);
-      ext = Math.max(ext, Math.hypot(q.x - DESIGN_WIDTH / 2, q.y - DESIGN_HEIGHT / 2) + ball.radius * q.scale);
+      ext = Math.max(ext, Math.hypot(q.x - DESIGN_WIDTH / 2, q.y - DESIGN_HEIGHT / 2) + pad * q.scale);
     }
   }
   camera.target = saved.target; camera.orbitAngle = saved.angle; camera.zoom = saved.zoom;
@@ -129,7 +131,7 @@ if (lightBtn) {
 
 // Roundness slider (shells scene only): the curved pane, from flat (0) to a dome.
 const roundBox = document.getElementById('roundBox');
-if (roundBox && shellScene) {
+if (roundBox && shellScene && paneId) {
   roundBox.style.display = 'flex';
   const slider = document.getElementById('roundSlider'), label = document.getElementById('roundLabel');
   slider.value = shells[paneId].roundness;

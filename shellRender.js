@@ -4,13 +4,11 @@ import { TWILIGHT, LIT, toneColor } from './light.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector, makeConicProjector } from './camera.js';
 import { applyDesignSpaceTransform, scratchLayers } from './render.js';
 import { vecDot, vecSub } from './geometry.js';
-import { shells, shellPieces, shellFrame, shellRange, worldEllipse, circlePoint, capRegion, jointOrder } from './shell.js';
+import { shells, shellPieces, shellFrame, shellRange, shellMid, worldEllipse, circlePoint, capRegion, jointOrder } from './shell.js';
 
 const TWO_PI = Math.PI * 2;
 const mod2pi = (x) => ((x % TWO_PI) + TWO_PI) % TWO_PI;
 const DEGENERATE_PX = 1e-3;
-// Debug: points per arc of a shade line when looking for where it reaches another shell.
-const TERM_SAMPLES = 240;
 const boxesMeet = (p, q) => p.x0 <= q.x1 && q.x0 <= p.x1 && p.y0 <= q.y1 && q.y0 <= p.y1;
 // The same-colored fills behind are eroded by this much (canvas px) before they mask the stroke: where a shell's two faces meet on its
 // contour their edges coincide, and the back face's antialiased edge would leave a faint stroke along the silhouette.
@@ -27,18 +25,21 @@ const TONE_LAYERS = { [LIT]: 3, [TWILIGHT]: 4 };
 // only when that is inconclusive from the exact range of the cut region (`shellRange`, cached). The flat shell is then moved into place in the sorted array
 // (units forced before it that sorted after it are moved up to it): O(n) per flat shell, and no cycles are possible.
 const reach = (s) => Math.max(s.radius, s.radius * s.roundness);
+const dist3 = (p, q) => Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
 export function orderShells(list, camPos) {
   const groups = new Map(), units = [];
   for (const s of list) {
-    if (s.group == null) { units.push({ shells: [s], c: s.center, R: reach(s) }); continue; }
+    if (s.group == null) { const c = shellMid(s); units.push({ shells: [s], c, R: reach(s) + dist3(c, s.center) }); continue; }
     let u = groups.get(s.group);
     if (!u) { u = { shells: [], c: null, R: 0 }; groups.set(s.group, u); units.push(u); }
     u.shells.push(s);
   }
   for (const u of groups.values()) {
     u.shells.sort((p, q) => (q.id === q.group) - (p.id === p.group));   // the ball first
-    u.c = u.shells[0].center;
-    u.R = Math.max(...u.shells.map(s => Math.hypot(s.center.x - u.c.x, s.center.y - u.c.y, s.center.z - u.c.z) + reach(s)));
+    const mids = u.shells.map(shellMid);   // the unit's center: the mean of its members' render centers
+    u.c = { x: 0, y: 0, z: 0 };
+    mids.forEach(m => { u.c.x += m.x / mids.length; u.c.y += m.y / mids.length; u.c.z += m.z / mids.length; });
+    u.R = Math.max(...u.shells.map(s => dist3(s.center, u.c) + reach(s)));
   }
   for (const u of units) u.key = Math.hypot(u.c.x - camPos.x, u.c.y - camPos.y, u.c.z - camPos.z);
   let arr = units.sort((p, q) => q.key - p.key);
@@ -132,8 +133,8 @@ export function renderShells(ctx, canvas, { darkMode }) {
     path.ellipse(e.x, e.y, e.a + g, e.b + g, e.angle, 0, TWO_PI);
     return path;
   };
-  const units = [], termLines = [], termArcs = [];
-  const list = Object.values(shells).filter(s => depthOf(s) > 0);
+  const units = [];
+  const list = Object.values(shells).filter(s => !s.hidden && depthOf(s) > 0);
   const order = orderShells(list, camPos);
   for (const s of order) {
     // The shading: the dark area of the shell as a lone full spheroid (below), cut by what the face has. With strokes on, the face's own
@@ -141,38 +142,21 @@ export function renderShells(ctx, canvas, { darkMode }) {
     const wantTones = lighting.on && strokes.on, shade = lighting.on && !strokes.on;
     const pieces = shellPieces(s, camPos, light.dir, wantTones);
     try {
-      // The terminator of the shell as a lone, full spheroid (no cuts, no joint): its front half solid, its back half dashed (Debug view).
-      // The area that line and the silhouette enclose on its dark side (`darkFull`, per face) is what is shaded, where the shell has
-      // surface (its own face) and until a shell drawn later covers it; 
+      // A face's dark area is that of the shell as a lone, full spheroid (no cuts, no joint; `darkFull`, per face), cut to the surface the
+      // face has (CLAUDE.md "Joints (shells)").
       const darkFull = {};
-      if (debug.on || shade) {
+      if (shade) {
         for (const pc of shellPieces({ ...s, cuts: [], sunCap: null }, camPos, light.dir, true)) {
-          const path = new Path2D();
-          if (pc.dark) {
-            const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
-            traceRegion(path, pc.frame, pc.region, box);
-            darkFull[pc.face] = { path, box };
-          } else if (pc.lit && debug.on) {
-            traceRegion(path, pc.frame, pc.region, { x0: 0, y0: 0, x1: 0, y1: 0 }, false, true);
-            termLines.push({ path, dashed: pc.face === 'inner' });
-            if (pc.face === 'outer' && s.group != null) {   // the solid line as points, to find where it reaches the other shells of its joint
-              const arcs = [];
-              for (const loop of pc.region.loops) for (const r of loop) {
-                const ci = pc.region.circles[r.ci];
-                if (!ci.term) continue;
-                const t1 = r.whole ? r.t0 + TWO_PI : r.t1, arc = [];
-                for (let k = 0; k <= TERM_SAMPLES; k++) arc.push(toScreen(pc.frame, circlePoint(ci, r.t0 + (t1 - r.t0) * k / TERM_SAMPLES)));
-                arcs.push(arc);
-              }
-              termArcs.push({ sid: s.id, group: s.group, arcs });
-            }
-          }
+          if (!pc.dark) continue;
+          const path = new Path2D(), box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+          traceRegion(path, pc.frame, pc.region, box);
+          darkFull[pc.face] = { path, box };
         }
       }
-      // The faces with the cuts at their own planes (no underlap): their tones, the Debug fill and the dots follow the seams themselves. The
+      // The faces with the cuts at their own planes (no underlap): their tones follow the seams themselves. The
       // overlapped faces only cover the seams' antialiasing (`cover`, painted first for the whole joint).
       const nominal = {};
-      if ((debug.on || shade) && s.cuts.some(k => k.nominal !== undefined)) {
+      if (shade && s.cuts.some(k => k.nominal !== undefined)) {
         const cuts = s.cuts.map(k => (k.nominal !== undefined ? { ...k, d: k.nominal } : k));
         const trace0 = (pc) => { const path = new Path2D(); traceRegion(path, pc.frame, pc.region, { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }); return path; };
         for (const pc of shellPieces({ ...s, cuts, sunCap: null }, camPos, light.dir, lighting.on)) {
@@ -195,7 +179,7 @@ export function renderShells(ctx, canvas, { darkMode }) {
           ? [[ps.find(pc => pc.lit), LIT], [ps.find(pc => pc.dark), TWILIGHT]].filter(([pc]) => pc).map(([pc, t]) => toneOf(pc, t))
           : [toneOf(basePc, LIT)];
         const lit = wantTones ? (tones.find(t => t.tone === LIT) || {}).fill || null : null;
-        mine.push({ cover: path !== real && face === 'outer' ? real : null, regions: shade && path !== real && face === 'outer' ? { lit: nominal[face].lit || null, dark: nominal[face].dark || null } : null, nomPath: nom || null, sid: s.id, hatch: debug.on ? darkFull[face] || null : null, shade, dark: darkFull[face] || null, dashed: face === 'inner', owner: s.id + '.' + face, group: s.group, zone: s.zone && shells[s.zone] ? zoneOf(shells[s.zone]) : null, color: face === 'inner' ? s.innerColor : s.color, path, lit, tones, box });
+        mine.push({ cover: path !== real && face === 'outer' ? real : null, regions: shade && path !== real && face === 'outer' ? { lit: nominal[face].lit || null, dark: nominal[face].dark || null } : null, sid: s.id, shade, dark: darkFull[face] || null, dashed: face === 'inner', owner: s.id + '.' + face, group: s.group, zone: s.zone && shells[s.zone] ? zoneOf(shells[s.zone]) : null, color: face === 'inner' ? s.innerColor : s.color, path, lit, tones, box });
       }
       units.push(...mine);
     } catch (err) {
@@ -214,57 +198,9 @@ export function renderShells(ctx, canvas, { darkMode }) {
     units.splice(i, j - i, ...run);
     i = j;
   }
-  // Debug: where the solid shade line of a shell reaches the outline of another outer face of its joint (red dots).
-  const dots = [];
-  if (debug.on) {
-    const tf = ctx.getTransform(), inside = (path, p) => { const q = tf.transformPoint({ x: p[0], y: p[1] }); return ctx.isPointInPath(path, q.x, q.y); };
-    const outers = units.filter(u => !u.dashed && u.group != null);
-    for (const ta of termArcs) for (const arc of ta.arcs) for (const O of outers) {
-      if (O.sid === ta.sid || O.group !== ta.group) continue;
-      const op = O.nomPath || O.path;
-      let prev = inside(op, arc[0]);
-      for (let k = 1; k < arc.length; k++) {
-        const cur = inside(op, arc[k]);
-        if (cur !== prev) {
-          let a = arc[k - 1], b = arc[k];
-          for (let it = 0; it < 20; it++) { const m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]; if (inside(op, m) === prev) a = m; else b = m; }
-          dots.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
-        }
-        prev = cur;
-      }
-    }
-  }
   drawUnits(ctx, units);
-  if (termLines.length) {
-    const tf = ctx.getTransform(), pxPerUnit = Math.hypot(tf.a, tf.b);
-    // The terminator lines are debug: over everything, a dark line on a light halo so they read on any background.
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (const [w, c] of [[2.5, '#ffffff'], [1, '#111111']]) {
-      ctx.lineWidth = w / pxPerUnit; ctx.strokeStyle = c;
-      termLines.forEach(l => { ctx.setLineDash(l.dashed ? [6 / pxPerUnit, 5 / pxPerUnit] : []); ctx.stroke(l.path); });
-    }
-    ctx.setLineDash([]);
-  }
-  if (dots.length) {
-    const tf = ctx.getTransform(), k = 1 / Math.hypot(tf.a, tf.b);
-    for (const [x, y] of dots) {
-      ctx.beginPath(); ctx.arc(x, y, 2 * k, 0, TWO_PI);
-      ctx.fillStyle = '#e53935'; ctx.fill();
-    }
-  }
-
   if (debug.on) {
     drawShellDebug(ctx, list, camPos, projectedEllipse);
-    // The draw layer of each shell (1 = drawn first, at the bottom), at its center (a limb: the middle of its length).
-    const k = 1 / Math.hypot(ctx.getTransform().a, ctx.getTransform().b);
-    ctx.save();
-    ctx.font = `bold ${16 * k}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
-    order.forEach((s, i) => {
-      const q = projectPoint(s.depthPoint || s.center);
-      ctx.lineWidth = 4 * k; ctx.strokeStyle = '#ffffff'; ctx.strokeText(String(i + 1), q.x, q.y);
-      ctx.fillStyle = '#111111'; ctx.fillText(String(i + 1), q.x, q.y);
-    });
-    ctx.restore();
   }
 }
 
@@ -348,11 +284,6 @@ function drawUnits(ctx, units) {
       ctx.fill(u.path);
       if (u.lit) { ctx.fillStyle = toneColor(u.color, LIT); ctx.fill(u.lit); }
     }
-    if (u.hatch) {   // Debug: the face's part of the enclosed dark area in pitch black (later faces cover it like any fill)
-      ctx.save(); ctx.clip(u.nomPath || u.path); ctx.clip(u.hatch.path);
-      ctx.fillStyle = '#000000'; ctx.fill(u.hatch.path);
-      ctx.restore();
-    }
     if (layers) {
       // The tone map: the face now on top, by tone.
       for (const i of Object.values(TONE_LAYERS)) {
@@ -401,6 +332,14 @@ function drawShellDebug(ctx, list, camPos, projectedEllipse) {
     if (pl <= 1) continue;
     const reg = capRegion([{ n: [p[0] / pl, p[1] / pl, p[2] / pl], d: 1 / pl }]);
     if (reg.circles) stroke(f, reg.circles[0], '#8e24aa');
+    if (s.ring && reg.circles) {   // a shell marked by the scene (`ring`: a color): a solid circle on its silhouette
+      const W = worldEllipse(f, reg.circles[0]), e = projectedEllipse(W.C, W.U, W.V), tf = ctx.getTransform(), px = 1 / Math.hypot(tf.a, tf.b);
+      if (e) {
+        ctx.save(); ctx.setLineDash([]); ctx.lineWidth = 2 * px; ctx.strokeStyle = s.ring;
+        ctx.beginPath(); ctx.arc(e.x, e.y, Math.max(e.a, e.b), 0, TWO_PI); ctx.stroke();
+        ctx.restore();
+      }
+    }
   }
   ctx.restore();
 }

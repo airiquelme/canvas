@@ -96,12 +96,98 @@ export function joint({ center, radius, limbs, color, innerColor = color, underl
   return { ball, limbs: ids };
 }
 
+// A rig (CLAUDE.md "Rigs"): balls and bones, a bone ONE shell with a joint at each end. A bone is a prolate spheroid (equatorial r, semi-axis
+// h) with a ball tangent to it along a circle at each end (the ball's center on its axis); the balls (radius rho_i < r) a distance D apart
+// fix it in closed form: s_i = sqrt(1 - rho_i^2 / r^2), q = sqrt(h^2 - r^2) = D / (s1 + s2), ball i is c_i = q s_i from the bone's center,
+// and the tangent circle is the plane at z_i = h^2 s_i / q (z from the center), delta_i = z_i - c_i = s_i r^2 / q behind the ball's center.
+// The bone keeps the part between its two tangent planes; a ball keeps the part beyond every incident bone's tangent plane. Two bones tangent
+// to the same ball meet in a pair of planes (F_i = S / r_i^2 + beta_i L_i^2 with S the ball's sphere, L_i the tangent plane, beta_i = 1 / h_i^2
+// - 1 / r_i^2, so on A's surface F_B = (kA^2 L_A^2 - kB^2 L_B^2) / r_B^2, k = q / h = sqrt(1 - r^2 / h^2)): A keeps kA L_A - kB L_B >= 0
+// (L_i = d_i . (x - J) - ell_i, d_i from the ball toward the bone, ell_i = -delta_i). `joint()`'s limbs are the case rho = r (ell = 0).
+// Every cut is pushed `underlapPx` into the neighbor and carries `nominal`, the plane itself. All the shells are one `group`.
+// balls: [{ center, radius }], bones: [{ a, b, radius }] (indices into balls). Returns { balls: ids, bones: ids }.
+export function rig({ balls, bones, color, innerColor = color, underlapPx = 1.5 }) {
+  const ballIds = balls.map(b => createShell({ center: b.center, radius: b.radius, color, innerColor }));
+  const group = ballIds[0], elems = balls.map(() => []), eps = underlapPx;
+  const sub = (p, q) => ({ x: p.x - q.x, y: p.y - q.y, z: p.z - q.z });
+  const neg = (v) => ({ x: -v.x, y: -v.y, z: -v.z });
+  const info = [];
+  const boneIds = bones.map((bn) => {
+    const A = balls[bn.a], B = balls[bn.b], r = bn.radius, dv = sub(B.center, A.center), D = Math.hypot(dv.x, dv.y, dv.z), ax = vecNormalize(dv);
+    if (!(A.radius < r && B.radius < r)) throw new Error('a bone must be thicker than its balls');
+    const s1 = Math.sqrt(1 - (A.radius / r) ** 2), s2 = Math.sqrt(1 - (B.radius / r) ** 2), q = D / (s1 + s2), h = Math.hypot(r, q);
+    // The nearest surface point to a ball is on its tangent circle only while the ball's center is inside the focal range: s_i < q / h.
+    if (Math.max(s1, s2) >= q / h) throw new Error('rig: a ball is too small for its bone (thicken the ball, thin the bone or lengthen it)');
+    const c1 = q * s1, z1 = h * h * s1 / q, z2 = h * h * s2 / q, kappa = q / h;
+    const M = { x: A.center.x + ax.x * c1, y: A.center.y + ax.y * c1, z: A.center.z + ax.z * c1 };
+    const cap = (n, d, nominal) => ({ ...plane(n, d)[0], nominal });
+    const id = createShell({ center: M, radius: r, roundness: h / r, axis: ax, cuts: [cap([0, 0, 1], -(z1 + eps) / h, -z1 / h), cap([0, 0, -1], -(z2 + eps) / h, -z2 / h)], color, innerColor });
+    const d1 = ax, d2 = neg(ax), ell1 = -(z1 - c1), ell2 = -(z2 - q * s2);
+    elems[bn.a].push({ shell: id, d: d1, kappa, ell: ell1 });
+    elems[bn.b].push({ shell: id, d: d2, kappa, ell: ell2 });
+    shells[id].rig = { ends: [{ ball: ballIds[bn.a], d: d1, kappa, ell: ell1 }, { ball: ballIds[bn.b], d: d2, kappa, ell: ell2 }] };
+    info.push({ id, M });
+    return id;
+  });
+  balls.forEach((b, i) => {
+    const ball = shells[ballIds[i]], f = shellFrame(ball);
+    ball.rig = { ball: true, J: b.center, radius: b.radius };
+    // A ball keeps the part beyond each incident tangent plane: (x - J) . d <= ell (+ the overlap).
+    ball.cuts = elems[i].map(e => {
+      const du = [vecDot(e.d, f.e1), vecDot(e.d, f.e2), vecDot(e.d, f.a)];
+      return { n: [-du[0], -du[1], -du[2]], d: -(e.ell + eps) / b.radius, nominal: -e.ell / b.radius };
+    });
+    // Bones at the same ball: X keeps kX LX - kY LY >= 0, i.e. n . (x - J) >= c, n = kX dX - kY dY, c = kX ellX - kY ellY.
+    for (const X of elems[i]) {
+      const sh = shells[X.shell], fX = shellFrame(sh), M = info.find(o => o.id === X.shell).M, rel = sub(M, b.center), extra = [];
+      for (const Y of elems[i]) {
+        if (Y === X) continue;
+        const n = { x: X.kappa * X.d.x - Y.kappa * Y.d.x, y: X.kappa * X.d.y - Y.kappa * Y.d.y, z: X.kappa * X.d.z - Y.kappa * Y.d.z };
+        const nl = Math.hypot(n.x, n.y, n.z), c = X.kappa * X.ell - Y.kappa * Y.ell;
+        const v = [fX.r * vecDot(n, fX.e1), fX.r * vecDot(n, fX.e2), fX.h * vecDot(n, fX.a)], vl = Math.hypot(...v);
+        if (nl < 1e-9 || vl < 1e-12) continue;
+        extra.push({ n: [v[0] / vl, v[1] / vl, v[2] / vl], d: (c - vecDot(n, rel) - eps * nl) / vl, nominal: (c - vecDot(n, rel)) / vl });
+      }
+      sh.cuts = [...sh.cuts, ...extra];
+    }
+  });
+  for (const id of [...ballIds, ...boneIds]) shells[id].group = group;
+  return { balls: ballIds, bones: boneIds };
+}
+
+// The draw order of a rig's members, farthest first: the pairs that meet at a ball are separated by a plane (an element and its ball: the
+// tangent plane, the element is in front when the camera is on its bone side; two elements: kA LA - kB LB, A in front when positive), the
+// camera's side of a plane is met first; the order is a topological sort of those pairs, the farthest first (any cycle: the farthest left).
+function rigOrder(members, camPos) {
+  const byBall = new Map(), before = new Map(members.map(s => [s, new Set()]));
+  for (const s of members) if (s.rig && s.rig.ball) byBall.set(s.id, { ball: s, elems: [] });
+  for (const s of members) if (s.rig && s.rig.ends) for (const e of s.rig.ends) { const b = byBall.get(e.ball); if (b) b.elems.push({ shell: s, e }); }
+  for (const { ball, elems } of byBall.values()) {
+    const rel = vecSub(camPos, ball.rig.J), L = (e) => vecDot(e.d, rel) - e.ell;
+    for (const x of elems) { if (L(x.e) > 0) before.get(x.shell).add(ball); else before.get(ball).add(x.shell); }
+    for (let i = 0; i < elems.length; i++) for (let j = i + 1; j < elems.length; j++) {
+      const a = elems[i], b = elems[j];
+      if (a.e.kappa * L(a.e) - b.e.kappa * L(b.e) > 0) before.get(a.shell).add(b.shell); else before.get(b.shell).add(a.shell);
+    }
+  }
+  const dist = (s) => { const p = shellMid(s); return Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z); };
+  const left = [...members].sort((p, q) => dist(q) - dist(p)), done = new Set(), out = [];
+  while (left.length) {
+    let i = left.findIndex(s => [...before.get(s)].every(o => done.has(o)));
+    if (i < 0) i = 0;
+    const [s] = left.splice(i, 1);
+    done.add(s); out.push(s);
+  }
+  return out;
+}
+
 // The draw order of one joint's members (its shells, ball = the shell whose id is the group), farthest first. The members tile the surface,
 // but on screen they can overlap (a bend's inner side is concave), and what is in front is exact: two members are separated by a plane
 // through the ball's center (limb | ball: the limb's rim plane, limb | limb: the stop plane sqrt(kX) x.dX = sqrt(kY) x.dY), and a ray
 // from the camera meets the camera's side of any plane first. Members with no such plane (a limb no longer than its radius) go by
 // the distance of their middle to the camera.
 export function jointOrder(members, camPos) {
+  if (members.some(s => s.rig)) return rigOrder(members, camPos);
   const ball = members.find(s => s.id === s.group), J = ball ? ball.center : members[0].center;
   const rel = vecSub(camPos, J), dir = (s) => vecNormalize(s.axis);
   const k = (s) => 1 / (s.radius * s.radius) - 1 / (s.radius * s.roundness) ** 2;
@@ -112,7 +198,7 @@ export function jointOrder(members, camPos) {
       return sx * vecDot(a, rel) - sy * vecDot(b, rel) > 0;
     }
     if (limbs.length === 1) { const s = vecDot(dir(limbs[0]), rel); if (Math.abs(s) > 1e-12) return (X === ball) === (s < 0); }
-    const dist = (s) => { const p = s.depthPoint || s.center; return Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z); };
+    const dist = (s) => { const p = shellMid(s); return Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z); };
     return dist(X) < dist(Y);
   };
   const left = [...members].sort((p, q) => (q === ball) - (p === ball)), out = [];
@@ -277,6 +363,30 @@ export function shellRange(s, w) {
     return best;
   };
   return { lo: base - extreme(-1), hi: base + extreme(1) };
+}
+
+// The shell's RENDER CENTER, for the draw order: the centroid of the surface it really has (a hemisphere's is toward the side that exists, a
+// bone cut between its tangent planes is at the middle of the part drawn), not the center of its spheroid. It is found once, by area-weighted
+// samples of the cut region on the unit sphere (a flat shell: of its disc), and kept as an offset in the shell's own frame (e1, e2, axis), so it
+// follows the shell when it moves or turns; it is redone only when the shape or the cuts change (the radius, roundness, or the `cuts` list).
+const MID_SAMPLES = 2000;
+export function shellMid(s) {
+  let m = s._mid;
+  if (!m || m.cuts !== s.cuts || m.n !== s.cuts.length || m.r !== s.radius || m.rd !== s.roundness) {
+    const f = shellFrame(s), r = f.r, h = f.flat ? 0 : f.h;
+    let sx = 0, sy = 0, sz = 0, sw = 0;
+    for (let i = 0; i < MID_SAMPLES; i++) {
+      let u;
+      if (f.flat) { const rho = Math.sqrt((i + 0.5) / MID_SAMPLES), t = i * 2.399963229728653; u = [rho * Math.cos(t), rho * Math.sin(t), 0]; }
+      else { const z = 1 - 2 * (i + 0.5) / MID_SAMPLES, rho = Math.sqrt(1 - z * z), t = i * 2.399963229728653; u = [rho * Math.cos(t), rho * Math.sin(t), z]; }
+      if (!s.cuts.every(k => dot3(k.n, u) >= k.d - 1e-9)) continue;
+      const w = f.flat ? 1 : Math.hypot(u[0] / r, u[1] / r, u[2] / h);   // the surface area element of x = T u
+      sx += w * r * u[0]; sy += w * r * u[1]; sz += w * h * u[2]; sw += w;
+    }
+    m = s._mid = { cuts: s.cuts, n: s.cuts.length, r: s.radius, rd: s.roundness, o: sw > 0 ? [sx / sw, sy / sw, sz / sw] : [0, 0, 0] };
+  }
+  const f = shellFrame(s), o = m.o;
+  return { x: s.center.x + o[0] * f.e1.x + o[1] * f.e2.x + o[2] * f.a.x, y: s.center.y + o[0] * f.e1.y + o[1] * f.e2.y + o[2] * f.a.y, z: s.center.z + o[0] * f.e1.z + o[1] * f.e2.z + o[2] * f.a.z };
 }
 
 // The pieces of a shell for one camera, back to front: the inside face (where it shows through the opening), then the outside, each as

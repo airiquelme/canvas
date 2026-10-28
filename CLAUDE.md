@@ -58,7 +58,7 @@ base and its lit part over it (Lit tones only with the light off; `innerColor` d
 `capRegion` intersects the circles pairwise in closed form, keeps the arcs whose middle lies in every other cap and chains them
 into loops (region on the left; a band is an annulus, filled nonzero). Each circle is a planar 3D ellipse, drawn with
 `makeConicProjector` (camera.js, shared with shading.js) as `ctx.ellipse` arcs; a screen ellipse thinner than 1e-3 px (a flat
-shell's cut edge) is a line. Order (`orderShells`): one sort by the straight-line distance from the camera to a unit's center, farthest first (a joint is one
+shell's cut edge) is a line. Order (`orderShells`): one sort by the straight-line distance from the camera to a unit's RENDER center (`shellMid`, shell.js: the area centroid of the surface the shell really has, so a hemisphere's is toward its side and a bone's between its tangent planes; found once from samples of the cut region and kept as an offset in the shell's frame, redone only when the radius, roundness or `cuts` change; a joint's is the mean of its members'), farthest first (a joint is one
 unit), O(n log n), nothing pairwise; each flat shell (a floor) is then moved into place: units wholly on its camera side draw after it,
 wholly behind it before it, a unit crossing the plane by its center's side (a bounding-sphere test first, `shellRange` only when that is
 inconclusive). Limits: other overlapping shells only by center distance (intersecting / nested ones can mis-order; model around it, the
@@ -92,12 +92,33 @@ angle (3.654) but leaks a farther member's shade through a nearer lit surface at
 lines (neighbor's line continued until it meets this limb's): exact (cap intersections) but it only helps when the lines cross near the
 joint (3 of 6 test bends) and was hard to read; stroking a thin cover line over the seams: the cause was the double antialiasing.
 Defaults now: lighting on, strokes OFF (the stroke pass costs ~80 canvas calls per shell, ~15-20 per face per tone; make it cheaper before
-turning it on). Demo scene: one purple arm at the orbit's center.
-**Debug view (shells).** Per shell, its terminator as a lone full spheroid (front half solid, back half dashed), the dark area (`darkFull`
-clipped to the face) in pitch black, the cuts at their `nominal` planes (a shared plane once), layer numbers (the draw order, 1 = first),
-red dots where a solid line reaches another outer face of its joint. In Debug the joint faces are painted from the nominal cuts too, so
-fill, lines and dots agree. **Focus** (shells scene): one fixed zoom at which the arm's outline fits `focus.shellFill` of the half-height
+turning it on). Demo scene: a HAND at the orbit's center (`buildShellScene`, scene.js), a `rig` (next section): 21 balls and 20 bones, every bone ONE shell
+with a joint at each end (wrist ball: forearm + 5 metacarpals; each finger: knuckle, two joints, tip). Seen so far: it reads as a hand from every
+angle; each bone is lit by its own plane, so the shade steps along the fingers at every joint; the palm is a fan of tapering metacarpals
+(webbed, not flat); neighboring fingers that touch are ordered by the distance to their render centers only (about 0.2% of rays pick the wrong winner, nearly all between bones that
+share no ball). 41 shells.
+
+**Debug view (shells).** Each shell's cut circles (dashed gray, a plane shared by two shells once, at its `nominal` plane) and silhouette (dashed
+purple). The terminator lines, the black dark area, the layer numbers and the red dots that were used to design the shading were removed once
+the shading was settled (they are in git history: commits 281ecc8 and its parent chain). **Focus** (shells scene): one fixed zoom at which the arm's outline fits `focus.shellFill` of the half-height
 from every orbit angle (72 sampled), the camera on the centroid of the ball and the limb tips.
+
+## Rigs (shells): balls and bones
+`rig({ balls: [{ center, radius }], bones: [{ a, b, radius }], color })` (`shell.js`): joints (balls) and bones, a bone ONE shell with a joint
+at each end, so chains and trees (a hand, a spine) are possible; `joint()` (a ball with limbs of its own radius, above) is the special case
+of a bone that ends at its ball's center. A bone is a prolate spheroid (equatorial r, semi-axis h) with a ball (radius rho_i < r) tangent to
+it along a circle at each end, the ball's center on the axis. Two balls a distance D apart fix it in closed form (verified: the distance from a
+ball center to the surface equals rho): s_i = sqrt(1 - rho_i^2 / r^2), q = sqrt(h^2 - r^2) = D / (s1 + s2), the bone's center is q s1 from ball 1,
+the tangent circle is the plane z_i = h^2 s_i / q (z from the center), delta_i = s_i r^2 / q behind the ball's center. The bone keeps the part between
+its tangent planes; a ball keeps the part beyond each incident tangent plane (a cap smaller than a hemisphere). Two bones tangent to the
+same ball meet in a pair of planes whatever their radii, lengths and axes (the plane rule S = k L^2: a spheroid tangent to a sphere along the
+circle L = 0 satisfies F = S / r^2 + beta L^2; residual 6e-16 in the check): with L_i = d_i . (x - J) - ell_i (d_i from the ball toward the bone,
+ell_i = -delta_i) and kappa_i = q / h, bone A keeps `kappa_A L_A - kappa_B L_B >= 0`. All cuts carry `nominal` and are pushed 1.5 units into
+the neighbor, as for joints. All members are one `group` (one unit in the draw order); `rigOrder` (via `jointOrder`) orders the pairs that
+meet at a ball exactly (the camera's side of the separating plane is in front) and sorts the rest by distance: topological, farthest first.
+Pairs of bones that share no ball (touching neighbors) are only by the distance to their render centers (`shellMid`; the same for the pairs of a joint that have no separating plane). Shading, covers and regions are as for joints. A bone must be
+thicker than both its balls.
+The Debug ring (`ring`: a color on a shell) is a solid circle exactly on that shell's silhouette (the demo marks the knuckle balls).
 
 ## Skewed meshes
 `createMesh([a, b], color, { skew: nodeId })` bends a 2-node mesh through a third node (`skew.js`, `buildSkewPrimitives` in

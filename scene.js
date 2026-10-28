@@ -1,6 +1,6 @@
 import { DESIGN_WIDTH, DESIGN_HEIGHT } from './config.js';
 import { makeShape } from './geometry.js';
-import { createShell, panel, hemisphere, band, wedge, joint } from './shell.js';
+import { rig, shells } from './shell.js';
 
 // Node = { id, center: {x, y, z}, radius, shape }. `radius` is the radius of the
 // sphere of equal volume; `shape` (makeShape, geometry.js) is the spheroid: semi-axis
@@ -167,19 +167,50 @@ export function buildFullScene() {
   return [...pyrBase, pyrApex];
 }
 
-// The shells demo (?scene=shells, CLAUDE.md "Shells"): a floor, a dome resting on it, a tilted ribbon, a half shell and a curved
-// pane whose roundness the Roundness slider drives. Returns the pane's id.
+// The shells scene (CLAUDE.md "Shells", "Rigs"): a hand, a `rig` of balls (joints) and bones (one shell each, with a joint at each end). The
+// wrist ball has the forearm and a metacarpal to each knuckle; each finger runs knuckle, two joints and a tip ball. The hand lies in the
+// (y, z) plane with the palm facing +x (the camera at angle 0); the fingers curl toward the palm. Every number is in the table.
 export function buildShellScene() {
-  const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2, up = { x: 0, y: 1, z: 0 };
-  createShell({ center: { x: cx, y: cy - 140, z: 0 }, radius: 260, roundness: 0, axis: up, cuts: panel(0.9, 0.9), color: '#c8bfa4' });
-  createShell({ center: { x: cx - 120, y: cy - 140, z: 60 }, radius: 90, roundness: 0.6, axis: up, cuts: hemisphere(), color: '#4a90d9', innerColor: '#f2c14e' });
-  createShell({ center: { x: cx + 120, y: cy, z: -40 }, radius: 80, roundness: 1, axis: { x: 0.3, y: 1, z: 0.2 }, cuts: band(-0.3, 0.3), color: '#e05a47' });
-  createShell({ center: { x: cx + 60, y: cy - 70, z: 120 }, radius: 70, roundness: 1, axis: up, cuts: wedge(0, Math.PI), color: '#5cb85c' });
-  const pane = createShell({ center: { x: cx - 80, y: cy + 20, z: -120 }, radius: 110, roundness: 0.15, axis: { x: 0, y: 0.3, z: 1 }, cuts: panel(0.75, 0.5), color: '#9fd8e8' });
-
-  // An arm (`joint`, shell.js): a ball and two half-spheroid limbs.
-  const dir = (deg) => ({ x: Math.cos(deg * Math.PI / 180), y: Math.sin(deg * Math.PI / 180), z: 0 });
-  const arm = (x, y, z, r, a, b, len, color, joined = true) => joint({ center: { x, y, z }, radius: r, color, joined, limbs: [{ dir: dir(a), length: len }, { dir: dir(b), length: len }] });
-  arm(cx, cy + 40, 0, 26, 160, 40, 110, '#ab47bc');   // at the orbit's center, clear of the dome and the floor
-  return pane;
+  const cx = DESIGN_WIDTH / 2, cy = DESIGN_HEIGHT / 2, SKIN = '#e8b48a', rad = Math.PI / 180;
+  const u = { x: 0, y: 1, z: 0 }, l = { x: 0, y: 0, z: 1 }, n = { x: 1, y: 0, z: 0 };   // along the hand, across it, out of the palm
+  const lin = (...terms) => terms.reduce((a, [v, k]) => ({ x: a.x + v.x * k, y: a.y + v.y * k, z: a.z + v.z * k }), { x: 0, y: 0, z: 0 });
+  const wrist = { x: cx, y: cy - 20, z: 0 };
+  // phi: the metacarpal's angle across the hand, tilt: out of the palm plane (the thumb), mLen: wrist to knuckle, r: the joints' radius,
+  // tip: the tip ball's size against r (default 0.8), segs: the phalanges, bend: each one's angle toward the palm (cumulative, degrees). A bone is 1.15 times thicker than its joints.
+  const fingers = [
+    { name: 'index', phi: -14, tilt: 0, mLen: 58, r: 6, segs: [22, 14, 11], bend: [12, 20, 16] },
+    { name: 'middle', phi: 0, tilt: 0, mLen: 62, r: 6.5, segs: [25, 16, 12], bend: [14, 24, 18] },
+    { name: 'ring', phi: 11, tilt: 0, mLen: 58, r: 6, segs: [22, 15, 11], bend: [16, 26, 20] },
+    { name: 'pinky', phi: 24, tilt: 0, mLen: 50, r: 6.4, segs: [18, 11, 10], bend: [18, 28, 22] },
+    { name: 'thumb', phi: -48, tilt: 28, mLen: 30, r: 7.5, tip: 0.7, segs: [17, 13], bend: [10, 18] },
+  ];
+  const metaDir = (f) => {
+    const m0 = lin([u, Math.cos(f.phi * rad)], [l, Math.sin(f.phi * rad)]);
+    return lin([m0, Math.cos(f.tilt * rad)], [n, Math.sin(f.tilt * rad)]);
+  };
+  const balls = [{ center: wrist, radius: 13 }, { center: lin([wrist, 1], [u, -100]), radius: 11 }];
+  const bones = [{ a: 1, b: 0, radius: 19 }];   // the forearm
+  const knuckles = [];
+  for (const f of fingers) {
+    const m = metaDir(f);
+    let theta = 0, p = lin([wrist, 1], [m, f.mLen]), prev = 0;
+    knuckles.push(balls.length);
+    balls.push({ center: p, radius: f.r });
+    f.boneIdx = [bones.length];
+    bones.push({ a: 0, b: balls.length - 1, radius: 13.1 });   // the metacarpal: barely thicker than the wrist ball, so the ball sits almost at the bone's center
+    prev = balls.length - 1;
+    f.segs.forEach((L, j) => {
+      theta += f.bend[j];
+      p = lin([p, 1], [m, L * Math.cos(theta * rad)], [n, L * Math.sin(theta * rad)]);
+      const last = j === f.segs.length - 1;
+      balls.push({ center: p, radius: last ? f.r * (f.tip ?? 0.8) : f.r });
+      // Every phalanx is barely thicker than its balls: its first joint sits almost at the bone's center, and the spheroid is much longer than the
+      // part drawn (the tangent planes cut it).
+      f.boneIdx.push(bones.length);
+      bones.push({ a: prev, b: balls.length - 1, radius: f.r + 0.1 });
+      prev = balls.length - 1;
+    });
+  }
+  const made = rig({ balls, bones, color: SKIN });
+  knuckles.forEach(i => { shells[made.balls[i]].ring = '#ff9800'; });   // the Debug view circles the knuckle joints
 }
