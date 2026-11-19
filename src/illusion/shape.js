@@ -6,7 +6,7 @@
 //   arc:  { kind: 'arc', e: { x, y, a, b, angle }, t0, t1 }   ctx.ellipse's terms; t runs from t0 to t1
 //         (t1 > t0 goes clockwise on screen, y down; t1 < t0 the other way)
 //
-// A shape is { sides: [...], fill, colors: [stroke colors], depth }. Each side starts where the previous one ends. A side's
+// A shape is { sides: [...], fill, colors: [stroke colors], depth, keep? }. Each side starts where the previous one ends. A side's
 // stroke is colors[side.ci] (pieces of one logical side share it), else colors[its index]. A side with `move` starts a new
 // loop (subpath).
 
@@ -54,8 +54,14 @@ export function drawShape(ctx, shape, { lineWidth = 3, stroke = true } = {}) {
       ctx.stroke();
     });
   }
+  if (ctx.fillStyle !== shape.fill) ctx.fillStyle = shape.fill;   // setting a color parses it: only when it changes
+  // A shape kept from frame to frame (`keep`) records its path once (Path2D) and refills it.
+  if (shape.keep && typeof Path2D !== 'undefined') {
+    if (!shape.path) { shape.path = new Path2D(); tracePath(shape.path, shape); }
+    ctx.fill(shape.path);
+    return;
+  }
   ctx.beginPath();
   tracePath(ctx, shape);
-  ctx.fillStyle = shape.fill;
   ctx.fill();
 }

@@ -31,6 +31,7 @@
 // nearest the middle point (`conicThrough`), or a line if straight.
 // BORDERS (Strokes button) are stroked under the fill (shape.js), so only the outer half of the union's outline shows.
 import { arc } from './shape.js';
+import { capsuleSides } from './capsule.js';
 
 const TAU = Math.PI * 2;
 const mod = (x) => ((x % TAU) + TAU) % TAU;
@@ -45,7 +46,7 @@ export function paramOn(e, p) {
 }
 
 // The arc of e from tS to tE that passes through tM.
-function arcThrough(e, tS, tE, tM) {
+export function arcThrough(e, tS, tE, tM) {
   const d = mod(tE - tS), dm = mod(tM - tS);
   return arc(e, tS, dm < d ? tS + d : tS - (TAU - d));
 }
@@ -315,4 +316,26 @@ export function curvedSides(A, S, B, rA, rB, projector) {
   }
   const e0 = ev(0), e1 = ev(Math.PI), em = ev(Math.PI / 2);
   return { sides, ends: [{ x: e0.x, y: e0.y }, { x: e1.x, y: e1.y }, { x: em.x, y: em.y }] };
+}
+
+// SIMPLIFIED (a curved shape small on screen, illusionRender.js): the union of the capsules between n + 1 of its cross-section
+// discs along the centerline, one loop per capsule (capsule.js, all wound alike, filled nonzero). The chords' sagitta is about
+// (size / 2) (PI / 2n)^2 / 2, under half a pixel for n >= 1.1 sqrt(size); the notches where two capsules meet on the outer side
+// of the bend are smaller. Cost: n capsules, closed form, whatever the bend.
+export function curveChainSides(A, S, B, rA, rB, projector, n) {
+  const M = { x: (A.x + B.x) / 2, y: (A.y + B.y) / 2, z: (A.z + B.z) / 2 };
+  const r0 = (rA + rB) / 2, r1 = (rA - rB) / 2;
+  const discs = [];
+  for (let k = 0; k <= n; k++) {
+    const th = (Math.PI * k) / n, c = Math.cos(th), s = Math.sin(th);
+    const q = projector.projectPoint({
+      x: M.x + (A.x - M.x) * c + (S.x - M.x) * s, y: M.y + (A.y - M.y) * c + (S.y - M.y) * s, z: M.z + (A.z - M.z) * c + (S.z - M.z) * s,
+    });
+    discs.push({ x: q.x, y: q.y, r: (r0 + r1 * c) * q.scale });
+  }
+  const sides = [];
+  for (let k = 0; k < n; k++) {
+    capsuleSides(discs[k], discs[k + 1]).forEach((sd, i) => sides.push({ ...sd, ci: i, move: i === 0 && k > 0 }));
+  }
+  return sides;
 }

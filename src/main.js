@@ -5,15 +5,24 @@ import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from 
 import { render } from './meshes/render.js';
 import { renderShells } from './shells/shellRender.js';
 import { shells } from './shells/shell.js';
-import { buildPairsScene, buildWorldScene, renderIllusion } from './illusion/illusionRender.js';
+import { buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion } from './illusion/illusionRender.js';
 import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
 
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+// The illusion scenes paint their whole background every frame, so their canvas is opaque (alpha: false): the browser then
+// composites it without blending it over the page.
+const illusionAtLoad = !['shells', 'basic', 'full'].includes(new URLSearchParams(location.search).get('scene'));
+const ctx = canvas.getContext('2d', illusionAtLoad ? { alpha: false } : undefined);
 
+// Canvas pixels per CSS pixel. The illusion world's Quality (panel) sets it; Auto lowers it while frames are slow and raises it
+// back when they are fast (the shapes are vectors, so a lower resolution only softens their edges).
+let renderScale = 1;
 function resizeCanvas() {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
+  canvas.width = Math.max(1, Math.round(window.innerWidth * renderScale));
+  canvas.height = Math.max(1, Math.round(window.innerHeight * renderScale));
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  canvas.style.display = 'block';
 }
 resizeCanvas();
 // Resizing clears the canvas; redraw so a paused view doesn't stay blank.
@@ -24,12 +33,13 @@ window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 const sceneName = new URLSearchParams(location.search).get('scene');
 const illusionScene = !['shells', 'basic', 'full'].includes(sceneName);
 const shellScene = sceneName === 'shells';
-const worldScene = illusionScene && sceneName !== 'pairs';
+const worldScene = illusionScene && sceneName !== 'pairs' && sceneName !== 'sheets';
 // The world's size, set by the panel's sliders (illusion world only).
-const worldOpts = { count: 3000, curved: 100, movers: 200 };
+const worldOpts = { count: 3000, curved: 100, movers: 200, walls: 48, sheets: 600 };
 if (illusionScene) {
   camera.height = 120;
   if (worldScene) buildWorldScene(worldOpts);
+  else if (sceneName === 'sheets') buildSheetsScene();
   else { buildPairsScene(); strokes.on = true; }   // the pairs scene is about its borders
 }
 const paneId = shellScene ? buildShellScene() : null;
@@ -125,27 +135,74 @@ if (worldScene) {
     input.style.flex = '1';
     const val = document.createElement('span'); val.textContent = worldOpts[key]; val.style.cssText = 'width:44px; text-align:right; font-family:monospace;';
     input.addEventListener('input', () => { val.textContent = input.value; });
-    input.addEventListener('change', () => { worldOpts[key] = Number(input.value); buildWorldScene(worldOpts); });
+    input.addEventListener('change', () => { worldOpts[key] = Number(input.value); buildWorldScene(worldOpts); pendingDraw = true; });
     row.append(name, input, val);
     panel.append(row);
   };
   slider('Shapes', 'count', 30000, 500);
   slider('Curved', 'curved', 1000, 10);
   slider('Movers', 'movers', 3000, 50);
+  slider('Walls', 'walls', 240, 12);
+  slider('Sheets', 'sheets', 5000, 100);
+  {   // Quality: the canvas resolution (Auto: adapts to the frame rate)
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; align-items:center; gap:8px;';
+    const name = document.createElement('span'); name.textContent = 'Quality'; name.style.width = '64px';
+    const sel = document.createElement('select');
+    sel.style.flex = '1';
+    for (const [v, t] of [['auto', 'Auto (adapts to the frame rate)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']]) {
+      const op = document.createElement('option'); op.value = v; op.textContent = t; sel.append(op);
+    }
+    sel.addEventListener('change', () => {
+      quality = sel.value;
+      setRenderScale(quality === 'auto' ? 1 : Number(quality));
+      sel.blur();   // so Space / WASD go to the camera
+    });
+    row.append(name, sel);
+    panel.append(row);
+  }
   statsEl = document.createElement('div');
   statsEl.style.cssText = 'font-family:monospace; font-size:12px; white-space:pre; line-height:1.4;';
   panel.append(statsEl);
   document.body.append(panel);
 }
+// Auto quality: once a second, from the last frames' mean interval. Slower than 45 fps: an eighth less resolution (down to 50%);
+// faster than 55 fps: an eighth more (up to 100%). A rise that had to be undone within 5 s is not tried again for 10 s, so it
+// doesn't seesaw between two levels.
+let quality = 'auto', lastAdapt = 0, lastRise = -1e9, noRiseUntil = 0;
+function setRenderScale(k) {
+  if (k === renderScale) return;
+  renderScale = k;
+  resizeCanvas();
+  frameTimes.length = 0;
+  drawFrame();
+}
+function adaptQuality(now) {
+  if (quality !== 'auto' || now - lastAdapt < 1000 || frameTimes.length < 20) return;
+  lastAdapt = now;
+  const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+  if (avg > 1000 / 45 && renderScale > 0.5) {
+    if (now - lastRise < 5000) noRiseUntil = now + 10000;
+    setRenderScale(Math.max(0.5, renderScale - 0.125));
+  } else if (avg < 1000 / 55 && renderScale < 1 && now > noRiseUntil) {
+    lastRise = now;
+    setRenderScale(Math.min(1, renderScale + 0.125));
+  }
+}
+// The panel's text and the bottom bar are rewritten 4 times a second, not every frame (each rewrite is a page layout).
+let lastUi = 0;
+function uiDue(now) { if (now - lastUi < 250) return false; lastUi = now; return true; }
 function showStats() {
   if (!statsEl || !lastStats || !frameTimes.length) return;
   const st = lastStats, avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
   statsEl.textContent =
-    `frame  ${avg.toFixed(1)} ms  (${(1000 / avg).toFixed(0)} fps)\n` +
+    `frame  ${avg.toFixed(1)} ms  (${(1000 / avg).toFixed(0)} fps)  resolution ${Math.round(renderScale * 100)}%${quality === 'auto' ? ' (auto)' : ''}\n` +
     `build  ${st.buildMs.toFixed(1)} ms  curved ${st.curvedMs.toFixed(1)} ms\n` +
     `draw   ${st.drawMs.toFixed(1)} ms\n` +
-    `shapes ${st.drawn} drawn (${st.curved} curved) of ${st.objects}\n` +
-    `       ${st.culled} off screen, ${st.tiny} sub-pixel, ${st.behind} behind the eye`;
+    `shapes ${st.drawn} drawn (${st.curved} curved, ${st.simplified} simplified, ${st.sheets} sheets) of ${st.objects}${st.skipped ? ` (${st.skipped} left out: no free spot)` : ''}\n` +
+    `       ${st.reused} reused (camera still), ${st.kept} curved kept (moved < 0.5 px)\n` +
+    `       ${st.culled} off screen, ${st.tiny} sub-pixel, ${st.behind} behind the eye\n` +
+    `       ${st.occluded} hidden (${st.nodesSkipped} tree nodes skipped whole)`;
 }
 
 const pauseBtn = document.getElementById('pauseBtn');
@@ -242,13 +299,17 @@ function loop(timestamp) {
   if (illusionScene) {
     const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
     lastTime = timestamp;
-    if (worldScene) {   // the movers move: every frame
+    if (worldScene) {   // the movers move: every frame, unless paused with the camera still (then nothing is redrawn)
+      if (!paused) worldTime += dt;
+      const moved = updateFly(dt);
+      if (paused && !moved && !pendingDraw) { lastTime0 = 0; requestAnimationFrame(loop); return; }
+      pendingDraw = false;
       if (lastTime0) { frameTimes.push(timestamp - lastTime0); if (frameTimes.length > 30) frameTimes.shift(); }
       lastTime0 = timestamp;
-      if (!paused) worldTime += dt;
-      updateFly(dt);
-      drawFrame(); syncAngleUi(); showStats();
-    } else if (updateFly(dt) || pendingDraw) { pendingDraw = false; drawFrame(); syncAngleUi(); }
+      drawFrame();
+      adaptQuality(timestamp);
+      if (uiDue(timestamp)) { syncAngleUi(); showStats(); }
+    } else if (updateFly(dt) || pendingDraw) { pendingDraw = false; drawFrame(); if (uiDue(timestamp)) syncAngleUi(); }
   } else if (!paused) {
     const dt = (timestamp - lastTime) / 1000;
     lastTime = timestamp;

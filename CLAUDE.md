@@ -47,6 +47,9 @@ Layout: `index.html` at the root loads `src/main.js`. `src/core/` is shared by b
 | `src/illusion/shape.js` | The illusion renderer's element: a closed loop of sides, each a line or an ellipse arc (`drawShape`: fill, then each side stroked in its own color) |
 | `src/illusion/capsule.js` | A 2-node mesh's screen shape: the two end arcs and the two outer tangent lines of its node circles |
 | `src/illusion/curve.js` | A 2-node mesh bent through a point (`bend`), in closed form: events as polynomial roots, one loop per stretch, filled as a union |
+| `src/illusion/cull.js` | Occlusion culling: static objects' bounding-sphere tree (`buildBVH`), frustum test, the global mask grid (`makeMask`, `maskHides`, `maskAddCapsule`, `maskAddTube`), a min-heap |
+| `src/illusion/sheet.js` | Sheets (two-sided thin surfaces): panels, discs, ribbons / strands; exact ellipse edges (`ellipseEdge`), the ribbon's face turns in closed form (`sheetPieces`), a panel's inner polygon for the mask (`panelPolygon`) |
+| `src/illusion/space.js` | Keeps the world's static shapes apart in 3D: shapes as capsule parts, segment distances, a multi-level grid (`Space`), movers' orbits (`lane`) |
 | `src/core/flyCamera.js` | Free-fly camera of the illusion scene (WASD, Space / Shift, mouse look under pointer lock, wheel zoom); sets `camera.position` |
 | `src/illusion/illusionRender.js` | `renderIllusion`, the default scene on this branch (`buildIllusionScene`) |
 | `src/shells/shell.js` | Shells: the store, `createShell`, cut helpers (`hemisphere`, `band`, `wedge`, `box`, `panel`, `plane`), `capRegion` (boundary of an intersection of caps on the unit sphere), `shellPieces`, `shellRange`, `joint` (ball + limbs, below), `jointOrder`, `tubeLight` |
@@ -61,7 +64,65 @@ button; meshes are ordered by their points' mean depth (no cutting yet: intersec
 **The world** (default scene, `world.js`): a skybox of the same shapes (a sun, a mountain ring and clouds 20-40k units away), static
 shapes from 40 to 8000 units around the start (log-uniform distance, any direction, sizes 2-100, bigger far away), and movers that
 circle, spin and flex. The panel (top right) sets the counts (Shapes / Curved / Movers) and shows frame / build / draw times. The
-renderer culls shapes off screen, smaller than 0.35 px or reaching the eye's plane (no near clip yet). Q sprints (6x). `?scene=pairs` is the first three pairs with their borders.
+renderer culls shapes off screen, smaller than 0.35 px or reaching the eye's plane (no near clip yet).
+**Occlusion culling** (`cull.js`): static objects (no `move`) sit in a tree of bounding spheres built once per scene; movers are
+tested one by one. Nodes and objects are visited NEAREST FIRST (one heap keyed by nearest depth) against the *global mask*: the
+union of the shapes drawn so far, kept as a grid of 8 design px tiles, each holding the farthest depth of a shape whose opaque
+interior covers it whole (shapes over 40 px: a capsule is convex, so a tile is covered when its 4 corners are inside, inset by the
+AA edge; a bent tube is not convex, so it adds 16 of its cross-section discs (`maskAddTube`), each with its own far depth: the drawn
+shape is their exact union; the hull of two neighbors would poke out of a bend's inner side). A node or object whose screen box (+ AA, + the border's reach with Strokes) lies on tiles all covered by something nearer
+than its nearest point is skipped (no sides built, no fill); a node outside the frustum is skipped whole. Conservative, so the
+frame is unchanged: an occluder's far depth < the hidden one's near depth, so painter's order would have drawn the occluder over
+it. Drawing is unchanged (visible set by mean depth, back to front). Storing the mask as an exact outline (lines and arcs) was
+discussed and not done: every shape would need a boolean merge into a region that grows with every shape, and cutting shapes
+against it leaves AA hairlines along the cuts. Not done yet: portals (windows). The Walls slider adds
+rings of wall segments (16 per ring, stacks of 5 touching capsules, 80-unit windows) around the start to exercise it. The mask has a second level (blocks of
+4 x 4 tiles holding their largest depth), so a big box is tested block by block.
+**No overlap** (`space.js`, used by `world.js`): no two static shapes overlap in 3D and none lies on a mover's orbit, for a realistic
+density (every pixel painted about once). Each shape is held by capsules (`partsOf`: a capsule with its larger radius, a bent tube
+as 8 segments padded by the chord's sagitta); a candidate is kept when no part comes closer to another's than the radii's sum
+(segment closest points, closed form), else redrawn, up to 20 tries, then left out (the panel's "left out"). Candidates come from a
+multi-level grid (a shape on its own level and every coarser one; a query reads at most 8 cells per level). A mover's orbit is the
+circle swept by its reach; orbits avoid the walls and sky, the world avoids the orbits. Movers may pass through each other (orbits
+kept wholly apart would leave room for only about a dozen). Build: 0.12 s for 3000 shapes, 1.9 s for 30000.
+**Simplified shapes**: a curved shape under `CURVE_EXACT_PX` (160 px, its box's diagonal) is a chain of capsules between n + 1 of its
+cross-section discs (`curveChainSides`, n = 1.2 sqrt(size): under half a pixel off), not its exact outline (0.1-0.4 ms each).
+**Reuse**: a static object keeps its sides (`o.cache`) while the camera and the canvas stay put (the panel's "reused"). With a margin
+(`CURVE_MARGIN_PX`: exact -> simplified below 150 px, back above 170 px, `o.exact`) so a shape at the cutover doesn't flip every
+frame. An exact curved outline is also kept (`o.exactRef`, movers too) until one of its bounding points, or the radius there, has
+moved `REUSE_PX` (0.5 canvas px) on screen since it was built (approximate, off by at most that; the panel's "kept").
+
+**Sheets** (`sheet.js`; the world's Sheets slider, `?scene=sheets` shows one of each): thin two-sided surfaces, `fill` on the face
+whose normal looks at the camera, `back` on the other (default: `backOf(fill)`, darker). `panel` (paper, cards: half-axes e1, e2,
+corners rounded by `round` x the shorter one), `disc` (c + e1 cos t + e2 sin t), `ribbon` (a strip along the half-ellipse through
+A, bend, B as curve.js, across the fixed direction `dir`, half-width rA..rB as r0 + r1 cos th; rB = 0 a pointed strand). Every
+edge is a 3D ellipse arc (a ribbon's edges are (M +- r0 dir) + (U +- r1 dir) cos th + V sin th), so its screen image is a conic: the
+ellipse through two exact points with their exact tangents and a third exact point IS that image (`conicThrough`), cut every PI / 4.
+A ribbon is ruled with its normal X' x dir constant along each ruling, so the face seen depends on th alone, g(th) = k + (a . M)
+sin th - (b . M) cos th (camera space): it turns at most twice, in closed form; each stretch is one loop (edge, end ruling, other
+edge, start ruling) in its face's color, its pieces drawn farthest first. Panels and discs go into the global mask (convex: their
+outline's chords); ribbons not yet. Placement (`space.js`): a panel as one segment along its longer half-axis with the shorter as
+radius, a ribbon as a bent tube of its half-width.
+**Performance** (low-end machines): Quality in the panel sets the canvas resolution, Auto (default) lowers it by eighths down to
+50% while frames are slower than 45 fps and raises it when faster than 55 (a rise undone within 5 s is not retried for 10 s); the
+canvas is opaque (`alpha: false`) in the illusion scenes; the panel and the bottom bar are rewritten 4 times a second, not every
+frame; a paused world with a still camera is not redrawn; kept shapes (`keep`: static objects' pieces, kept curved outlines) record
+their path once (Path2D) and refill it; the fill color is set only when it changes; static objects' bounding points and the
+mask's buffers are kept between frames.
+
+**Illusion TODO**
+- Batch the fills of shapes that are next to each other in the draw order and share a color (one path, one fill). Waiting on how
+  (and whether) borders between same-colored shapes are drawn.
+- Hierarchical simplification: objects form a hierarchy (leaves and branches in a tree, trees in a forest, forests in a
+  landscape), and each level has a simplified stand-in PRECOMPUTED from its children (not worked out frame by frame): below an
+  angular size a tree draws as its stand-in (a blob, a hint of the trunk), far enough a forest draws as one, then several forests
+  together (seen from high above or toward the horizon). Only objects in the same hierarchy merge; unrelated, disconnected objects
+  never do (finding that per frame would cost too much). The switch should happen where the difference is under a pixel, or
+  cross-fade, so it doesn't pop. Needs objects made of several shapes in the scene first.
+- Simplest tiers for a single shape far away (a line for a thin one, one ellipse for a round one): a capsule is already 4 sides,
+  so this pays off for groups and complex shapes, not for capsules.
+- Portals: windows / gaps in walls as openings the culling looks through.
+- Ribbons as occluders (not convex: e.g. their rulings' quads, inside the strip). Q sprints (6x). `?scene=pairs` is the first three pairs with their borders.
 Cost (headless, JS only, 1600 x 900): about 2000 capsules drawn in 3 ms of canvas calls; curved shapes about 0.1 ms each
 (closed form, below). A pair with `bend` (a world point) follows the 3D half-ellipse through
 it (`curve.js`, as a skewed mesh's path), radius r0 + r1 cos th (rA at A, rB at B: a trig polynomial, unlike a linear blend in
