@@ -2,7 +2,8 @@
 import { debug, lighting, light, strokes } from '../config.js';
 import { TWILIGHT, LIT, toneColor } from '../core/light.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector, makeConicProjector } from '../core/camera.js';
-import { applyDesignSpaceTransform, scratchLayers } from '../meshes/render.js';
+import { applyDesignSpaceTransform } from '../core/canvas.js';
+import { scratchLayers } from '../meshes/render.js';
 import { vecDot, vecSub } from '../core/geometry.js';
 import { shells, shellPieces, shellFrame, shellRange, shellMid, worldEllipse, circlePoint, capRegion, jointOrder } from './shell.js';
 

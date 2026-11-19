@@ -43,11 +43,51 @@ Layout: `index.html` at the root loads `src/main.js`. `src/core/` is shared by b
 | `src/meshes/cones/hostHull.js` | A split cone's host mesh as the convex hull of its node bodies (hosts with squashed nodes): exact signed distance (`hostProbe`): a table of 4096 normals only says which bodies are in play, then the candidates (each body's nearest-point normal, each pair's ruled curve, each triple's face normal) are evaluated with the true support |
 | `src/meshes/debug/shapeDebug.js` | Debug button's overlay: dotted screen outline of every node (+ cut and axes of squashed ones); a skew node shows instead the body's cross-section at that point of the arch (`sectionAt`, `skew.js`) |
 | `src/main.js` | Canvas setup, Pause / Dark mode / Debug buttons, animation loop |
+| `src/core/canvas.js` | `applyDesignSpaceTransform` (design space onto the canvas) |
+| `src/illusion/shape.js` | The illusion renderer's element: a closed loop of sides, each a line or an ellipse arc (`drawShape`: fill, then each side stroked in its own color) |
+| `src/illusion/capsule.js` | A 2-node mesh's screen shape: the two end arcs and the two outer tangent lines of its node circles |
+| `src/illusion/curve.js` | A 2-node mesh bent through a point (`bend`): its long sides are ellipse arcs fitted to the screen (`conicThrough`) |
+| `src/core/flyCamera.js` | Free-fly camera of the illusion scene (WASD, Space / Shift, mouse look under pointer lock, wheel zoom); sets `camera.position` |
+| `src/illusion/illusionRender.js` | `renderIllusion`, the default scene on this branch (`buildIllusionScene`) |
 | `src/shells/shell.js` | Shells: the store, `createShell`, cut helpers (`hemisphere`, `band`, `wedge`, `box`, `panel`, `plane`), `capRegion` (boundary of an intersection of caps on the unit sphere), `shellPieces`, `shellRange`, `joint` (ball + limbs, below), `jointOrder`, `tubeLight` |
 | `src/shells/shellRender.js` | `renderShells`: the shells frame (`orderShells`, exact arcs, joint painting, strokes, the Debug view) |
 | `tools/` | Headless Node checks, grouped as `geometry/` (shape, outline, hull, orient, perspective, silhouette), `joints/`, `cones/` (cone, ellipsoid, host, split) and `render/` (trace, meshCheck, frameTime); run them from the project root (the root `package.json` sets `"type":"module"`, so no copy is needed; `trace` / `meshCheck` / `jointRef` take a copy of `src/` as their first argument): `trace.mjs` records the canvas calls over the orbit to diff two copies (`SPHERES=1` makes every node round), `shapeCheck.mjs` spheroid math, `hullCheck.mjs` ellipse capsule vs brute-force hull, `orientCheck`/`perspectiveCheck`/`silhouetteCheck` node ellipses vs the 3D body, `coneCheck.mjs` / `ellipsoidCheck.mjs` `hullCone.js` vs the sphere cone and a brute-force hull, `jointParity.mjs` the general joint ring with spheres vs the closed form, `jointCheck.mjs` its invariants and timing on squashed bodies, `jointSweep.mjs` frame-to-frame continuity of the demo's joint over the orbit, `jointRef.mjs` painted colors of a squashed V vs an exact ray cast of its flat solid (`STEP=4 node tools/joints/jointRef.mjs <dir> all 6 <png-prefix>` writes drawn | reference | mismatch images), `meshCheck.mjs` rasterizes the squashed meshes' fills in real frames and compares them with the hull of their node ellipses, `outlineCheck.mjs` the exact ellipse / outline / conic math against brute force, `hostCheck.mjs` `hostProbe` against a brute-force hill climb, `splitCheck.mjs` the uniform closed form and the numeric split ring against each other and the sphere closed form, `frameTime.mjs` ms per `render()` of the demo (`SPHERES=1`: all round) |
 
-## Shells (the default scene, separate from the meshes)
+## Illusion (branch `optical-illusion`, the default scene)
+The new direction: objects are not 3D bodies sorted by depth but flat shapes rebuilt every frame so they LOOK right from the camera
+(correct in projection only). The element is a 2D shape whose sides are straight lines or arcs of ellipses, nothing else (`shape.js`).
+Each 2-node mesh is one shape (`capsule.js`: 4 sides), filled, its sides stroked each in its own color only with the Strokes
+button; meshes are ordered by their points' mean depth (no cutting yet: intersecting meshes can mis-order).
+**The world** (default scene, `world.js`): a skybox of the same shapes (a sun, a mountain ring and clouds 20-40k units away), static
+shapes from 40 to 8000 units around the start (log-uniform distance, any direction, sizes 2-100, bigger far away), and movers that
+circle, spin and flex. The panel (top right) sets the counts (Shapes / Curved / Movers) and shows frame / build / draw times. The
+renderer culls shapes off screen, smaller than 0.35 px or reaching the eye's plane (no near clip yet), and gives a curved shape
+visibility samples in proportion to its screen size. Q sprints (6x). `?scene=pairs` is the first three pairs with their borders.
+Cost (headless, JS only, 1600 x 900): about 2000 capsules drawn in 3 ms of canvas calls; curved shapes about 0.7 ms each on average
+(several ms for a big one near the camera): they are the limit, see the closed-form plan below. A pair with `bend` (a world point) follows the 3D half-ellipse through
+it (`curve.js`, as a skewed mesh's path). On screen the tube is the union of its cross-sections' discs (center projected, radius
+r * scale); the outline is the boundary of that union, every piece an ellipse arc or a line:
+- the sides are the discs' envelope, with the tilt from the width changing with depth (w' = dw / ds), so they meet the end discs
+  tangentially; each visible stretch is fitted by ellipse arcs (`conicThrough`: the conic through both ends with their tangents,
+  nearest the middle point that is an ellipse; checked BOTH ways, true curve to arc and arc to true curve, split while off by
+  more than 0.3 px; a straight stretch is a line);
+- the caps are the end discs' outward arcs;
+- FOLDS: where the tube turns toward the camera the inner envelope runs past the turn and crosses itself; everything inside
+  another disc is dropped, so the part coming toward the camera and the part going away each keep their own edge and meet at a
+  corner (solved exactly where the two curves cross). Seen almost end-on, the discs grow faster than they move (|w'| >= 1): no
+  envelope at all, and the outline there is the edge of the disc where that stretch ends, a 'tip' circle (5th color), met by the
+  sides tangentially. In a hairpin view the outline jumps between curves at the corners, so the visible stretches are chained by
+  their corners (possibly several loops, `move` in shape.js), not in the curves' order.
+- samples along the arch are bisected where the screen centerline turns fast or an envelope moves more than 3 px.
+Checked headless over 48 views (orbit + random close fly positions): outline within 0.3 px of the union's edge both ways. The
+centerline is evaluated in closed form in camera space (position, direction, width rate: `disc`, from `makeProjector`'s `toCamera`
+/ `persp`); visibility and corner searches go through screen grids. Still sampled: the samples along th, visibility, corner seeds,
+the fit's error checks. CLOSED-FORM PLAN (not done): everything is a rational function of tan(th / 2), so the fold, nesting and cusp
+events are polynomial roots (the exact stretches, no samples); fit each stretch with a fixed number of arcs between events; the
+corners are then ellipse / ellipse intersections (closed-form quartic, `conicRoots` and the arc-loop booleans in geometry.js).
+The camera flies (`flyCamera.js`) instead of orbiting. The other scenes: `?scene=shells`, `?scene=basic`, `?scene=full`.
+
+## Shells (`?scene=shells`, separate from the meshes)
 A shell is a part of a spheroid drawn as an open, two-sided surface: `createShell({ center, radius, roundness, axis, spin, cuts,
 color, innerColor })` (`shell.js`). `x = c + T u`, u on the unit sphere, `T = [r e1, r e2, r roundness a]`: roundness 1 a sphere,
 < 1 oblate, 0 a flat disc (curvature at the pole = roundness / r), > 1 prolate. T is affine, so every test is a cap `n . u >= d` on

@@ -5,6 +5,8 @@ import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from 
 import { render } from './meshes/render.js';
 import { renderShells } from './shells/shellRender.js';
 import { shells } from './shells/shell.js';
+import { buildPairsScene, buildWorldScene, renderIllusion } from './illusion/illusionRender.js';
+import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -17,11 +19,21 @@ resizeCanvas();
 // Resizing clears the canvas; redraw so a paused view doesn't stay blank.
 window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 
-// The default is the shells scene (CLAUDE.md "Shells"); ?scene=basic is the small skew scene, ?scene=full the squashed-nodes demo.
+// The default is the illusion world (CLAUDE.md "Illusion"); ?scene=pairs the illusion's first three pairs, ?scene=shells the
+// shells, ?scene=basic the small skew scene, ?scene=full the squashed-nodes demo.
 const sceneName = new URLSearchParams(location.search).get('scene');
-const shellScene = sceneName !== 'basic' && sceneName !== 'full';
+const illusionScene = !['shells', 'basic', 'full'].includes(sceneName);
+const shellScene = sceneName === 'shells';
+const worldScene = illusionScene && sceneName !== 'pairs';
+// The world's size, set by the panel's sliders (illusion world only).
+const worldOpts = { count: 3000, curved: 20, movers: 200 };
+if (illusionScene) {
+  camera.height = 120;
+  if (worldScene) buildWorldScene(worldOpts);
+  else { buildPairsScene(); strokes.on = true; }   // the pairs scene is about its borders
+}
 const paneId = shellScene ? buildShellScene() : null;
-if (!shellScene) (sceneName === 'full' ? buildFullScene : buildBasicScene)();
+if (!shellScene && !illusionScene) (sceneName === 'full' ? buildFullScene : buildBasicScene)();
 if (shellScene) { camera.height = 180; camera.zoom = 2.6; }   // look down on the hand, magnified (the hand is ~230 units tall)
 
 // Focus view: one mesh of 3+ nodes (and the meshes sharing a node with it), the camera on its bounding sphere, magnified until all of
@@ -60,6 +72,7 @@ function shellFocusFrame() {
   return { target, zoom: ext > 1e-6 ? Math.min(Math.max(focus.shellFill * Math.min(DESIGN_WIDTH, DESIGN_HEIGHT) / 2 / ext, home.zoom), 12) : home.zoom };
 }
 function focusFrame() {
+  if (illusionScene) return null;
   if (shellScene) return shellFocusFrame();
   const mesh = focus.meshId !== null ? meshes[focus.meshId] : Object.values(meshes).find(m => m.nodeIds.length > 2);
   if (!mesh) return null;
@@ -84,8 +97,55 @@ let paused = false;
 // Black background makes light seam gaps easier to spot, white makes dark ones.
 let darkMode = false;
 
+// The illusion scene flies (flyCamera.js) instead of orbiting.
+if (illusionScene) enableFly(canvas, () => { pendingDraw = true; });
+if (worldScene) fly.speed = 600;
+let pendingDraw = true;
+
+let worldTime = 0, lastStats = null;
 function drawFrame() {
+  if (illusionScene) { lastStats = renderIllusion(ctx, canvas, { darkMode, time: worldTime }); return; }
   (shellScene ? renderShells : render)(ctx, canvas, { darkMode });
+}
+
+// The world's panel (top right): sliders for the number of shapes, and the last frames' stats. "frame" is the time between
+// animation frames (what the browser really spends, rasterizing included); "build" the JS that makes the shapes, of which
+// "curved" the bent tubes; "draw" the canvas calls (the browser may rasterize later, inside "frame").
+let statsEl = null;
+const frameTimes = [];
+if (worldScene) {
+  const panel = document.createElement('div');
+  panel.style.cssText = 'position:fixed; top:64px; right:16px; z-index:10; width:300px; font:13px sans-serif; color:#fff;' +
+    'background:rgba(51,51,51,0.85); padding:10px 12px; border-radius:6px; display:flex; flex-direction:column; gap:6px;';
+  const slider = (label, key, max, step) => {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; align-items:center; gap:8px;';
+    const name = document.createElement('span'); name.textContent = label; name.style.width = '64px';
+    const input = document.createElement('input'); input.type = 'range'; input.min = 0; input.max = max; input.step = step; input.value = worldOpts[key];
+    input.style.flex = '1';
+    const val = document.createElement('span'); val.textContent = worldOpts[key]; val.style.cssText = 'width:44px; text-align:right; font-family:monospace;';
+    input.addEventListener('input', () => { val.textContent = input.value; });
+    input.addEventListener('change', () => { worldOpts[key] = Number(input.value); buildWorldScene(worldOpts); });
+    row.append(name, input, val);
+    panel.append(row);
+  };
+  slider('Shapes', 'count', 30000, 500);
+  slider('Curved', 'curved', 1000, 10);
+  slider('Movers', 'movers', 3000, 50);
+  statsEl = document.createElement('div');
+  statsEl.style.cssText = 'font-family:monospace; font-size:12px; white-space:pre; line-height:1.4;';
+  panel.append(statsEl);
+  document.body.append(panel);
+}
+function showStats() {
+  if (!statsEl || !lastStats || !frameTimes.length) return;
+  const st = lastStats, avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+  statsEl.textContent =
+    `frame  ${avg.toFixed(1)} ms  (${(1000 / avg).toFixed(0)} fps)\n` +
+    `build  ${st.buildMs.toFixed(1)} ms  curved ${st.curvedMs.toFixed(1)} ms\n` +
+    `draw   ${st.drawMs.toFixed(1)} ms\n` +
+    `shapes ${st.drawn} drawn (${st.curved} curved) of ${st.objects}\n` +
+    `       ${st.culled} off screen, ${st.tiny} sub-pixel, ${st.behind} behind the eye`;
 }
 
 const pauseBtn = document.getElementById('pauseBtn');
@@ -155,12 +215,19 @@ const angleSlider = document.getElementById('angleSlider');
 const angleLabel = document.getElementById('angleLabel');
 const TWO_PI = Math.PI * 2;
 function syncAngleUi() {
+  if (illusionScene) { if (angleLabel) angleLabel.textContent = flyStatus(); return; }
   if (!angleSlider) return;
   const a = ((camera.orbitAngle % TWO_PI) + TWO_PI) % TWO_PI;
   angleSlider.value = a;
   angleLabel.textContent = a.toFixed(3);
 }
-if (angleSlider) {
+if (illusionScene) {   // no orbit: the bottom bar shows the fly camera instead of the angle slider
+  if (angleSlider) angleSlider.style.display = 'none';
+  if (angleLabel) { angleLabel.style.flex = '1'; angleLabel.style.textAlign = 'left'; }
+  if (angleLabel && angleLabel.previousElementSibling) angleLabel.previousElementSibling.textContent = 'Click to look (Esc to release) · WASD move (Q sprint) · Space / Shift up / down · wheel zoom';
+  if (pauseBtn && !worldScene) pauseBtn.style.display = 'none';   // in the world it freezes the movers
+}
+if (angleSlider && !illusionScene) {
   angleSlider.addEventListener('input', () => {
     paused = true;
     if (pauseBtn) pauseBtn.textContent = 'Resume';
@@ -170,9 +237,19 @@ if (angleSlider) {
   });
 }
 
-let lastTime = 0;
+let lastTime = 0, lastTime0 = 0;
 function loop(timestamp) {
-  if (!paused) {
+  if (illusionScene) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+    lastTime = timestamp;
+    if (worldScene) {   // the movers move: every frame
+      if (lastTime0) { frameTimes.push(timestamp - lastTime0); if (frameTimes.length > 30) frameTimes.shift(); }
+      lastTime0 = timestamp;
+      if (!paused) worldTime += dt;
+      updateFly(dt);
+      drawFrame(); syncAngleUi(); showStats();
+    } else if (updateFly(dt) || pendingDraw) { pendingDraw = false; drawFrame(); syncAngleUi(); }
+  } else if (!paused) {
     const dt = (timestamp - lastTime) / 1000;
     lastTime = timestamp;
     camera.orbitAngle += dt * 0.4;

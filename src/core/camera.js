@@ -10,9 +10,11 @@ export const camera = {
   height: 0, // world-y offset from the target
   fov: Math.PI / 3,
   zoom: 1.7, // magnifies everything about the screen center
+  position: null, // set by the fly camera (flyCamera.js): the eye, instead of the orbit
 };
 
 export function getCameraPosition() {
+  if (camera.position) return { ...camera.position };   // fly camera (flyCamera.js)
   return {
     x: camera.target.x + camera.orbitRadius * Math.cos(camera.orbitAngle),
     y: camera.target.y + camera.height,
@@ -53,6 +55,10 @@ export function makeProjector(camPos, basis) {
   const projectCam = (camSpace) => projectToScreen(camSpace, camera.fov, camera.orbitRadius, screenCenter);
   return {
     projectPoint: (world) => projectCam(worldToCamera(world, camPos, basis)),
+    // Camera space and the projection's constants: screen = (cx + s X / Z, cy - s Y / Z), px per unit s / Z
+    // (projectToScreen: focal length x screenScale = refDistance), for closed-form work in camera space (illusion/curve.js).
+    toCamera: (world) => worldToCamera(world, camPos, basis),
+    persp: { s: camera.orbitRadius * camera.zoom, cx: screenCenter.x, cy: screenCenter.y },
     // depth = camera-space z, used for depth sorting.
     projectNode: (node) => {
       const camSpace = worldToCamera(node.center, camPos, basis);

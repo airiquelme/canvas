@@ -12,6 +12,7 @@ import { drawJointDebug } from './debug/jointDebug.js';
 import { drawShapeDebug } from './debug/shapeDebug.js';
 import { shadowEllipse, vecSub, vecDot, vecNormalize, closestPointOnCircle, ellipseRayPoint, ellipsePoint, ellipsoidShape, ellipseCapsule, hullOutline, outlinePolygon, ellipseParam, ellipseArc, mapArc, arcPoint, loopBox, untwistLoop, capsuleTangentPoints, pointInPolygon, subtractDisc, subtractPolygon } from '../core/geometry.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from '../core/camera.js';
+import { applyDesignSpaceTransform } from '../core/canvas.js';
 import { nodes, meshes } from '../scene.js';
 import { archAt, archSamples, shapeAt, inverse } from './skew.js';
 import {
@@ -130,12 +131,6 @@ function rawSlabs(prim) {
   return out;
 }
 
-export function applyDesignSpaceTransform(ctx, canvas) {
-  const scale = Math.min(canvas.width / DESIGN_WIDTH, canvas.height / DESIGN_HEIGHT);
-  ctx.translate(canvas.width / 2, canvas.height / 2);
-  ctx.scale(scale, scale);
-  ctx.translate(-DESIGN_WIDTH / 2, -DESIGN_HEIGHT / 2);
-}
 
 function centroid(points) {
   const sum = points.reduce((acc, c) => ({ x: acc.x + c.x, y: acc.y + c.y, z: acc.z + c.z }), { x: 0, y: 0, z: 0 });
