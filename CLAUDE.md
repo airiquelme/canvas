@@ -46,7 +46,7 @@ Layout: `index.html` at the root loads `src/main.js`. `src/core/` is shared by b
 | `src/core/canvas.js` | `applyDesignSpaceTransform` (design space onto the canvas) |
 | `src/illusion/shape.js` | The illusion renderer's element: a closed loop of sides, each a line or an ellipse arc (`drawShape`: fill, then each side stroked in its own color) |
 | `src/illusion/capsule.js` | A 2-node mesh's screen shape: the two end arcs and the two outer tangent lines of its node circles |
-| `src/illusion/curve.js` | A 2-node mesh bent through a point (`bend`): its long sides are ellipse arcs fitted to the screen (`conicThrough`) |
+| `src/illusion/curve.js` | A 2-node mesh bent through a point (`bend`), in closed form: events as polynomial roots, one loop per stretch, filled as a union |
 | `src/core/flyCamera.js` | Free-fly camera of the illusion scene (WASD, Space / Shift, mouse look under pointer lock, wheel zoom); sets `camera.position` |
 | `src/illusion/illusionRender.js` | `renderIllusion`, the default scene on this branch (`buildIllusionScene`) |
 | `src/shells/shell.js` | Shells: the store, `createShell`, cut helpers (`hemisphere`, `band`, `wedge`, `box`, `panel`, `plane`), `capRegion` (boundary of an intersection of caps on the unit sphere), `shellPieces`, `shellRange`, `joint` (ball + limbs, below), `jointOrder`, `tubeLight` |
@@ -61,30 +61,28 @@ button; meshes are ordered by their points' mean depth (no cutting yet: intersec
 **The world** (default scene, `world.js`): a skybox of the same shapes (a sun, a mountain ring and clouds 20-40k units away), static
 shapes from 40 to 8000 units around the start (log-uniform distance, any direction, sizes 2-100, bigger far away), and movers that
 circle, spin and flex. The panel (top right) sets the counts (Shapes / Curved / Movers) and shows frame / build / draw times. The
-renderer culls shapes off screen, smaller than 0.35 px or reaching the eye's plane (no near clip yet), and gives a curved shape
-visibility samples in proportion to its screen size. Q sprints (6x). `?scene=pairs` is the first three pairs with their borders.
-Cost (headless, JS only, 1600 x 900): about 2000 capsules drawn in 3 ms of canvas calls; curved shapes about 0.7 ms each on average
-(several ms for a big one near the camera): they are the limit, see the closed-form plan below. A pair with `bend` (a world point) follows the 3D half-ellipse through
-it (`curve.js`, as a skewed mesh's path). On screen the tube is the union of its cross-sections' discs (center projected, radius
-r * scale); the outline is the boundary of that union, every piece an ellipse arc or a line:
-- the sides are the discs' envelope, with the tilt from the width changing with depth (w' = dw / ds), so they meet the end discs
-  tangentially; each visible stretch is fitted by ellipse arcs (`conicThrough`: the conic through both ends with their tangents,
-  nearest the middle point that is an ellipse; checked BOTH ways, true curve to arc and arc to true curve, split while off by
-  more than 0.3 px; a straight stretch is a line);
-- the caps are the end discs' outward arcs;
-- FOLDS: where the tube turns toward the camera the inner envelope runs past the turn and crosses itself; everything inside
-  another disc is dropped, so the part coming toward the camera and the part going away each keep their own edge and meet at a
-  corner (solved exactly where the two curves cross). Seen almost end-on, the discs grow faster than they move (|w'| >= 1): no
-  envelope at all, and the outline there is the edge of the disc where that stretch ends, a 'tip' circle (5th color), met by the
-  sides tangentially. In a hairpin view the outline jumps between curves at the corners, so the visible stretches are chained by
-  their corners (possibly several loops, `move` in shape.js), not in the curves' order.
-- samples along the arch are bisected where the screen centerline turns fast or an envelope moves more than 3 px.
-Checked headless over 48 views (orbit + random close fly positions): outline within 0.3 px of the union's edge both ways. The
-centerline is evaluated in closed form in camera space (position, direction, width rate: `disc`, from `makeProjector`'s `toCamera`
-/ `persp`); visibility and corner searches go through screen grids. Still sampled: the samples along th, visibility, corner seeds,
-the fit's error checks. CLOSED-FORM PLAN (not done): everything is a rational function of tan(th / 2), so the fold, nesting and cusp
-events are polynomial roots (the exact stretches, no samples); fit each stretch with a fixed number of arcs between events; the
-corners are then ellipse / ellipse intersections (closed-form quartic, `conicRoots` and the arc-loop booleans in geometry.js).
+renderer culls shapes off screen, smaller than 0.35 px or reaching the eye's plane (no near clip yet). Q sprints (6x). `?scene=pairs` is the first three pairs with their borders.
+Cost (headless, JS only, 1600 x 900): about 2000 capsules drawn in 3 ms of canvas calls; curved shapes about 0.1 ms each
+(closed form, below). A pair with `bend` (a world point) follows the 3D half-ellipse through
+it (`curve.js`, as a skewed mesh's path), radius r0 + r1 cos th (rA at A, rB at B: a trig polynomial, unlike a linear blend in
+th). NO SAMPLING. On screen the tube is the union of its cross-sections' discs; in camera space X, Y, Z, r are all a + b cos +
+c sin, so every screen quantity and derivative is a trig polynomial over a power of Z (`ev`, exact first and second derivatives).
+- EVENTS are polynomial roots (`tpRoots`: Aberth on z^N P(z), z = e^(i th), roots near the unit circle kept): nesting
+  (w'^2 = |c'|^2, degree 4) and the envelope's cusps (the circle family's second derivative vanishing on it, E = s G sqrt(H),
+  squared: degree 16); plus fixed breaks every PI / 4. Each stretch between breaks is classified at its middle by the exact
+  functions (`classOf`), so spurious roots only add breaks.
+- PIECES, one simple loop per stretch, all with the same orientation in ONE path: the nonzero fill paints their exact union
+  (fold corners, hairpins, overlaps) with no outline computed. normal: a tube (the two envelopes and caps of the end discs
+  centered on the outward direction, half-angle acos(-+w~)); fold: the outer envelope and the two end discs meeting where their
+  circles cross on the folded side (the folded envelope lies inside its neighbors' discs); nested (|w~| >= 1): the bigger end
+  disc. Stretches are not merged (a long loop could overlap itself with opposite windings and cancel its fill).
+- SIDES: envelope parts cut where the exact tangent turns more than PI / 8 (or spans 300 px), each the ellipse through both
+  ends with their tangents (perpendicular to the radius) nearest the middle point (`conicThrough`), a line if straight.
+- BORDERS (Strokes): every piece's sides stroked at twice the width UNDER the fill (shape.js), so only the outer half of the
+  union's outline shows (capsules too).
+Checked headless (`raster` probes: 1.5 M points 0.3-3 px either side of the true union's edge plus a coarse grid, 384 views incl.
+close-ups and different end radii): every point farther than 0.34 px from the edge is right. About 0.1-0.4 ms per curved shape,
+whatever its size.
 The camera flies (`flyCamera.js`) instead of orbiting. The other scenes: `?scene=shells`, `?scene=basic`, `?scene=full`.
 
 ## Shells (`?scene=shells`, separate from the meshes)

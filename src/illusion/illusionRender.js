@@ -87,10 +87,8 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     const o = s.o;
     let sides;
     if (o.bend) {
-      // Detail by screen size: the visibility samples (cost ~ n^2) scale with the box's diagonal.
       const tc = performance.now();
-      const nSide = Math.max(8, Math.min(256, Math.round(s.size / 2))), nCap = Math.max(8, Math.min(64, Math.round(s.size / 6)));
-      sides = curvedSides(o.a.c, o.bend, o.b.c, o.a.r, o.b.r, projector, { nSide, nCap }).sides;
+      sides = curvedSides(o.a.c, o.bend, o.b.c, o.a.r, o.b.r, projector).sides;
       stats.curvedMs += performance.now() - tc;
       stats.curved++;
     } else {

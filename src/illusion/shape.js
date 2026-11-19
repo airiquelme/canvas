@@ -38,21 +38,24 @@ export function tracePath(ctx, shape) {
   ctx.closePath();
 }
 
-// The fill, then (with `stroke`) each side stroked on its own in its own color.
+// (With `stroke`) each side stroked on its own in its own color, at twice `lineWidth`, then the fill over them (nonzero: a shape
+// made of several overlapping loops fills their union). The fill covers each stroke's inner half and every stroke inside the
+// shape, so only the outer `lineWidth` of the shape's true outline shows (underpaint, no outline computed).
 export function drawShape(ctx, shape, { lineWidth = 3, stroke = true } = {}) {
+  if (stroke) {
+    ctx.lineWidth = 2 * lineWidth;
+    ctx.lineCap = 'round';
+    shape.sides.forEach((s, i) => {
+      const p = sideStart(s);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      traceSide(ctx, s);
+      ctx.strokeStyle = shape.colors[(s.ci ?? i) % shape.colors.length];
+      ctx.stroke();
+    });
+  }
   ctx.beginPath();
   tracePath(ctx, shape);
   ctx.fillStyle = shape.fill;
   ctx.fill();
-  if (!stroke) return;
-  ctx.lineWidth = lineWidth;
-  ctx.lineCap = 'round';
-  shape.sides.forEach((s, i) => {
-    const p = sideStart(s);
-    ctx.beginPath();
-    ctx.moveTo(p.x, p.y);
-    traceSide(ctx, s);
-    ctx.strokeStyle = shape.colors[(s.ci ?? i) % shape.colors.length];
-    ctx.stroke();
-  });
 }

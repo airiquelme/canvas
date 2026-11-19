@@ -26,7 +26,7 @@ const illusionScene = !['shells', 'basic', 'full'].includes(sceneName);
 const shellScene = sceneName === 'shells';
 const worldScene = illusionScene && sceneName !== 'pairs';
 // The world's size, set by the panel's sliders (illusion world only).
-const worldOpts = { count: 3000, curved: 20, movers: 200 };
+const worldOpts = { count: 3000, curved: 100, movers: 200 };
 if (illusionScene) {
   camera.height = 120;
   if (worldScene) buildWorldScene(worldOpts);
