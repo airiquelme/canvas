@@ -5,8 +5,9 @@ import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from 
 import { render } from './meshes/render.js';
 import { renderShells } from './shells/shellRender.js';
 import { shells } from './shells/shell.js';
-import { buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion } from './illusion/illusionRender.js';
+import { grass, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion } from './illusion/illusionRender.js';
 import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
+import { light, setSun } from './illusion/light.js';
 
 const canvas = document.getElementById('game');
 // The illusion scenes paint their whole background every frame, so their canvas is opaque (alpha: false): the browser then
@@ -28,19 +29,29 @@ resizeCanvas();
 // Resizing clears the canvas; redraw so a paused view doesn't stay blank.
 window.addEventListener('resize', () => { resizeCanvas(); drawFrame(); });
 
-// The default is the illusion world (CLAUDE.md "Illusion"); ?scene=pairs the illusion's first three pairs, ?scene=shells the
+// The default is the illusion meadow (meadow.js); ?scene=world the stress world, ?scene=sheets one of each sheet, ?scene=pairs the illusion's first three pairs, ?scene=shells the
 // shells, ?scene=basic the small skew scene, ?scene=full the squashed-nodes demo.
 const sceneName = new URLSearchParams(location.search).get('scene');
 const illusionScene = !['shells', 'basic', 'full'].includes(sceneName);
 const shellScene = sceneName === 'shells';
-const worldScene = illusionScene && sceneName !== 'pairs' && sceneName !== 'sheets';
+const worldScene = sceneName === 'world';
+const meadowScene = illusionScene && !['world', 'sheets', 'pairs', 'patch'].includes(sceneName);
+const animScene = worldScene || meadowScene;   // scenes with movers (animated every frame)
 // The world's size, set by the panel's sliders (illusion world only).
 const worldOpts = { count: 3000, curved: 100, movers: 200, walls: 48, sheets: 600 };
 if (illusionScene) {
   camera.height = 120;
   if (worldScene) buildWorldScene(worldOpts);
   else if (sceneName === 'sheets') buildSheetsScene();
-  else { buildPairsScene(); strokes.on = true; }   // the pairs scene is about its borders
+  else if (sceneName === 'patch') buildPatchScene();
+  else if (sceneName === 'pairs') { buildPairsScene(); strokes.on = true; }   // the pairs scene is about its borders
+  else {   // the meadow: the eye 60 units over the ground, looking across it
+    let saved = null;   // the ground's edits from an earlier visit (grid.js), replayed
+    try { saved = JSON.parse(localStorage.getItem('gatomica.groundEdits') || 'null'); } catch (e) { saved = null; }
+    const groundAt = buildMeadowScene({ edits: Array.isArray(saved) ? saved : null });
+    camera.target = { x: 500, y: groundAt(500, 0) + 20, z: 0 };
+    camera.height = groundAt(500 + camera.orbitRadius * Math.cos(camera.orbitAngle), camera.orbitRadius * Math.sin(camera.orbitAngle)) + 60 - camera.target.y;
+  }
 }
 const paneId = shellScene ? buildShellScene() : null;
 if (!shellScene && !illusionScene) (sceneName === 'full' ? buildFullScene : buildBasicScene)();
@@ -240,10 +251,70 @@ if (strokeBtn) {
 }
 
 const lightBtn = document.getElementById('lightBtn');
-if (lightBtn) {
-  const label = () => { lightBtn.textContent = lighting.on ? 'Light: on' : 'Light: off'; lightBtn.style.background = lighting.on ? '#1b5e20' : '#333'; };
+if (lightBtn) {   // the illusion scenes: the stylized sun (light.js); the others: the meshes' / shells' light
+  const on = () => (illusionScene ? light.on : lighting.on);
+  const label = () => { lightBtn.textContent = on() ? 'Light: on' : 'Light: off'; lightBtn.style.background = on() ? '#1b5e20' : '#333'; };
   label();
-  lightBtn.addEventListener('click', () => { lighting.on = !lighting.on; label(); drawFrame(); });
+  lightBtn.addEventListener('click', () => {
+    if (illusionScene) { light.on = !light.on; if (meadowScene) buildMeadowScene(); }   // the meadow's shade regions are built with the sun
+    else lighting.on = !lighting.on;
+    label(); drawFrame();
+  });
+}
+
+// The sun (illusion scenes): direction and height above the horizon. The meadow rebuilds its shade regions when a slider is let go
+// (about 0.2 s); the other scenes follow while dragging.
+if (illusionScene) {
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed; left:16px; top:64px; z-index:10; font:13px sans-serif; color:#fff; background:rgba(51,51,51,0.85);' +
+    'padding:8px 12px; border-radius:6px; display:flex; flex-direction:column; gap:4px; width:240px;';
+  const row = (label, min, max, value, set) => {
+    const r = document.createElement('label');
+    r.style.cssText = 'display:flex; align-items:center; gap:8px;';
+    const name = document.createElement('span'); name.textContent = label; name.style.width = '58px';
+    const input = document.createElement('input'); input.type = 'range'; input.min = min; input.max = max; input.step = 1; input.value = value;
+    input.style.flex = '1';
+    const val = document.createElement('span'); val.textContent = value + '\u00b0'; val.style.cssText = 'width:36px; text-align:right; font-family:monospace;';
+    const apply = (rebuild) => { val.textContent = input.value + '\u00b0'; set(Number(input.value) * Math.PI / 180); if (rebuild && meadowScene) buildMeadowScene(); pendingDraw = true; };
+    input.addEventListener('input', () => apply(false));
+    input.addEventListener('change', () => { apply(true); input.blur(); });
+    r.append(name, input, val);
+    box.append(r);
+  };
+  row('Sun dir', 0, 360, Math.round(light.azimuth * 180 / Math.PI), (a) => setSun(a, light.elevation));
+  row('Sun height', -10, 80, Math.round(light.elevation * 180 / Math.PI), (e) => setSun(light.azimuth, e));
+  if (meadowScene) {   // grass from the patches' seeds (grass.js)
+    const b = document.createElement('button');
+    const label = () => { b.textContent = grass.on ? 'Grass: on' : 'Grass: off'; b.style.background = grass.on ? '#1b5e20' : '#333'; };
+    b.style.cssText = 'margin-top:4px; color:#fff; border:none; border-radius:4px; padding:4px 8px; cursor:pointer;';
+    label();
+    b.addEventListener('click', () => { grass.on = !grass.on; label(); b.blur(); pendingDraw = true; });
+    box.append(b);
+    const hint = document.createElement('div');
+    hint.textContent = 'E: dig   R: place a cube (at the cross)';
+    hint.style.cssText = 'font-size:12px; opacity:0.8; margin-top:2px;';
+    box.append(hint);
+    const reset = document.createElement('button');
+    reset.textContent = 'Reset ground';
+    reset.style.cssText = 'margin-top:4px; color:#fff; background:#333; border:none; border-radius:4px; padding:4px 8px; cursor:pointer;';
+    reset.addEventListener('click', () => {
+      try { localStorage.removeItem('gatomica.groundEdits'); } catch (err) { /* nothing saved */ }
+      buildMeadowScene({ edits: null });
+      reset.blur(); pendingDraw = true;
+    });
+    box.append(reset);
+    // The grid of cubes (grid.js): dig / place at the screen's center.
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat || e.target instanceof HTMLInputElement) return;
+      if (e.code === 'KeyE' || e.code === 'KeyR') {
+        if (editGround(e.code === 'KeyE' ? 'dig' : 'place')) {
+          try { localStorage.setItem('gatomica.groundEdits', JSON.stringify(groundEdits())); } catch (err) { /* not saved */ }
+        }
+        pendingDraw = true;
+      }
+    });
+  }
+  document.body.append(box);
 }
 
 // Roundness slider (shells scene only): the curved pane, from flat (0) to a dome.
@@ -282,7 +353,7 @@ if (illusionScene) {   // no orbit: the bottom bar shows the fly camera instead 
   if (angleSlider) angleSlider.style.display = 'none';
   if (angleLabel) { angleLabel.style.flex = '1'; angleLabel.style.textAlign = 'left'; }
   if (angleLabel && angleLabel.previousElementSibling) angleLabel.previousElementSibling.textContent = 'Click to look (Esc to release) · WASD move (Q sprint) · Space / Shift up / down · wheel zoom';
-  if (pauseBtn && !worldScene) pauseBtn.style.display = 'none';   // in the world it freezes the movers
+  if (pauseBtn && !animScene) pauseBtn.style.display = 'none';   // in the world and the meadow it freezes the movers
 }
 if (angleSlider && !illusionScene) {
   angleSlider.addEventListener('input', () => {
@@ -299,7 +370,7 @@ function loop(timestamp) {
   if (illusionScene) {
     const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
     lastTime = timestamp;
-    if (worldScene) {   // the movers move: every frame, unless paused with the camera still (then nothing is redrawn)
+    if (animScene) {   // the movers move: every frame, unless paused with the camera still (then nothing is redrawn)
       if (!paused) worldTime += dt;
       const moved = updateFly(dt);
       if (paused && !moved && !pendingDraw) { lastTime0 = 0; requestAnimationFrame(loop); return; }

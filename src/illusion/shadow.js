@@ -1,0 +1,176 @@
+// Sun shade on the ground, in WORLD space (the same from every angle): one field for both a hill's own far side and the shadow it
+// casts on the ground behind it.
+//
+// FIELD. The sun is directional and the ground a height field H, so whether a ground point is in shade does not depend on the
+// camera. Sweep lines run across the ground along the sun's horizontal direction, starting on the sun's side; along each, the
+// "shadow line" height falls by tan(elevation) per unit and is raised to the ground wherever the ground is higher:
+// SL = max(SL - ds tanE, H). A point is in shade where the ground is below it; depth(x, z) = SL - H >= 0 is stored on that rotated
+// grid and read bilinearly (0 exactly on lit ground, so no specks). A slope facing away from the sun falls below its crest's
+// shadow line, so a hill's own shade side and its cast shadow are one region, joined at the terminator.
+// SPLIT. Each floor patch (a triangle) is cut along the field's border: the border's crossings of its edges by bisection (cached
+// per edge, so two neighbors, and every level of the terrain, cut a shared edge at the same point), and inside, a circle arc in
+// x, z through both crossings and the border's point on the chord's perpendicular bisector (a line where they are in line). Parts:
+// [{ loop, shade }], each a loop of patch pieces (patch.js) whose sides on the triangle's edges keep that edge's index and whose
+// cut is tagged 'cut'.
+
+const EPS = 0.25;   // world units of depth below which a point counts as lit
+
+export function buildShadowField({ H, x0, x1, z0, z1, dir, res = 512 }) {
+  const hl = Math.hypot(dir.x, dir.z);
+  if (dir.y <= 0) return { all: true };   // the sun is down: everything in shade
+  if (hl < 1e-6) return { none: true };   // overhead: nothing
+  const ux = dir.x / hl, uz = dir.z / hl, vx = -uz, vz = ux, tanE = dir.y / hl;   // u toward the sun, v across
+  const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+  let umin = Infinity, umax = -Infinity, vmin = Infinity, vmax = -Infinity;
+  for (const [x, z] of [[x0, z0], [x1, z0], [x0, z1], [x1, z1]]) {
+    const u = (x - cx) * ux + (z - cz) * uz, v = (x - cx) * vx + (z - cz) * vz;
+    umin = Math.min(umin, u); umax = Math.max(umax, u); vmin = Math.min(vmin, v); vmax = Math.max(vmax, v);
+  }
+  const ds = Math.max(umax - umin, vmax - vmin) / res, nu = Math.ceil((umax - umin) / ds) + 1, nv = Math.ceil((vmax - vmin) / ds) + 1;
+  const depth = new Float32Array(nu * nv);
+  const t0 = performance.now();
+  const sweep = (j) => {
+    const v = vmin + j * ds;
+    let SL = -Infinity;
+    for (let i = 0; i < nu; i++) {   // i = 0 on the sun's side (u = umax)
+      const u = umax - i * ds, x = cx + u * ux + v * vx, z = cz + u * uz + v * vz, h = H(x, z);
+      SL = Math.max(SL - ds * tanE, h);
+      depth[j * nu + i] = SL - h;
+    }
+  };
+  for (let j = 0; j < nv; j++) sweep(j);
+  // After an edit of the ground in an x, z box: redo the sweep lines that cross it (a line's shade depends only on the ground
+  // along it, upwind).
+  const update = (box) => {
+    let a = Infinity, b = -Infinity;
+    for (const [x, z] of [[box.x0, box.z0], [box.x1, box.z0], [box.x0, box.z1], [box.x1, box.z1]]) {
+      const v = (x - cx) * vx + (z - cz) * vz; a = Math.min(a, v); b = Math.max(b, v);
+    }
+    for (let j = Math.max(0, Math.floor((a - vmin) / ds) - 1); j <= Math.min(nv - 1, Math.ceil((b - vmin) / ds) + 1); j++) sweep(j);
+  };
+  const at = (x, z) => {
+    const u = (x - cx) * ux + (z - cz) * uz, v = (x - cx) * vx + (z - cz) * vz;
+    const fi = (umax - u) / ds, fj = (v - vmin) / ds;
+    const i = Math.max(0, Math.min(nu - 2, Math.floor(fi))), j = Math.max(0, Math.min(nv - 2, Math.floor(fj)));
+    const a = Math.max(0, Math.min(1, fi - i)), b = Math.max(0, Math.min(1, fj - j));
+    const k = j * nu + i;
+    return (depth[k] * (1 - a) + depth[k + 1] * a) * (1 - b) + (depth[k + nu] * (1 - a) + depth[k + nu + 1] * a) * b;
+  };
+  // Whether a world point (above the ground too) is in shade: below the shadow line there.
+  const point = (p) => at(p.x, p.z) + H(p.x, p.z) > p.y + EPS;
+  return { at, point, update, ms: performance.now() - t0, ux, uz, tanE };
+}
+
+const shaded = (F, p) => F.all || (!F.none && F.at(p.x, p.z) > EPS);
+
+// The crossings of the field's border along the world segment p -> q, as u in (0, 1), cached by edge.
+function crossings(F, p, q, cache) {
+  const ka = `${Math.round(p.x * 100)},${Math.round(p.z * 100)}`, kb = `${Math.round(q.x * 100)},${Math.round(q.z * 100)}`;
+  const flip = kb < ka, key = flip ? kb + '|' + ka : ka + '|' + kb;
+  let us = cache.get(key);
+  if (!us) {
+    const A = flip ? q : p, B = flip ? p : q, pt = (u) => ({ x: A.x + (B.x - A.x) * u, z: A.z + (B.z - A.z) * u });
+    const n = Math.max(4, Math.ceil(Math.hypot(B.x - A.x, B.z - A.z) / 6));
+    us = [];
+    let ua = 0, sa = shaded(F, pt(0));
+    for (let k = 1; k <= n; k++) {
+      const ub = k / n, sb = shaded(F, pt(ub));
+      if (sa !== sb) {
+        let lo = ua, hi = ub;
+        for (let it = 0; it < 30; it++) { const m = (lo + hi) / 2; if (shaded(F, pt(m)) === sa) lo = m; else hi = m; }
+        us.push((lo + hi) / 2);
+      }
+      ua = ub; sa = sb;
+    }
+    cache.set(key, us);
+  }
+  return flip ? us.map((u) => 1 - u).reverse() : us;
+}
+
+// A floor patch's parts under the field (a triangle patch: o.loop are 3 lines, local x, z). [{ loop, shade }].
+export function splitPatch(o, F, cache) {
+  const W = (p) => ({ x: p.x + o.ox, z: p.z + o.oz }), Lc = (p) => ({ x: p.x - o.ox, z: p.z - o.oz });
+  const loop = o.loop;
+  if (F.all || F.none || loop.some((pc) => pc.kind !== 'line')) return [{ loop, shade: !!F.all }];
+  // Crossings around the loop: { k (edge), u, p (local) }.
+  const cuts = [];
+  loop.forEach((pc, k) => { for (const u of crossings(F, W(pc.a), W(pc.b), cache)) cuts.push({ k, u, p: { x: pc.a.x + (pc.b.x - pc.a.x) * u, z: pc.a.z + (pc.b.z - pc.a.z) * u } }); });
+  if (cuts.length < 2 || cuts.length % 2) {   // whole (an island inside it is left out)
+    const c = { x: (loop[0].a.x + loop[1].a.x + loop[2].a.x) / 3, z: (loop[0].a.z + loop[1].a.z + loop[2].a.z) / 3 };
+    const votes = loop.filter((pc) => shaded(F, W(pc.a))).length + (shaded(F, W(c)) ? 1 : 0);
+    return [{ loop, shade: votes >= 2 }];
+  }
+  // Pair the crossings without crossing chords: of the two neighbor pairings, the shorter total.
+  const len = (off) => { let s = 0; for (let a = 0; a < cuts.length; a += 2) { const p = cuts[(a + off) % cuts.length].p, q = cuts[(a + off + 1) % cuts.length].p; s += Math.hypot(q.x - p.x, q.z - p.z); } return s; };
+  const off = cuts.length > 2 && len(1) < len(0) ? 1 : 0;
+  // The cut from crossing A to B: a piece (line, or circle arc through the border's middle point).
+  const cutPiece = (A, B) => {
+    const m = { x: (A.x + B.x) / 2, z: (A.z + B.z) / 2 }, n = { x: -(B.z - A.z) / 2, z: (B.x - A.x) / 2 };
+    const at = (s) => ({ x: m.x + n.x * s, z: m.z + n.z * s }), sm = shaded(F, W(m));
+    let M = null;
+    for (const sgn of [1, -1]) {   // search the perpendicular both ways for the border
+      let lo = 0, found = null;
+      for (let k = 1; k <= 8 && !found; k++) { const s = (sgn * k) / 8; if (shaded(F, W(at(s))) !== sm) found = [lo, s]; else lo = s; }
+      if (found) {
+        let [a, b] = found;
+        for (let it = 0; it < 30; it++) { const c = (a + b) / 2; if (shaded(F, W(at(c))) === sm) a = c; else b = c; }
+        M = at((a + b) / 2);
+        break;
+      }
+    }
+    if (!M) return { kind: 'line', a: A, b: B, edge: 'cut' };
+    // Circle through A, M, B (in x, z).
+    const ax = A.x, az = A.z, bx = M.x, bz = M.z, cx = B.x, cz = B.z;
+    const d = 2 * (ax * (bz - cz) + bx * (cz - az) + cx * (az - bz));
+    const chord = Math.hypot(B.x - A.x, B.z - A.z);
+    const sag = Math.abs((B.x - A.x) * (M.z - A.z) - (B.z - A.z) * (M.x - A.x)) / (chord || 1);
+    if (Math.abs(d) < 1e-12 || sag < chord * 1e-3) return { kind: 'line', a: A, b: B, edge: 'cut' };
+    const ux = ((ax * ax + az * az) * (bz - cz) + (bx * bx + bz * bz) * (cz - az) + (cx * cx + cz * cz) * (az - bz)) / d;
+    const uz = ((ax * ax + az * az) * (cx - bx) + (bx * bx + bz * bz) * (ax - cx) + (cx * cx + cz * cz) * (bx - ax)) / d;
+    const r = Math.hypot(ax - ux, az - uz), ang = (p) => Math.atan2(p.z - uz, p.x - ux);
+    const TAU = 2 * Math.PI, mod = (t) => ((t % TAU) + TAU) % TAU;
+    const t0 = ang(A), dB = mod(ang(B) - t0), dM = mod(ang(M) - t0);
+    const t1 = dM < dB ? t0 + dB : t0 - (TAU - dB);
+    return { kind: 'arc', c: { x: ux, z: uz }, U: { x: r, z: 0 }, V: { x: 0, z: r }, t0, t1, edge: 'cut' };
+  };
+  const rev = (pc) => (pc.kind === 'line' ? { ...pc, a: pc.b, b: pc.a } : { ...pc, t0: pc.t1, t1: pc.t0 });
+  // Walk the triangle's boundary from crossing i to crossing j (forward), as pieces.
+  const nC = cuts.length;
+  const walk = (ci, cj) => {
+    const A = cuts[ci], B = cuts[cj], out = [];
+    const part = (k, pa, pb) => { if (Math.hypot(pb.x - pa.x, pb.z - pa.z) > 1e-9) out.push({ kind: 'line', a: pa, b: pb, edge: k }); };
+    if (A.k === B.k && B.u > A.u) { part(A.k, A.p, B.p); return out; }
+    part(A.k, A.p, loop[A.k].b);
+    for (let k = (A.k + 1) % 3; k !== B.k; k = (k + 1) % 3) part(k, loop[k].a, loop[k].b);
+    part(B.k, loop[B.k].a, B.p);
+    return out;
+  };
+  // Regions: each boundary stretch between consecutive crossings, closed by the cuts of the pairing.
+  const partner = new Array(nC);
+  for (let a = 0; a < nC; a += 2) { const i = (a + off) % nC, j = (a + off + 1) % nC; partner[i] = j; partner[j] = i; }
+  const cutOf = new Map();
+  const getCut = (i, j) => { const k = i < j ? `${i}-${j}` : `${j}-${i}`; if (!cutOf.has(k)) cutOf.set(k, { from: Math.min(i, j), pc: cutPiece(cuts[Math.min(i, j)].p, cuts[Math.max(i, j)].p) }); const c = cutOf.get(k); return c.from === i ? c.pc : rev(c.pc); };
+  const used = new Set(), parts = [];
+  for (let s0 = 0; s0 < nC; s0++) {
+    if (used.has(s0)) continue;
+    const pieces = [];
+    let s = s0, guard = 0;
+    do {
+      used.add(s);
+      const e = (s + 1) % nC;
+      pieces.push(...walk(s, e));
+      const p = partner[e];
+      pieces.push(getCut(e, p));
+      s = p;
+    } while (s !== s0 && ++guard < nC);
+    // Its tone: the field at a point just inside (the middle of its first boundary stretch, nudged toward the region's centroid).
+    const pts = pieces.map((pc) => pc.a || { x: pc.c.x + pc.U.x * Math.cos(pc.t0), z: pc.c.z + pc.V.z * Math.sin(pc.t0) });
+    const cen = pts.reduce((acc, p) => ({ x: acc.x + p.x / pts.length, z: acc.z + p.z / pts.length }), { x: 0, z: 0 });
+    const b0 = pieces.find((pc) => pc.kind === 'line' && pc.edge !== 'cut') || pieces[0];
+    const mid = b0.kind === 'line' ? { x: (b0.a.x + b0.b.x) / 2, z: (b0.a.z + b0.b.z) / 2 } : cen;
+    const probe = { x: mid.x + (cen.x - mid.x) * 0.2, z: mid.z + (cen.z - mid.z) * 0.2 };
+    parts.push({ loop: pieces, shade: shaded(F, W(probe)) });
+  }
+  // Lit parts first (their cut is underpainted before the shade parts are drawn over it).
+  return parts.sort((a, b) => a.shade - b.shade);
+}

@@ -6,7 +6,7 @@
 //   arc:  { kind: 'arc', e: { x, y, a, b, angle }, t0, t1 }   ctx.ellipse's terms; t runs from t0 to t1
 //         (t1 > t0 goes clockwise on screen, y down; t1 < t0 the other way)
 //
-// A shape is { sides: [...], fill, colors: [stroke colors], depth, keep? }. Each side starts where the previous one ends. A side's
+// A shape is { sides: [...], fill, colors: [stroke colors], depth, keep?, crescents? }. Each side starts where the previous one ends. A side's
 // stroke is colors[side.ci] (pieces of one logical side share it), else colors[its index]. A side with `move` starts a new
 // loop (subpath).
 
@@ -21,7 +21,7 @@ export const pointOnEllipse = (e, t) => {
 export const sideStart = (s) => s.kind === 'line' ? s.from : pointOnEllipse(s.e, s.t0);
 
 // Adds one side to the current path (assumes the pen is already at its start).
-function traceSide(ctx, s) {
+export function traceSide(ctx, s) {
   if (s.kind === 'line') ctx.lineTo(s.to.x, s.to.y);
   else ctx.ellipse(s.e.x, s.e.y, s.e.a, s.e.b, s.e.angle, s.t0, s.t1, s.t1 < s.t0);
 }
@@ -56,12 +56,42 @@ export function drawShape(ctx, shape, { lineWidth = 3, stroke = true } = {}) {
   }
   if (ctx.fillStyle !== shape.fill) ctx.fillStyle = shape.fill;   // setting a color parses it: only when it changes
   // A shape kept from frame to frame (`keep`) records its path once (Path2D) and refills it.
-  if (shape.keep && typeof Path2D !== 'undefined') {
-    if (!shape.path) { shape.path = new Path2D(); tracePath(shape.path, shape); }
-    ctx.fill(shape.path);
+  if ((shape.keep || shape.crescents) && typeof Path2D !== 'undefined') {
+    let path = shape.path;
+    if (!path) { path = new Path2D(); tracePath(path, shape); if (shape.keep) shape.path = path; }
+    ctx.fill(path);
+    if (shape.crescents) for (const c of shape.crescents) crescent(ctx, shape, path, c);
     return;
   }
   ctx.beginPath();
   tracePath(ctx, shape);
   ctx.fill();
+}
+
+// CRESCENTS (stylized light, opt-in: illusionRender.js sets shape.crescents = [{ dx, dy, color }]): the shape minus the same shape
+// moved by (dx, dy), filled in `color`. Moved toward the light, what is left is a shade crescent on the far side; away from it, a
+// bright one on the near side. Its width at each point of the outline is the shift times how much the outline faces away, so it
+// tapers to nothing at its tips with no geometry computed. Drawn inside a clip of the shape and of the complement of each moved
+// loop (a big rectangle plus the loop, even-odd: one clip per loop, so a shape that is a union of loops works).
+function crescent(ctx, shape, path, { dx, dy, color }) {
+  if (Math.hypot(dx, dy) < 0.05) return;
+  ctx.save();
+  ctx.clip(path);
+  let loop = null;
+  const flush = () => { if (loop) { ctx.clip(loop, 'evenodd'); loop = null; } };
+  shape.sides.forEach((s, i) => {
+    if (i === 0 || s.move) {
+      flush();
+      loop = new Path2D();
+      loop.rect(-1e6, -1e6, 2e6, 2e6);
+      const p = sideStart(s);
+      loop.moveTo(p.x + dx, p.y + dy);
+    }
+    if (s.kind === 'line') loop.lineTo(s.to.x + dx, s.to.y + dy);
+    else loop.ellipse(s.e.x + dx, s.e.y + dy, s.e.a, s.e.b, s.e.angle, s.t0, s.t1, s.t1 < s.t0);
+  });
+  flush();
+  ctx.fillStyle = color;
+  ctx.fill(path);
+  ctx.restore();
 }

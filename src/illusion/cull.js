@@ -20,8 +20,10 @@ export function boundPoints(o) {
   if (o.move) return pointsOf(o);
   return o.boundPts || (o.boundPts = pointsOf(o));
 }
-export const boundRadius = (o) => (o.kind === 'panel' || o.kind === 'disc' ? 0 : Math.max(o.a.r, o.b.r));
+export const boundRadius = (o) => (o.kind === 'panel' || o.kind === 'disc' || o.kind === 'quad' || o.kind === 'patch' ? 0 : Math.max(o.a.r, o.b.r));
 function pointsOf(o) {
+  if (o.kind === 'quad') return o.pts;
+  if (o.kind === 'patch') return o.bound;
   if (o.kind === 'panel' || o.kind === 'disc') {
     const { c, e1, e2 } = o, at = (s1, s2) => ({ x: c.x + s1 * e1.x + s2 * e2.x, y: c.y + s1 * e1.y + s2 * e2.y, z: c.z + s1 * e1.z + s2 * e2.z });
     return [at(1, 1), at(-1, 1), at(-1, -1), at(1, -1)];
@@ -32,7 +34,20 @@ function pointsOf(o) {
   return [A, B, { x: A.x + V.x, y: A.y + V.y, z: A.z + V.z }, { x: B.x + V.x, y: B.y + V.y, z: B.z + V.z }];
 }
 
-// Tree of bounding spheres (median split along the longest axis of the objects' centers).
+// An object's RELEVANT SIZE (world units, kept): what decides whether it can be seen at all. A thin shape's width, a round
+// shape's diameter: a tube or capsule's largest diameter, a ribbon's, a panel's or disc's shorter side. Ground (patches,
+// quads) never vanishes: Infinity.
+export function relSize(o) {
+  if (o.relSize !== undefined) return o.relSize;
+  const len = (v) => Math.hypot(v.x, v.y, v.z);
+  let w = Infinity;
+  if (!o.kind || o.kind === 'ribbon') w = 2 * Math.max(o.a.r, o.b.r);
+  else if (o.kind === 'panel' || o.kind === 'disc') w = 2 * Math.min(len(o.e1), len(o.e2));
+  return (o.relSize = w);
+}
+
+// Tree of bounding spheres (median split along the longest axis of the objects' centers). Each node also holds its members'
+// largest relevant size (`maxSize`), so a far node too small for any of them is skipped whole.
 export function buildBVH(objects) {
   const items = objects.map((o) => {
     const r = boundRadius(o), pts = boundPoints(o);
@@ -52,6 +67,7 @@ function split(items) {
   }
   const c = { x: (min.x + max.x) / 2, y: (min.y + max.y) / 2, z: (min.z + max.z) / 2 };
   const node = { c, R: Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z) / 2, count: items.length };
+  node.maxSize = items.reduce((m, it) => Math.max(m, relSize(it.o)), 0);
   if (items.length <= LEAF) { node.items = items.map((it) => it.o); return node; }
   const ext = { x: cmax.x - cmin.x, y: cmax.y - cmin.y, z: cmax.z - cmin.z };
   const axis = ext.x >= ext.y && ext.x >= ext.z ? 'x' : ext.y >= ext.z ? 'y' : 'z';

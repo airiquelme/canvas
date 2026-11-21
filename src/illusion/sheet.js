@@ -38,7 +38,7 @@ export function backOf(hex) {
 }
 
 // Screen point and screen tangent (d / dt) of the camera-space ellipse C + U cos t + V sin t.
-function edgeAt(C, U, V, t, P) {
+export function edgeAt(C, U, V, t, P) {
   const c = Math.cos(t), s = Math.sin(t);
   const X = C.x + U.x * c + V.x * s, Y = C.y + U.y * c + V.y * s, Z = C.z + U.z * c + V.z * s;
   const Xp = V.x * c - U.x * s, Yp = V.y * c - U.y * s, Zp = V.z * c - U.z * s, iz = 1 / Z;
@@ -49,8 +49,9 @@ function edgeAt(C, U, V, t, P) {
 }
 
 // The sides along the camera-space ellipse from t0 to t1 (either direction), each an exact arc (or a line where it is straight).
-export function ellipseEdge(C, U, V, t0, t1, P, ci = 0) {
-  const n = Math.max(1, Math.ceil(Math.abs(t1 - t0) / BREAK)), sides = [];
+// pieces: how many arcs (default: one per PI / 4).
+export function ellipseEdge(C, U, V, t0, t1, P, ci = 0, pieces = 0) {
+  const n = pieces || Math.max(1, Math.ceil(Math.abs(t1 - t0) / BREAK)), sides = [];
   let pa = edgeAt(C, U, V, t0, P);
   for (let k = 1; k <= n; k++) {
     const tb = t0 + ((t1 - t0) * k) / n, tm = t0 + ((t1 - t0) * (k - 0.5)) / n;
