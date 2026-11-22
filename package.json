@@ -1,5 +1,18 @@
 {
   "private": true,
   "type": "module",
-  "scripts": { "start": "npx live-server --port=8000" }
+  "scripts": {
+    "dev": "vite",
+    "start": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 8001",
+    "test": "node --test \"tools/unit/*.test.mjs\"",
+    "test:render": "node tools/render/gpu/pixelTest.mjs /src:canvas /src:webgl2 --max-flat=200 && node tools/render/gpu/pixelTest.mjs /src:canvas /src:webgl2 --night --max-flat=200 && node tools/render/gpu/pixelTest.mjs /src:canvas /src:webgpu --max-flat=200",
+    "grass:density": "node tools/render/gpu/grassDensity.mjs",
+    "bench": "node tools/render/gpu/bench.mjs",
+    "check": "node tools/render/illusionCheck.mjs"
+  },
+  "devDependencies": {
+    "vite": "^8.3.8"
+  }
 }

@@ -53,11 +53,25 @@ export function projectToScreen(camSpace, fov, refDistance, screenCenter) {
 export function makeProjector(camPos, basis) {
   const screenCenter = { x: DESIGN_WIDTH / 2, y: DESIGN_HEIGHT / 2 };
   const projectCam = (camSpace) => projectToScreen(camSpace, camera.fov, camera.orbitRadius, screenCenter);
+  // The hot paths inlined (no temporaries, the tangents once), in the same arithmetic order as worldToCamera / projectToScreen,
+  // so the results are bit-identical.
+  const { right: R, up: U, forward: F } = basis, px = camPos.x, py = camPos.y, pz = camPos.z;
+  const fl = 1 / Math.tan(camera.fov / 2), ss = camera.orbitRadius * Math.tan(camera.fov / 2), K = fl * ss, zoom = camera.zoom;
+  const scx = screenCenter.x, scy = screenCenter.y;
+  const toCamera = (w) => {
+    const dx = w.x - px, dy = w.y - py, dz = w.z - pz;
+    return { x: dx * R.x + dy * R.y + dz * R.z, y: dx * U.x + dy * U.y + dz * U.z, z: dx * F.x + dy * F.y + dz * F.z };
+  };
   return {
-    projectPoint: (world) => projectCam(worldToCamera(world, camPos, basis)),
+    projectPoint: (w) => {
+      const dx = w.x - px, dy = w.y - py, dz = w.z - pz;
+      const X = dx * R.x + dy * R.y + dz * R.z, Y = dx * U.x + dy * U.y + dz * U.z, Z = dx * F.x + dy * F.y + dz * F.z;
+      const scale = K / Z * zoom;
+      return { x: scx + X * scale, y: scy - Y * scale, scale };
+    },
     // Camera space and the projection's constants: screen = (cx + s X / Z, cy - s Y / Z), px per unit s / Z
     // (projectToScreen: focal length x screenScale = refDistance), for closed-form work in camera space (illusion/curve.js).
-    toCamera: (world) => worldToCamera(world, camPos, basis),
+    toCamera,
     persp: { s: camera.orbitRadius * camera.zoom, cx: screenCenter.x, cy: screenCenter.y },
     // depth = camera-space z, used for depth sorting.
     projectNode: (node) => {

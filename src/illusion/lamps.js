@@ -65,8 +65,12 @@ export function lampParts(o, parts, H) {
       out = next;
     }
   }
-  // Overlays (a band's disc wholly inside a part) after what they lie on.
-  return out.sort((a, b) => (a.shade - b.shade) || ((a.overlay ? 1 : 0) - (b.overlay ? 1 : 0)));
+  // Overlays (a band's disc wholly inside a part) are drawn over what they lie on, so parts can overlap: drawn in increasing
+  // lift, the strongest wins, which is right: a part's lift comes from circles holding its region, and a circle (convex) holding
+  // a ring holds the disc inside it too, so a part never has more lift than the overlays over it. Sorting by the overlay flag
+  // alone let a weaker overlay of one lamp cover a stronger band of another, cut from the part under it (bites in the pools).
+  const lv = (q) => (q.lamp ? q.lamp.level : 0);
+  return out.sort((a, b) => (a.shade - b.shade) || (lv(a) - lv(b)) || ((a.overlay ? 1 : 0) - (b.overlay ? 1 : 0)));
 }
 
 // A loop of pieces (local x, z) split by the circle (c, r): [{ loop, inside, overlay? }]. Crossings by sampling and bisection
@@ -74,23 +78,36 @@ export function lampParts(o, parts, H) {
 // loop (outside) and the disc drawn over it (`overlay`).
 export function splitByCircle(loop, c, r) {
   const f = (p) => Math.hypot(p.x - c.x, p.z - c.z) - r;
+  // its slope along the piece (sign only matters): (p - c) . dp
+  const df = (p) => (p.x - c.x) * p.dx + (p.z - c.z) * p.dz;
   const cuts = [];
   loop.forEach((pc, k) => {
     const n = pc.kind === 'arc' ? 24 : 12;
-    let ua = 0, fa = f(pieceAt(pc, 0));
+    const at = (u) => f(pieceAt(pc, u));
+    const root = (lo, hi, fLo) => {   // the sign change of f in [lo, hi] (fLo: f at lo)
+      for (let it = 0; it < 40; it++) { const m = (lo + hi) / 2; if ((at(m) < 0) === (fLo < 0)) lo = m; else hi = m; }
+      const u = (lo + hi) / 2, p = pieceAt(pc, u);
+      if (u > 1e-9 && u < 1 - 1e-9) cuts.push({ k, u, p: { x: p.x, z: p.z }, t: Math.atan2(p.z - c.z, p.x - c.x) });
+    };
+    let ua = 0, pa = pieceAt(pc, 0), fa = f(pa);
     for (let j = 1; j <= n; j++) {
-      const ub = j / n, fb = f(pieceAt(pc, ub));
-      if ((fa < 0) !== (fb < 0)) {
+      const ub = j / n, pb = pieceAt(pc, ub), fb = f(pb);
+      if ((fa < 0) !== (fb < 0)) root(ua, ub, fa);
+      else if (fa >= 0 && df(pa) < 0 && df(pb) > 0) {
+        // GRAZING: both ends outside but the piece comes closer in between: the circle may dip in and out within the step
+        // (missed, it left a patch wholly in or out of the band: straight edges and bites in the pools). Find the closest point.
         let lo = ua, hi = ub;
-        for (let it = 0; it < 40; it++) { const m = (lo + hi) / 2; if ((f(pieceAt(pc, m)) < 0) === (fa < 0)) lo = m; else hi = m; }
-        const u = (lo + hi) / 2, p = pieceAt(pc, u);
-        if (u > 1e-9 && u < 1 - 1e-9) cuts.push({ k, u, p: { x: p.x, z: p.z }, t: Math.atan2(p.z - c.z, p.x - c.x) });
+        for (let it = 0; it < 40; it++) { const m = (lo + hi) / 2; if (df(pieceAt(pc, m)) < 0) lo = m; else hi = m; }
+        const um = (lo + hi) / 2, fm = at(um);
+        if (fm < 0) { root(ua, um, fa); root(um, ub, fm); }
       }
-      ua = ub; fa = fb;
+      ua = ub; pa = pb; fa = fb;
     }
   });
+  cuts.sort((a, b) => a.k - b.k || a.u - b.u);
   const poly = [];
-  for (const pc of loop) for (let j = 0; j < (pc.kind === 'arc' ? 16 : 1); j++) poly.push(pieceAt(pc, j / (pc.kind === 'arc' ? 16 : 1)));
+  const NP = (pc) => (pc.kind === 'arc' ? 64 : 1);   // fine: it decides which way each cut arc runs
+  for (const pc of loop) for (let j = 0; j < NP(pc); j++) poly.push(pieceAt(pc, j / NP(pc)));
   const inPoly = (p) => {
     let ins = false;
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -106,18 +123,27 @@ export function splitByCircle(loop, c, r) {
     return [{ loop, inside }];
   }
   const nC = cuts.length;
-  // Each boundary stretch from crossing s to s + 1 lies inside or outside; an inside stretch's two crossings are joined by the
-  // circle's arc inside the loop (partner), and every region walks stretch, arc, stretch...
+  // Each boundary stretch from crossing s to s + 1 lies inside or outside the circle. The circle's arcs inside the loop join
+  // crossings that are NEIGHBORS AROUND THE CIRCLE (sorted by angle, every other interval lies inside the loop), and every region
+  // walks stretch, arc, stretch... Joining the two ends of each inside stretch instead is only right for a convex loop: a patch
+  // cut by a shoreline is not, and a circle crossing it 4 times came out with arcs the long way round (a pool spilling over water).
   const insideOf = (s) => { const A = cuts[s], B = cuts[(s + 1) % nC]; const u = A.k === B.k && B.u > A.u ? (A.u + B.u) / 2 : (A.u + 1) / 2; return f(pieceAt(loop[A.k], u)) < 0; };
-  const partner = new Array(nC);
-  for (let s = 0; s < nC; s++) if (insideOf(s)) { partner[s] = (s + 1) % nC; partner[(s + 1) % nC] = s; }
-  if (partner.some((x) => x === undefined)) return [{ loop, inside: f(pieceAt(loop[0], 0.5)) < 0 }];
   const TAU = 2 * Math.PI, mod = (t) => ((t % TAU) + TAU) % TAU;
-  const arcPiece = (A, B) => {   // the circle from crossing A to B, the way that runs inside the loop
-    const d = mod(B.t - A.t), tm1 = A.t + d / 2;
-    const mid = { x: c.x + r * Math.cos(tm1), z: c.z + r * Math.sin(tm1) };
-    const t1 = inPoly(mid) ? A.t + d : A.t - (TAU - d);
-    return { kind: 'arc', c, U: { x: r, z: 0 }, V: { x: 0, z: r }, t0: A.t, t1, edge: 'lamp' };
+  const partner = new Array(nC).fill(undefined);   // filled: some() skips the holes of a sparse array
+  const sweep = new Array(nC).fill(0);   // the signed angle of the inside arc from each crossing to its partner
+  const byT = [...cuts.keys()].sort((i, j) => mod(cuts[i].t) - mod(cuts[j].t));
+  for (let i = 0; i < nC; i++) {
+    const a = byT[i], b = byT[(i + 1) % nC], d = mod(cuts[b].t - cuts[a].t), tm = cuts[a].t + d / 2;
+    if (inPoly({ x: c.x + r * Math.cos(tm), z: c.z + r * Math.sin(tm) })) {
+      if (partner[a] !== undefined || partner[b] !== undefined) { partner.fill(undefined); break; }   // inconsistent: give up below
+      partner[a] = b; partner[b] = a; sweep[a] = d; sweep[b] = -d;
+    }
+  }
+  if (partner.some((x) => x === undefined)) return [{ loop, inside: f(pieceAt(loop[0], 0.5)) < 0 }];
+  const arcPiece = (ia, ib) => {   // the circle from crossing ia to its partner ib, along the inside arc found above (its own
+    // midpoint test could pick the long way round: that arc's middle can lie inside a concave loop too)
+    const A = cuts[ia];
+    return { kind: 'arc', c, U: { x: r, z: 0 }, V: { x: 0, z: r }, t0: A.t, t1: A.t + sweep[ia], edge: 'lamp' };
   };
   const sub = (pc, u0, u1) => {   // a piece's stretch from u0 to u1
     if (pc.kind === 'line') {
@@ -144,7 +170,7 @@ export function splitByCircle(loop, c, r) {
       const e = (s + 1) % nC;
       pieces.push(...walk(s, e));
       const p = partner[e];
-      pieces.push(arcPiece(cuts[e], cuts[p]));
+      pieces.push(arcPiece(e, p));
       s = p;
     } while (s !== s0 && ++guard <= nC);
     parts.push({ loop: pieces, inside });

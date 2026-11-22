@@ -5,15 +5,30 @@ import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from 
 import { render } from './meshes/render.js';
 import { renderShells } from './shells/shellRender.js';
 import { shells } from './shells/shell.js';
-import { grass, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion } from './illusion/illusionRender.js';
+import { grass, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion, buildIllusionFrame, drawIllusionOverlay, walkGround } from './illusion/illusionRender.js';
+import { bestBackend } from './gpu/backend.js';
 import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
 import { light, setSun } from './illusion/light.js';
 
 const canvas = document.getElementById('game');
-// The illusion scenes paint their whole background every frame, so their canvas is opaque (alpha: false): the browser then
-// composites it without blending it over the page.
-const illusionAtLoad = !['shells', 'basic', 'full'].includes(new URLSearchParams(location.search).get('scene'));
-const ctx = canvas.getContext('2d', illusionAtLoad ? { alpha: false } : undefined);
+// BACKENDS (illusion scenes, src/gpu/backend.js): WebGPU, WebGL2 or Canvas 2D, the best the browser runs unless ?backend= names
+// one. A GPU backend draws on its own canvas under #game, which then only holds the overlay (Debug view, the ground edit's aim)
+// on a transparent background; with Strokes on (no GPU path yet) the frame is drawn in Canvas 2D on #game.
+const params = new URLSearchParams(location.search);
+const illusionAtLoad = !['shells', 'basic', 'full'].includes(params.get('scene'));
+const wantedBackend = params.get('backend');
+let gpu = null, gpuCanvas = null;
+if (illusionAtLoad && wantedBackend !== 'canvas') {
+  gpuCanvas = document.createElement('canvas');
+  gpuCanvas.style.cssText = 'position:fixed; left:0; top:0; z-index:0; display:block;';
+  canvas.before(gpuCanvas);
+  canvas.style.position = 'relative'; canvas.style.zIndex = '1';
+  gpu = await bestBackend(gpuCanvas, wantedBackend);
+  if (!gpu || gpu.name === 'canvas') { gpuCanvas.remove(); gpuCanvas = null; gpu = null; }
+}
+// The illusion scenes paint their whole background every frame, so on its own their canvas is opaque (alpha: false): the browser
+// then composites it without blending it over the page. Over a GPU canvas it is a transparent overlay.
+const ctx = canvas.getContext('2d', illusionAtLoad && !gpu ? { alpha: false } : undefined);
 
 // Canvas pixels per CSS pixel. The illusion world's Quality (panel) sets it; Auto lowers it while frames are slow and raises it
 // back when they are fast (the shapes are vectors, so a lower resolution only softens their edges).
@@ -24,6 +39,10 @@ function resizeCanvas() {
   canvas.style.width = window.innerWidth + 'px';
   canvas.style.height = window.innerHeight + 'px';
   canvas.style.display = 'block';
+  if (gpuCanvas) {
+    gpuCanvas.width = canvas.width; gpuCanvas.height = canvas.height;
+    gpuCanvas.style.width = canvas.style.width; gpuCanvas.style.height = canvas.style.height;
+  }
 }
 resizeCanvas();
 // Resizing clears the canvas; redraw so a paused view doesn't stay blank.
@@ -121,12 +140,79 @@ let darkMode = false;
 // The illusion scene flies (flyCamera.js) instead of orbiting.
 if (illusionScene) enableFly(canvas, () => { pendingDraw = true; });
 if (worldScene) fly.speed = 600;
+if (meadowScene) fly.ground = walkGround;   // Enter: walk on it
 let pendingDraw = true;
 
 let worldTime = 0, lastStats = null;
 function drawFrame() {
-  if (illusionScene) { lastStats = renderIllusion(ctx, canvas, { darkMode, time: worldTime }); return; }
-  (shellScene ? renderShells : render)(ctx, canvas, { darkMode });
+  const t0 = performance.now();
+  if (illusionScene && gpu && !strokes.on) {
+    const F = buildIllusionFrame(canvas, { darkMode, time: worldTime });
+    lastStats = gpu.render(F, { darkMode });
+    drawIllusionOverlay(ctx, canvas, F);
+    gpuCanvas.style.visibility = 'visible';
+  } else if (illusionScene) {
+    lastStats = renderIllusion(ctx, canvas, { darkMode, time: worldTime });
+    if (gpuCanvas) gpuCanvas.style.visibility = 'hidden';
+  }
+  else (shellScene ? renderShells : render)(ctx, canvas, { darkMode });
+  tracker.work.push(performance.now() - t0);
+  if (tracker.work.length > 30) tracker.work.shift();
+}
+
+// FRAME TRACKER (top right) and FPS CAP. Capped at CAP_FPS (the target: every other refresh of a 60 Hz screen), the button
+// uncaps it (one frame per screen refresh). The scheduler keeps the average at the cap on any refresh rate: a frame is drawn
+// when the time since the last one's due time has come (less a 3 ms margin for the refresh's jitter), and the next is due one
+// interval after that one (or after now, once behind). Shown, over the last second: the mean time between drawn frames and its
+// fps, the slowest frame (spikes), and the JS of drawing a frame (build + canvas calls; the browser rasterizes outside it).
+const CAP_FPS = 30;
+const tracker = { capped: true, nextDue: 0, frames: [], work: [] };   // frames: [timestamp, interval]; work: the last 30 frames' JS
+function frameDue(ts) {
+  if (!tracker.capped) return true;
+  const iv = 1000 / CAP_FPS;
+  if (ts < tracker.nextDue - 3) return false;
+  tracker.nextDue = ts - tracker.nextDue > iv ? ts + iv : tracker.nextDue + iv;
+  return true;
+}
+let lastDrawnTs = 0;
+function trackFrame(ts) {
+  if (lastDrawnTs && ts - lastDrawnTs < 250) tracker.frames.push([ts, ts - lastDrawnTs]);   // (a gap after idling is not a frame time)
+  lastDrawnTs = ts;
+}
+{
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed; top:16px; right:16px; z-index:11; font:12px monospace; color:#fff; background:rgba(51,51,51,0.85);' +
+    'padding:6px 10px; border-radius:6px; display:flex; align-items:center; gap:10px; white-space:pre; line-height:1.4;';
+  const text = document.createElement('div');
+  const btn = document.createElement('button');
+  btn.style.cssText = 'color:#fff; border:none; border-radius:4px; padding:4px 8px; cursor:pointer; font:12px sans-serif;';
+  const label = () => { btn.textContent = tracker.capped ? `Cap ${CAP_FPS}: on` : 'Uncapped'; btn.style.background = tracker.capped ? '#1b5e20' : '#8e2424'; };
+  label();
+  btn.addEventListener('click', () => { tracker.capped = !tracker.capped; tracker.nextDue = 0; frameTimes.length = 0; label(); btn.blur(); });
+  // the backend (illusion scenes): switching reloads the page with ?backend= (a canvas holds one kind of context)
+  if (illusionScene) {
+    const sel = document.createElement('select');
+    sel.style.cssText = 'font:12px sans-serif; background:#222; color:#fff; border:1px solid #555; border-radius:4px; padding:2px;';
+    const current = gpu && !strokes.on ? gpu.name : 'canvas';
+    for (const [v, t] of [['webgl2', 'WebGL2'], ['webgpu', 'WebGPU'], ['canvas', 'Canvas 2D']]) {
+      const op = document.createElement('option'); op.value = v; op.textContent = t; op.selected = v === current; sel.append(op);
+    }
+    sel.addEventListener('change', () => { const q = new URLSearchParams(location.search); q.set('backend', sel.value); location.search = q.toString(); });
+    box.append(text, sel, btn);
+  } else box.append(text, btn);
+  document.body.append(box);
+  setInterval(() => {   // 4 times a second (each rewrite is a page layout)
+    const now = performance.now();
+    while (tracker.frames.length && now - tracker.frames[0][0] > 1000) tracker.frames.shift();
+    const w = tracker.work, f = tracker.frames;
+    if (!f.length) { text.textContent = 'idle (nothing moving)'; return; }
+    const avg = f.reduce((a, x) => a + x[1], 0) / f.length, worst = Math.max(...f.map((x) => x[1]));
+    const js = w.length ? w.reduce((a, b) => a + b, 0) / w.length : 0;
+    const be = illusionScene ? (gpu && !strokes.on ? gpu.name + (gpu.samples ? ` ${gpu.samples}x` : '') : 'canvas') : 'canvas';
+    text.textContent = `${avg.toFixed(1).padStart(5)} ms  ${(1000 / avg).toFixed(0).padStart(3)} fps  ${be}
+` +
+      `worst ${worst.toFixed(1).padStart(5)} ms  JS ${js.toFixed(1)} ms`;
+  }, 250);
 }
 
 // The world's panel (top right): sliders for the number of shapes, and the last frames' stats. "frame" is the time between
@@ -192,10 +278,16 @@ function adaptQuality(now) {
   if (quality !== 'auto' || now - lastAdapt < 1000 || frameTimes.length < 20) return;
   lastAdapt = now;
   const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
-  if (avg > 1000 / 45 && renderScale > 0.5) {
+  // Against the target: uncapped 45 / 55 fps as before; capped, slow when frames miss the cap (under 0.8 of it), fast only when
+  // the cap is held and drawing's JS takes under 40% of the interval (the cap hides how much faster it could go).
+  const target = tracker.capped ? CAP_FPS : 60;
+  const js = tracker.work.length ? tracker.work.reduce((a, b) => a + b, 0) / tracker.work.length : 0;
+  const slow = tracker.capped ? avg > 1000 / (0.8 * CAP_FPS) : avg > 1000 / 45;
+  const fast = tracker.capped ? avg < 1000 / (0.95 * target) && js < 0.4 * 1000 / target : avg < 1000 / 55;
+  if (slow && renderScale > 0.5) {
     if (now - lastRise < 5000) noRiseUntil = now + 10000;
     setRenderScale(Math.max(0.5, renderScale - 0.125));
-  } else if (avg < 1000 / 55 && renderScale < 1 && now > noRiseUntil) {
+  } else if (fast && renderScale < 1 && now > noRiseUntil) {
     lastRise = now;
     setRenderScale(Math.min(1, renderScale + 0.125));
   }
@@ -290,8 +382,14 @@ if (illusionScene) {
     label();
     b.addEventListener('click', () => { grass.on = !grass.on; label(); b.blur(); pendingDraw = true; });
     box.append(b);
+    const tb = document.createElement('button');   // the blades' style: shaded tips only (a texture) or whole leaves
+    const tLabel = () => { tb.textContent = grass.tips ? 'Grass: tips' : 'Grass: leaves'; tb.style.background = grass.tips ? '#1b5e20' : '#333'; };
+    tb.style.cssText = b.style.cssText;
+    tLabel();
+    tb.addEventListener('click', () => { grass.tips = !grass.tips; tLabel(); tb.blur(); pendingDraw = true; });
+    box.append(tb);
     const hint = document.createElement('div');
-    hint.textContent = 'E: dig   R: place a cube (at the cross)';
+    hint.textContent = 'E: dig   R: place a cube (at the cross)   Enter: walk / fly';
     hint.style.cssText = 'font-size:12px; opacity:0.8; margin-top:2px;';
     box.append(hint);
     const reset = document.createElement('button');
@@ -367,6 +465,7 @@ if (angleSlider && !illusionScene) {
 
 let lastTime = 0, lastTime0 = 0;
 function loop(timestamp) {
+  if (!frameDue(timestamp)) { requestAnimationFrame(loop); return; }   // capped: not this refresh (dt then spans the skipped ones)
   if (illusionScene) {
     const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
     lastTime = timestamp;
@@ -377,15 +476,15 @@ function loop(timestamp) {
       pendingDraw = false;
       if (lastTime0) { frameTimes.push(timestamp - lastTime0); if (frameTimes.length > 30) frameTimes.shift(); }
       lastTime0 = timestamp;
-      drawFrame();
+      drawFrame(); trackFrame(timestamp);
       adaptQuality(timestamp);
       if (uiDue(timestamp)) { syncAngleUi(); showStats(); }
-    } else if (updateFly(dt) || pendingDraw) { pendingDraw = false; drawFrame(); if (uiDue(timestamp)) syncAngleUi(); }
+    } else if (updateFly(dt) || pendingDraw) { pendingDraw = false; drawFrame(); trackFrame(timestamp); if (uiDue(timestamp)) syncAngleUi(); }
   } else if (!paused) {
     const dt = (timestamp - lastTime) / 1000;
     lastTime = timestamp;
     camera.orbitAngle += dt * 0.4;
-    drawFrame();
+    drawFrame(); trackFrame(timestamp);
     syncAngleUi();
   } else {
     lastTime = timestamp;

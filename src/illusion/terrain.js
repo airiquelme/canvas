@@ -128,7 +128,9 @@ export function buildTerrain({ grid, H, colorOf, minErr = 0, colorK = 0.5, parts
     [...anc].sort((p, q) => q.depth - p.depth).forEach((a) => { a.uniform = uniformOf(a); });
     const order = [...ms].sort((p, q) => diamonds.get(q)[0].depth - diamonds.get(p)[0].depth);
     for (const mi of order) diamondErr(mi);
-    for (const node of touched) if (!node.allKids || node.kids === null) node.gen = null;   // grass regrows on the new ground (same seeds)
+    // grass regrows on the new ground (same seeds): every touched node, not only today's leaves (the cut below can make a node a
+    // leaf again whose blades were grown on the old ground: buried under a placed cube, floating over a dug one)
+    for (const node of touched) node.gen = null;
     finish();
   };
   T.refresh(null);

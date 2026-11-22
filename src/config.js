@@ -1,4 +1,8 @@
 export const DESIGN_WIDTH = 1000, DESIGN_HEIGHT = 800;
+// The STANDARD LINE: the stylized strokes that have a width on screen instead of a real thickness (grass tips; later scratches and
+// such), in design px: the design space is fitted to the window, so it is the same share of the view on any screen, window or
+// render resolution (3 = about 4 px on a 1080p screen, 8 px at 4K; canvas px would grow on screen when Auto quality lowers it).
+export const LINE_PX = 3;
 
 // Debug views, all switched together by the Debug button (main.js). `on` is
 // the live state; the others pick which views it turns on:

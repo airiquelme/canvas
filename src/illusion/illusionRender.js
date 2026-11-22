@@ -5,7 +5,7 @@
 import { debug, strokes, DESIGN_WIDTH, DESIGN_HEIGHT } from '../config.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from '../core/camera.js';
 import { applyDesignSpaceTransform } from '../core/canvas.js';
-import { drawShape, tracePath, traceSide, sideStart } from './shape.js';
+import { drawShape, tracePath, traceSide, sideStart, pointOnEllipse } from './shape.js';
 import { capsuleSides } from './capsule.js';
 import { curvedSides, curveChainSides } from './curve.js';
 import { buildWorld } from './world.js';
@@ -13,9 +13,9 @@ import { buildMeadow } from './meadow.js';
 import { relSize, boundPoints, boundRadius, buildBVH, makeFrustum, sphereBox, makeMask, maskHides, maskAddCapsule, maskAddTube, maskAddConvex, Heap } from './cull.js';
 import { sheetPieces, panelPolygon, backOf } from './sheet.js';
 import { quadPieces, quadConvex } from './quad.js';
-import { patchPieces, ringPatch } from './patch.js';
+import { patchPieces, ringPatch, heightAt } from './patch.js';
 import { selectTerrain } from './terrain.js';
-import { light, shadeOf, brightOf, shadeOverlay } from './light.js';
+import { light, shadeOf, brightOf, litOf, shadeOverlay } from './light.js';
 import { capsuleShadow } from './groundShadow.js';
 import { selectGrass, bladePieces } from './grass.js';
 import { drawSky } from './sky.js';
@@ -84,6 +84,7 @@ export function buildMeadowScene(opts = {}) {
   terrain = m.terrain;
   groundEdit = m.edit;
   groundGrid = m.grid;
+  groundFn = m.groundAt;
   sky.on = true; sky.sunDisc = true;
   objects.push(...m.movers, ...m.poles);
   tree = null;
@@ -138,6 +139,11 @@ const CURVE_EXACT_PX = 160, CURVE_MARGIN_PX = 10;
 // An exact curved outline is kept (o.exactRef) until one of the object's bounding points, or the radius there, has moved this
 // far on screen (canvas px) since it was built: an approximation, off by at most that much, rebuilt at once past it.
 const REUSE_PX = 0.5;
+// GROUND REUSE: a fully front-facing patch's screen shape is redrawn as its last built one under the affine map that carries its
+// three corners to where they are now, while 4 check points of the surface (its edges' middles, its middle) land within
+// PATCH_REUSE_PX canvas px of their true projections (a sliver between neighbors would show the ground
+// underlay, not the sky); else it is rebuilt (and becomes the new reference).
+const PATCH_REUSE_PX = 0.25;
 
 // A sheet shrunk toward its center by g (while it fades out): a panel's or disc's half-axes, a ribbon's width.
 function shrunkSheet(o, g) {
@@ -151,7 +157,10 @@ let tree = null, skipped = 0, frameNo = 0;
 // The scene's terrain (terrain.js), or null: its patches are picked per frame, at the coarsest level within TERRAIN_TOL_PX.
 let terrain = null;
 // The meadow's ground edit (meadow.js edit: dig / place a cube of the grid at the screen's center), or null.
-let groundEdit = null, groundGrid = null;
+let groundEdit = null, groundGrid = null, groundFn = null;
+// The meadow's walkable ground for the walk mode (flyCamera.js): the drawn ground's height at x, z (land or water, edits included)
+// and the grid's cube size, or null outside the meadow.
+export const walkGround = () => (groundEdit && groundFn ? { height: groundFn, cube: groundGrid.cube } : null);
 // The ground's edits ([["i,j,k", solid], ...], grid.js), for saving.
 export const groundEdits = () => (groundGrid ? groundGrid.edits() : []);
 export function editGround(action) {
@@ -164,18 +173,20 @@ export function editGround(action) {
 const sky = { on: false, sunDisc: false };
 export const sceneTerrain = () => terrain;   // for tools
 // Grass on the terrain (grass.js); the Grass button.
-export const grass = { on: true };
+export const grass = { on: true, tips: true };   // tips: only the blades' shaded tips (a texture), grass.js
 const TERRAIN_TOL_PX = 0.5;   // canvas px
 
 
-// Draws one frame at time t (seconds, for the movers); returns its stats.
-export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {}) {
+// Draws one frame at time t (seconds, for the movers) with Canvas 2D; returns its stats.
+export function renderIllusion(ctx, canvas, opts = {}) {
+  return drawIllusion2D(ctx, canvas, buildIllusionFrame(canvas, opts));
+}
+
+// THE FRAME: everything but the drawing, the same for every backend (Canvas 2D here, the GPU backends in src/gpu/): the shapes in
+// draw order (back to front, each with its `pieces`), the movers' shadows (each drawn right after shape `last`), the sky's terms
+// and the stats. Canvas size only matters through `fit` / `view`.
+export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) {
   const t0 = performance.now();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = darkMode ? '#000000' : '#ffffff';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.save();
-  applyDesignSpaceTransform(ctx, canvas);
   // The visible part of the design space (the canvas may be wider or taller than its aspect).
   const fit = Math.min(canvas.width / DESIGN_WIDTH, canvas.height / DESIGN_HEIGHT);
   const hw = canvas.width / 2 / fit, hh = canvas.height / 2 / fit;
@@ -185,11 +196,10 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
 
   const camPos = getCameraPosition(), basis = computeViewBasis(camPos, camera.target);
   const projector = makeProjector(camPos, basis), { projectPoint } = projector;
-  const depthOf = (p) => worldToCamera(p, camPos, basis).z;
-  if (sky.on && !darkMode) drawSky(ctx, view, { projectPoint, camPos, forward: basis.forward, light, sunDisc: sky.sunDisc });
+  const depthOf = (p) => projector.toCamera(p).z;
 
   const stats = { objects: objects.length, skipped, drawn: 0, curved: 0, culled: 0, behind: 0, tiny: 0, occluded: 0, nodesSkipped: 0, simplified: 0, reused: 0, kept: 0, sheets: 0, seams: 0, flat: 0, shadows: 0, blades: 0, fullBlades: 0, specks: 0,
-    buildMs: 0, drawMs: 0, curvedMs: 0 };
+    buildMs: 0, drawMs: 0, curvedMs: 0, reusedGround: 0, backGround: 0, fills: 0 };
   if (!tree) {   // static objects in a tree, built once per scene
     tree = { root: buildBVH(objects.filter((o) => !o.move)), movers: objects.filter((o) => o.move) };
   }
@@ -269,7 +279,7 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     for (const o of sel) pushObject(o);
     if (grass.on && terrain.leafNodes) {   // blades from the patches' seeds (grass.js), near the eye only
       frameBlades = selectGrass(terrain, camPos, { F: light.on ? terrain.F : null, L: light.on ? light.dir : null,
-        toCamera: projector.toCamera, projectPoint, persp, frustum, near: NEAR, fit });
+        toCamera: projector.toCamera, projectPoint, persp, frustum, near: NEAR, fit, tips: grass.tips });
       stats.grass = frameBlades.curved.length; stats.specks = frameBlades.triangles;
     }
   }
@@ -304,7 +314,7 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
   // Far blades: each patch's shade triangles as one shape (grass.js), drawn after the patch.
   const grassShade = (fill, p) => { const lf = lamps.length ? lampAt(p) : null; return lf ? lampTone(fill, shadeOf(fill), lf) : shadeOf(fill); };
   if (frameBlades) for (const g of frameBlades.specks) shapes.push({ o: g, size: 1, proj: [], depth: g.depth, prebuilt: true,
-    pieces: [{ sides: g.sides, fill: grassShade(g.host.patch.fill, g.host.patch.mid), colors: SIDE_COLORS }] });
+    pieces: [{ sides: g.sides, fill: grassShade(g.host.patch.fill, g.host.patch.mid), alpha: g.alpha, colors: SIDE_COLORS }] });
   if (frameBlades) for (const b of frameBlades.curved) {
     const z = depthOf(b.mid);
     if (z <= NEAR) continue;
@@ -323,25 +333,37 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
   // Objects standing on the terrain (`onGround`: movers, poles) are drawn after the ground patch under their base, as blades are
   // (a big patch's mean depth can be nearer than an object on it): their key at most that patch's.
   if (terrain) {
-    const ground = shapes.filter((s) => s.o.kind === 'patch' && s.o.loop.length === 3 && s.o.loop.every((pc) => pc.kind === 'line'));
-    const inTri = (o, x, z) => {
-      const [a, b, c] = o.loop.map((pc) => ({ x: pc.a.x + o.ox, z: pc.a.z + o.oz }));
-      const sg = (p, q) => (q.x - p.x) * (z - p.z) - (q.z - p.z) * (x - p.x);
-      const d1 = sg(a, b), d2 = sg(b, c), d3 = sg(c, a);
-      return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
-    };
+    // the drawn triangles' corners (world x, z), gathered once only if something stands on the ground
+    let tri = null, tn = 0, tS = null;
+    const sg = (ax, az, bx, bz, x, z) => (bx - ax) * (z - az) - (bz - az) * (x - ax);
     for (const s of shapes) if (s.o.onGround) {
+      if (!tri) {
+        tri = new Float64Array(shapes.length * 6); tS = [];
+        for (const g of shapes) {
+          const o = g.o;
+          if (o.kind !== 'patch' || o.loop.length !== 3 || o.loop.some((pc) => pc.kind !== 'line')) continue;
+          for (let k = 0; k < 3; k++) { tri[6 * tn + 2 * k] = o.loop[k].a.x + o.ox; tri[6 * tn + 2 * k + 1] = o.loop[k].a.z + o.oz; }
+          tS.push(g); tn++;
+        }
+      }
       const pts = boundPoints(s.o);
       let low = pts[0];
       for (const p of pts) if (p.y < low.y) low = p;
-      for (const g of ground) if (inTri(g.o, low.x, low.z)) { s.depth = Math.min(s.depth, g.depth - 1e-6); break; }
+      const x = low.x, z = low.z;
+      for (let k = 0; k < tn; k++) {
+        const j = 6 * k;
+        const d1 = sg(tri[j], tri[j + 1], tri[j + 2], tri[j + 3], x, z), d2 = sg(tri[j + 2], tri[j + 3], tri[j + 4], tri[j + 5], x, z);
+        const d3 = sg(tri[j + 4], tri[j + 5], tri[j], tri[j + 1], x, z);
+        if ((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0)) continue;
+        s.depth = Math.min(s.depth, tS[k].depth - 1e-6); break;
+      }
     }
   }
   shapes.sort((p, q) => q.depth - p.depth);
 
   // A static object keeps its pieces while the camera (and the canvas) stays put.
   const camKey = [camPos.x, camPos.y, camPos.z, camera.target.x, camera.target.y, camera.target.z, camera.zoom, camera.fov,
-    camera.orbitRadius, canvas.width, canvas.height].join(',');
+    camera.orbitRadius, canvas.width, canvas.height, light.on, light.version].join(',');
   const tol = REUSE_PX / fit;   // design px
   const near = (ref, s) => ref.proj.length === s.proj.length && ref.proj.every((p, i) => {
     const q = s.proj[i];
@@ -371,21 +393,85 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     const cos = -(L.x * vx + L.y * vy + L.z * vz) / vl, sh = px * (1 - cos);
     const br = o.shade.bright === false ? 0 : 0.3 * px * Math.min(1, dl / (px || 1));
     for (const p of pieces) {
-      p.crescents = [{ dx: dx * sh, dy: dy * sh, color: shadeTone(p.fill) }];
-      if (br > 0.05) p.crescents.push({ dx: -dx * br, dy: -dy * br, color: brightOf(p.fill) });
+      p.crescents = [{ dx: dx * sh, dy: dy * sh, color: shadeTone(p.base ?? p.fill) }];
+      if (br > 0.05) p.crescents.push({ dx: -dx * br, dy: -dy * br, color: brightOf(p.base ?? p.fill) });
     }
   };
   // Pieces: the shapes an object is drawn as, farthest first (one, except a sheet's faces). `keep`: kept for later frames, so
   // its path is recorded once (shape.js).
-  const one = (o, sides) => (sides.length ? [{ sides, fill: o.fill, colors: SIDE_COLORS, keep: !o.move }] : []);
+  const one = (o, sides) => (sides.length ? [{ sides, fill: litOf(o.fill), base: o.fill, colors: SIDE_COLORS, keep: !o.move }] : []);
+  // Ground reuse (PATCH_REUSE_PX): the patch's 7 control points (3 corners, then the check points), world, cached on it.
+  const reuseOn = !debug.on && !strokes.on && typeof Path2D !== 'undefined', ptol = PATCH_REUSE_PX / fit;
+  const lightKey = light.on + ':' + light.version;
+  const ctrlOf = (o) => {
+    if (o.ctrl !== undefined) return o.ctrl;
+    if (o.loop.length !== 3 || o.loop.some((pc) => pc.kind !== 'line')) return (o.ctrl = null);
+    const L = (x, z) => ({ x: o.ox + x, y: o.oy + heightAt(o.q, x, z), z: o.oz + z, lx: x, lz: z });
+    const c = o.loop.map((pc) => pc.a);
+    return (o.ctrl = [L(c[0].x, c[0].z), L(c[1].x, c[1].z), L(c[2].x, c[2].z),
+      L((c[0].x + c[1].x) / 2, (c[0].z + c[1].z) / 2), L((c[1].x + c[2].x) / 2, (c[1].z + c[2].z) / 2),
+      L((c[2].x + c[0].x) / 2, (c[2].z + c[0].z) / 2), L((c[0].x + c[1].x + c[2].x) / 3, (c[0].z + c[1].z + c[2].z) / 3)]);
+  };
+  // The exact range over a triangle patch of g (patch.js: > 0 where its top faces the eye), a quadratic in x, z: its extremes
+  // are at the corners, at each edge's own extreme (a parabola along it) or at its stationary point inside. [min, max].
+  const gRange = (o, W) => {
+    if (o.gFrame === frameNo) return o.gR;
+    o.gFrame = frameNo;
+    return (o.gR = gRangeOf(o, W));
+  };
+  const gRangeOf = (o, W) => {
+    const [A, B, C, D, E, F] = o.q, ex = camPos.x - o.ox, ey = camPos.y - o.oy, ez = camPos.z - o.oz;
+    const G3 = -(2 * A * ex + B * ez), G4 = -(B * ex + 2 * C * ez), G5 = ey - F - D * ex - E * ez;
+    const g = (x, z) => A * x * x + B * x * z + C * z * z + G3 * x + G4 * z + G5;
+    let lo = Infinity, hi = -Infinity;
+    const see = (v) => { if (v < lo) lo = v; if (v > hi) hi = v; };
+    for (let k = 0; k < 3; k++) {
+      const p = W[k], q = W[(k + 1) % 3], dx = q.lx - p.lx, dz = q.lz - p.lz;
+      see(g(p.lx, p.lz));
+      const a2 = A * dx * dx + B * dx * dz + C * dz * dz;   // g(p + t d) = a2 t^2 + a1 t + g(p)
+      if (Math.abs(a2) > 1e-12) {
+        const a1 = 2 * A * p.lx * dx + B * (p.lx * dz + p.lz * dx) + 2 * C * p.lz * dz + G3 * dx + G4 * dz, t = -a1 / (2 * a2);
+        if (t > 0 && t < 1) see(g(p.lx + t * dx, p.lz + t * dz));
+      }
+    }
+    const det = 4 * A * C - B * B;   // inside: 2A x + B z + G3 = 0, B x + 2C z + G4 = 0
+    if (Math.abs(det) > 1e-12) {
+      const x = (B * G4 - 2 * C * G3) / det, z = (B * G3 - 2 * A * G4) / det;
+      const s1 = (W[1].lx - W[0].lx) * (z - W[0].lz) - (W[1].lz - W[0].lz) * (x - W[0].lx);
+      const s2 = (W[2].lx - W[1].lx) * (z - W[1].lz) - (W[2].lz - W[1].lz) * (x - W[1].lx);
+      const s3 = (W[0].lx - W[2].lx) * (z - W[2].lz) - (W[0].lz - W[2].lz) * (x - W[2].lx);
+      if ((s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0)) see(g(x, z));
+    }
+    return [lo, hi];
+  };
+  const frontAll = (o) => gRange(o, o.ctrl)[0] > 0;   // its top seen everywhere (no contour across it)
+  // The reused pieces (each { M, ref }) or null.
+  const reusePatch = (o, s, W, Q) => {
+    const R = o.ref;
+    if (!R || R.parts !== o.parts || R.light !== lightKey) return null;
+    const P = R.Q;
+    // affine M with M(P_k) = Q_k, k = 0..2
+    const ux = P[1].x - P[0].x, uy = P[1].y - P[0].y, vx = P[2].x - P[0].x, vy = P[2].y - P[0].y, det = ux * vy - uy * vx;
+    if (!(Math.abs(det) > 1e-6)) return null;
+    const qx1 = Q[1].x - Q[0].x, qy1 = Q[1].y - Q[0].y, qx2 = Q[2].x - Q[0].x, qy2 = Q[2].y - Q[0].y;
+    const a = (qx1 * vy - qx2 * uy) / det, c = (qx2 * ux - qx1 * vx) / det, b = (qy1 * vy - qy2 * uy) / det, d = (qy2 * ux - qy1 * vx) / det;
+    const e = Q[0].x - a * P[0].x - c * P[0].y, f = Q[0].y - b * P[0].x - d * P[0].y;
+    for (let k = 3; k < 7; k++) {
+      const x = a * P[k].x + c * P[k].y + e, y = b * P[k].x + d * P[k].y + f;
+      if (Math.abs(x - Q[k].x) > ptol || Math.abs(y - Q[k].y) > ptol) return null;
+    }
+    const M = { a, b, c, d, e, f };
+    return R.pieces.map((p) => ({ ref: p, M, fill: p.fill, sides: p.sides }));
+  };
   for (const s of shapes) {
     if (s.prebuilt) continue;   // far grass: built already
     if (s.blade) {   // grass: built after its ground patch (drawn before it), so whether that patch shows its crest is known
       const hs = s.hostS;
       if (hs && hs.pieces && hs.sil === undefined) hs.sil = hs.pieces.some((p) => p.sides.some((sd) => sd.ci === 4));
       // its lit face only where it can show: near the eye, or on the ground's outline
-      const full = s.o.dist < GRASS_FULL_D || !!(hs && hs.sil);
-      s.pieces = bladePieces(s.o, projector, grassShade(s.o.fill, s.o.mid), SIDE_COLORS, full).pieces;
+      const full = !grass.tips && (s.o.dist < GRASS_FULL_D || !!(hs && hs.sil));
+      s.pieces = bladePieces(s.o, projector, grassShade(s.o.ground ?? s.o.fill, s.o.mid), SIDE_COLORS, full, grass.tips).pieces;
+      if (grass.tips && s.o.alpha < 1) for (const p of s.pieces) p.alpha = s.o.alpha;   // fading: translucent
       if (s.pieces.length) { stats.blades++; if (full) stats.fullBlades++; }
       continue;
     }
@@ -400,7 +486,10 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     const g = s.grow ?? 1, fading = g < 1;
     const sh = fading && o.kind && o.kind !== 'quad' && o.kind !== 'patch' ? shrunkSheet(o, g) : o;
     if (!o.move && !s.nearCut && !fading && o.cache && o.cache.key === camKey) { pieces = o.cache.pieces; stats.reused++; }
-    else if (o.kind === 'quad') pieces = quadPieces(s.proj).map((p) => ({ sides: p.sides, fill: o.fill, colors: SIDE_COLORS, keep: !o.move }));
+    else if (o.kind === 'quad') pieces = quadPieces(s.proj).map((p) => ({ sides: p.sides, fill: litOf(o.fill), base: o.fill, colors: SIDE_COLORS, keep: !o.move }));
+    else if (o.kind === 'patch' && !s.nearCut && o.oneSided !== false && ctrlOf(o) && gRange(o, o.ctrl)[1] <= 0) { pieces = []; stats.backGround++; }   // seen from below only
+    else if (o.kind === 'patch' && reuseOn && !s.nearCut && ctrlOf(o) && frontAll(o) &&
+      (pieces = reusePatch(o, s, o.ctrl, o.ctrl.map(projectPoint)))) stats.reusedGround++;
     else if (o.kind === 'patch') {   // its lit / shade parts (shadow.js) in their tones, lit first, else the whole patch
       pieces = [];
       for (const part of o.parts || [{ loop: o.loop, shade: false }]) {
@@ -409,14 +498,18 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
         for (const p of patchPieces(o, projector, camPos, s.nearCut ? Infinity : pxScaleOf(s), loop)) {
           if (p.flat) stats.flat++;
           const base = part.fill || o.fill;   // a part's own color (water), else the patch's
-          const sh = part.shade && light.on ? (part.lamp ? lampTone(base, shadeOf(base), part.lamp) : shadeOf(base)) : base;
+          const sh = part.shade && light.on ? (part.lamp ? lampTone(base, shadeOf(base), part.lamp) : shadeOf(base)) : litOf(base);
           pieces.push({ sides: p.sides, fill: sh, colors: SIDE_COLORS, keep: !o.move });
         }
       }
+      // the reference for later frames: only a patch with no contour (wholly front-facing) and a whole view of it
+      o.ref = null;
+      if (reuseOn && !s.nearCut && ctrlOf(o) && frontAll(o) && !pieces.some((p) => p.sides.some((sd) => sd.ci === 4)))
+        o.ref = { Q: o.ctrl.map(projectPoint), pieces, parts: o.parts, light: lightKey };
     }
     else if (o.kind) {
       pieces = sheetPieces(sh, projector).sort((p, q) => q.depth - p.depth)
-        .map((p) => ({ sides: p.sides, fill: p.front ? o.fill : o.back, colors: SIDE_COLORS, keep: !o.move }));
+        .map((p) => ({ sides: p.sides, fill: litOf(p.front ? o.fill : o.back), base: p.front ? o.fill : o.back, colors: SIDE_COLORS, keep: !o.move }));
     } else if (curved && o.exact) {
       if (!fading && o.exactRef && near(o.exactRef, s)) { pieces = o.exactRef.pieces; stats.kept++; }
       else {
@@ -441,27 +534,79 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
   // those patches (one clip of all of them), as the shade overlay.
   const shadows = [];
   if (light.on && terrain && terrain.H) {
+    // the drawn ground patches' boxes, once (not one scan of every shape per mover)
+    let gi = null, gb = null, gn = 0;
     for (const o of tree.movers) if (!o.kind && o.shade) {
       const sh = capsuleShadow(o, terrain.H, light.dir, projector);
       if (!sh) continue;
+      if (!gi) {
+        gi = new Int32Array(shapes.length); gb = new Float64Array(shapes.length * 4);
+        shapes.forEach((s, i) => {
+          if (s.o.kind !== 'patch' || !s.pieces.length) return;
+          const b = s.o.bound;
+          gi[gn] = i; gb[4 * gn] = b[0].x; gb[4 * gn + 1] = b[7].x; gb[4 * gn + 2] = b[0].z; gb[4 * gn + 3] = b[7].z; gn++;
+        });
+      }
       let last = -1;
-      const hosts = [];
-      shapes.forEach((s, i) => {
-        if (s.o.kind !== 'patch' || !s.pieces.length) return;
-        const b = s.o.bound, x0 = b[0].x, x1 = b[7].x, z0 = b[0].z, z1 = b[7].z;
-        if (x1 < sh.box.x0 || x0 > sh.box.x1 || z1 < sh.box.z0 || z0 > sh.box.z1) return;
-        hosts.push(s); last = i;
-      });
+      const hosts = [], bx = sh.box;
+      for (let k = 0; k < gn; k++) {
+        if (gb[4 * k + 1] < bx.x0 || gb[4 * k] > bx.x1 || gb[4 * k + 3] < bx.z0 || gb[4 * k + 2] > bx.z1) continue;
+        hosts.push(shapes[gi[k]]); last = gi[k];
+      }
       if (last >= 0) shadows.push({ sh, hosts, last });
     }
   }
+  return { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo, projectPoint, camPos, forward: basis.forward,
+    sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit };
+}
+
+// Canvas 2D drawing of a frame (the reference backend).
+export function drawIllusion2D(ctx, canvas, F) {
+  const { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo } = F;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = darkMode ? '#000000' : '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  applyDesignSpaceTransform(ctx, canvas);
+  if (F.sky) drawSky(ctx, view, { projectPoint: F.projectPoint, camPos: F.camPos, forward: F.forward, light, sunDisc: F.sky.sunDisc });
   // No stacking: each shadow leaves out the shadows drawn before it this frame (one even-odd clip each), so the ground under two
   // overlapping shadows is darkened once, to the same shade tone.
+  // Reused ground pieces (`M`, `ref`): their reference path, recorded once, drawn / added under M.
+  // Every piece's path is recorded once per frame (a kept piece's, once for all) and shared by the underlay and the fill.
+  const pathOf = (p) => {
+    const r = p.ref || p;
+    if (!r.path) { const path = new Path2D(); tracePath(path, r); if (r.keep || p.ref) r.path = path; else return (r.framePath = path); }
+    return r.path;
+  };
+  const framePathOf = (p) => (p.ref || p.keep ? pathOf(p) : p.framePath || pathOf(p));
+  const traceInto = (path, p) => { if (p.M) path.addPath(pathOf(p), p.M); else path.addPath(framePathOf(p)); };
+  // BATCHES: consecutive GROUND pieces of one color with nothing drawn between them are filled as one path (the same pixels for an
+  // opaque color, minus the seam between them). Nonzero: only pieces wound the same way (positive area on screen) go in, else two
+  // overlapping pieces would cancel where they overlap.
+  const areaSign = (sides) => {
+    let a = 0, px = 0, py = 0, fx = 0, fy = 0, first = true;
+    const pt = (q) => { if (first) { fx = q.x; fy = q.y; first = false; } else a += px * q.y - q.x * py; px = q.x; py = q.y; };
+    for (const sd of sides) { if (sd.kind === 'line') pt(sd.from); else { pt(sideStart(sd)); pt(pointOnEllipse(sd.e, (sd.t0 + sd.t1) / 2)); } }
+    a += px * fy - fx * py;
+    return a;
+  };
+  const positive = (p) => {
+    const r = p.ref || p;
+    if (r.sgn === undefined) r.sgn = areaSign(r.sides) > 0;
+    return p.M ? r.sgn === (p.M.a * p.M.d - p.M.b * p.M.c > 0) : r.sgn;
+  };
+  let batch = null, batchFill = null;
+  const flush = () => { if (batch) { if (ctx.fillStyle !== batchFill) ctx.fillStyle = batchFill; ctx.fill(batch); batch = null; stats.fills++; } };
+  const batchPiece = (p) => {
+    if (batch && batchFill !== p.fill) flush();
+    if (!batch) { batch = new Path2D(); batchFill = p.fill; }
+    traceInto(batch, p);
+  };
   const shadowsDrawn = [];
   const drawShadow = ({ sh, hosts }) => {
     if (typeof Path2D === 'undefined') return;
     const clip = new Path2D();
-    for (const s of hosts) for (const p of s.pieces) if (p.fill === s.o.fill) tracePath(clip, p);
+    for (const s of hosts) for (const p of s.pieces) if (p.fill === litOf(s.o.fill)) traceInto(clip, p);
     ctx.save();
     ctx.clip(clip);
     for (const prev of shadowsDrawn) {
@@ -472,8 +617,8 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     }
     ctx.beginPath();
     tracePath(ctx, { sides: sh.sides });
-    ctx.fillStyle = shadeOverlay();
-    ctx.fill();
+    for (const pass of shadeOverlay()) { ctx.globalCompositeOperation = pass.op; ctx.fillStyle = pass.color; ctx.fill(); }
+    ctx.globalCompositeOperation = 'source-over';
     ctx.restore();
     shadowsDrawn.push(sh.sides);
     stats.shadows++;
@@ -488,7 +633,7 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     for (const s of shapes) if ((s.o.kind === 'patch' || s.o.kind === 'quad') && s.pieces) for (const p of s.pieces) {
       let path = under.get(p.fill);
       if (!path) under.set(p.fill, (path = new Path2D()));
-      tracePath(path, p);
+      traceInto(path, p);
     }
     for (const [fill, path] of under) { ctx.fillStyle = fill; ctx.fill(path); stats.seams++; }
   }
@@ -497,15 +642,34 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     const o = s.o;
     o.drawnFrame = frameNo;
     if (!s.pieces.length) continue;
-    for (const p of s.pieces) drawShape(ctx, p, { stroke: strokes.on });
+    const ground = o.kind === 'patch' || o.kind === 'quad';
+    for (const p of s.pieces) {
+      if ((p.M || (ground && !p.crescents && !strokes.on && typeof Path2D !== 'undefined')) && positive(p)) batchPiece(p);
+      else if (p.M) {   // a reused piece wound the other way: alone, under its map
+        flush(); ctx.save(); ctx.transform(p.M.a, p.M.b, p.M.c, p.M.d, p.M.e, p.M.f);
+        if (ctx.fillStyle !== p.fill) ctx.fillStyle = p.fill;
+        ctx.fill(pathOf(p)); ctx.restore(); stats.fills++;
+      } else if (p.alpha !== undefined && p.alpha < 1) {   // a fading piece (grass): translucent
+        flush(); ctx.globalAlpha = p.alpha; drawShape(ctx, p, { stroke: strokes.on }); ctx.globalAlpha = 1; stats.fills++;
+      } else { flush(); drawShape(ctx, p, { stroke: strokes.on }); stats.fills++; }
+    }
     stats.drawn++;
-    for (const sh of shadows) if (sh.last === si) drawShadow(sh);
+    for (const sh of shadows) if (sh.last === si) { flush(); drawShadow(sh); }
   }
+  flush();
   const t2 = performance.now();
   stats.buildMs = t1 - t0; stats.drawMs = t2 - t1;
   stats.frame = frameNo;
 
-  if (groundEdit) {   // the grid's aim (main.js: E digs, R places at the screen's center)
+  drawOverlay(ctx, F);
+  ctx.restore();
+  return stats;
+}
+
+// What is drawn over a frame in Canvas 2D whatever the backend (ctx in design space): the ground edit's aim, the Debug view.
+function drawOverlay(ctx, F) {
+  const { fit, view, darkMode, shapes } = F;
+  if (F.groundEdit) {   // the grid's aim (main.js: E digs, R places at the screen's center)
     const cx = (view.x0 + view.x1) / 2, cy = (view.y0 + view.y1) / 2, r = 7;
     ctx.lineCap = 'round';
     for (const [w, c] of [[3.5 / fit, 'rgba(0, 0, 0, 0.45)'], [1.5 / fit, 'rgba(255, 255, 255, 0.9)']]) {
@@ -520,7 +684,36 @@ export function renderIllusion(ctx, canvas, { darkMode = false, time = 0 } = {})
     for (const s of shapes) if (s.o.kind) for (const p of s.pieces) tracePath(ctx, p);
     ctx.stroke();
     for (const s of shapes) if (!s.o.kind) for (const q of s.proj) { ctx.beginPath(); ctx.arc(q.x, q.y, 2, 0, Math.PI * 2); ctx.fill(); }
+    // the BLOCK GRID (grid.js cubes, the player's scale) on the ground around the eye: the terrain's patches are no guide (flat ground
+    // is drawn with triangles many cubes wide)
+    const G = walkGround();
+    if (G) {
+      const c = G.cube, R = 10, e = F.camPos, i0 = Math.floor(e.x / c) - R, k0 = Math.floor(e.z / c) - R, step = c / 4;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)'; ctx.lineWidth = 1 / fit;
+      ctx.beginPath();
+      const run = (x0, z0, dx, dz) => {   // a grid line on the ground, broken where it passes behind the eye
+        let pen = false;
+        for (let t = 0; t <= 2 * R * c + 1e-9; t += step) {
+          const x = x0 + dx * t, z = z0 + dz * t, q = F.projectPoint({ x, y: G.height(x, z), z });
+          if (!(q.scale > 0) || q.scale > 50) { pen = false; continue; }
+          if (pen) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
+          pen = true;
+        }
+      };
+      for (let i = i0; i <= i0 + 2 * R; i++) run(i * c, k0 * c, 0, 1);
+      for (let k = k0; k <= k0 + 2 * R; k++) run(i0 * c, k * c, 1, 0);
+      ctx.stroke();
+    }
   }
+}
+
+// The overlay alone on a transparent 2D canvas stacked over a GPU backend's canvas.
+export function drawIllusionOverlay(ctx, canvas, F) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!F.groundEdit && !debug.on) return;
+  ctx.save();
+  applyDesignSpaceTransform(ctx, canvas);
+  drawOverlay(ctx, F);
   ctx.restore();
-  return stats;
 }
