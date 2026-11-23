@@ -720,8 +720,11 @@ then a transparent overlay for the Debug view and the aim (`drawIllusionOverlay`
   REPLACE would write the test's reference) so shadows don't stack; then all but bit 6 cleared.
 - GROUND UNDERLAY: neighboring ground pieces at different levels of detail leave true gaps up to about a pixel (the terrain's
   tolerance); per-sample coverage shows a 0.05 px gap as a full sample of sky (dots of (121,133,50) on (107,124,35)). A band of
-  UNDER_PX = 2 canvas px along each ground piece's inner sides (not contours) in its color, at the farthest depth, fills them
-  (1 px left about a fifth). Segments cached per piece.
+  UNDER_PX = 2 canvas px along each ground piece's inner sides in its color, at the farthest depth, fills them (1 px left about a
+  fifth). Segments cached per piece. Banded: inner cuts (shade, shore, lamp) and triangle edges that two ground shapes drawn this
+  frame share (keys of their world end points, counted per frame); not contours, near cuts or edges facing the sky (a ridge whose
+  next patch faces away). A band end meeting an unbanded side tapers to nothing over TAPER_PX = 3: half of a band on the outline,
+  or a square end where an edge meets a contour, stuck out past the ridges as a ragged fringe (bumps per edge).
 - Per frame CPU: tessellation into a float32 arena (no per-piece copies; kept / reused pieces cached), underlay segments cached.
 Measured (headless Chrome, RTX 4060, 1600 x 900, flying, `npm run bench`): Canvas 2D total 26.6 ms (build 8.3 + draw 4.3 + raster),
 WebGL2 15.1 ms (build 8.6, plan + GL 5.2, GPU ~1.3), WebGPU 17.3 ms. The GPU part is now small: what is left is the JS (the
