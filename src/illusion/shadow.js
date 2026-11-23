@@ -163,12 +163,18 @@ export function splitPatch(o, F, cache) {
       pieces.push(getCut(e, p));
       s = p;
     } while (s !== s0 && ++guard < nC);
-    // Its tone: the field at a point just inside (the middle of its first boundary stretch, nudged toward the region's centroid).
-    const pts = pieces.map((pc) => pc.a || { x: pc.c.x + pc.U.x * Math.cos(pc.t0), z: pc.c.z + pc.V.z * Math.sin(pc.t0) });
-    const cen = pts.reduce((acc, p) => ({ x: acc.x + p.x / pts.length, z: acc.z + p.z / pts.length }), { x: 0, z: 0 });
-    const b0 = pieces.find((pc) => pc.kind === 'line' && pc.edge !== 'cut') || pieces[0];
-    const mid = b0.kind === 'line' ? { x: (b0.a.x + b0.b.x) / 2, z: (b0.a.z + b0.b.z) / 2 } : cen;
-    const probe = { x: mid.x + (cen.x - mid.x) * 0.2, z: mid.z + (cen.z - mid.z) * 0.2 };
+    // Its tone: the field at the middle of its longest stretch of the triangle's edges. Between two consecutive crossings an edge
+    // is on one side of the border (that is how the crossings were found), so that point has the region's tone. (Nudged 20% toward
+    // the region's rough centroid, as before, it could land past a curved cut: a thin strip between a cut and an edge, its
+    // centroid outside it, took the other part's tone and was drawn lit inside the shade, up to the patch's straight edges.)
+    let b0 = null, bl = -1;
+    for (const pc of pieces) if (pc.kind === 'line' && pc.edge !== 'cut') { const l = Math.hypot(pc.b.x - pc.a.x, pc.b.z - pc.a.z); if (l > bl) { bl = l; b0 = pc; } }
+    let probe;
+    if (b0) probe = { x: (b0.a.x + b0.b.x) / 2, z: (b0.a.z + b0.b.z) / 2 };
+    else {   // (no edge stretch: the centroid of its corners)
+      const pts = pieces.map((pc) => pc.a || { x: pc.c.x + pc.U.x * Math.cos(pc.t0), z: pc.c.z + pc.V.z * Math.sin(pc.t0) });
+      probe = pts.reduce((acc, p) => ({ x: acc.x + p.x / pts.length, z: acc.z + p.z / pts.length }), { x: 0, z: 0 });
+    }
     parts.push({ loop: pieces, shade: shaded(F, W(probe)) });
   }
   // Lit parts first (their cut is underpainted before the shade parts are drawn over it).

@@ -383,10 +383,13 @@ if (illusionScene) {
     b.addEventListener('click', () => { grass.on = !grass.on; label(); b.blur(); pendingDraw = true; });
     box.append(b);
     const tb = document.createElement('button');   // the blades' style: shaded tips only (a texture) or whole leaves
-    const tLabel = () => { tb.textContent = grass.tips ? 'Grass: tips' : 'Grass: leaves'; tb.style.background = grass.tips ? '#1b5e20' : '#333'; };
+    const tLabel = () => { tb.textContent = grass.faces ? 'Grass: faces' : grass.tips ? 'Grass: tips' : 'Grass: leaves'; tb.style.background = grass.faces || grass.tips ? '#1b5e20' : '#333'; };
     tb.style.cssText = b.style.cssText;
     tLabel();
-    tb.addEventListener('click', () => { grass.tips = !grass.tips; tLabel(); tb.blur(); pendingDraw = true; });
+    tb.addEventListener('click', () => {   // faces -> tips -> leaves -> faces
+      if (grass.faces) { grass.faces = false; grass.tips = true; } else if (grass.tips) grass.tips = false; else grass.faces = true;
+      tLabel(); tb.blur(); pendingDraw = true;
+    });
     box.append(tb);
     const sb = document.createElement('button');   // the grass edge's spikes along silhouettes and shade borders (illusionRender.js)
     const sLabel = () => { sb.textContent = silhouette.spikes ? 'Spikes: on' : 'Spikes: off'; sb.style.background = silhouette.spikes ? '#1b5e20' : '#333'; };

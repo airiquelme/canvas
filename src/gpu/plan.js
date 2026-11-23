@@ -122,11 +122,11 @@ export function createFramePlanner() {
   const ptKey = (p) => `${Math.round(p.x * 100)},${Math.round(p.y * 100)},${Math.round(p.z * 100)}`;
   const edgeKeys = (o) => {
     const src = o.kind === 'quad' ? o.pts : o.edges;
-    if (o.edgeKeys && o.edgeKeysOf === src) return o.edgeKeys;
+    if (o.underKeys && o.underKeysOf === src) return o.underKeys;
     const pairs = o.kind === 'quad' ? o.pts.map((p, k) => [p, o.pts[(k + 1) % 4]]) : o.edges || [];
-    o.edgeKeys = pairs.map((e) => { if (!e) return null; const a = ptKey(e[0]), b = ptKey(e[1]); return a < b ? a + '|' + b : b + '|' + a; });
-    o.edgeKeysOf = src;
-    return o.edgeKeys;
+    o.underKeys = pairs.map((e) => { if (!e) return null; const a = ptKey(e[0]), b = ptKey(e[1]); return a < b ? a + '|' + b : b + '|' + a; });
+    o.underKeysOf = src;   // (not `edgeKeys`: the grass edge's own keys, illusionRender.js, are cached there)
+    return o.underKeys;
   };
 
   function plan(F) {

@@ -25,6 +25,13 @@
 // shade band (kc = edge (1 - f); 0 when all shade), from t0 (sin t0 = 1 - TIP_H) to the tip, where every curve meets (so it thins
 // to a point by itself); each side one exact arc; the start closed by a half circle. Every line starts the STANDARD LINE wide
 // (config.js LINE_PX, design px) on screen, whatever its blade's size or distance (a stylized stroke; dk may pass the blade's own edges, |k| > 1). Small and curved blades alike; never the lit face. Off: the leaves.
+// FACES (`faces`, the leaves' blades, density and growth): each blade shows only the face that differs from the ground under it
+// (the shadow test at its foot, as tips): on lit ground its SHADE part (shade tone), on ground in shade its LIT part (the ground's
+// lit tone: the share 1 - fSun of its width from the edge facing the sun, fSun its shade share as if the shadow were not there);
+// with the sun down, none. Every blade is the curved leaf, at any size (no small triangles: switching flickered). As tall as
+// the grass edge's tufts (illusionRender.js: TUFT_ASPECT x TUFT_R x TUFT_CELL = 4.32, x 0.7-1.3): each blade's height (and curl)
+// mapped from H_MIN..H_MAX onto FACE_H_MIN..FACE_H_MAX. Blades come and go by their WIDTH (0 to full; the patch's width fade times
+// their thinning fade), opaque and at full height: no opacity steps, no sliver cutoff.
 import { line } from './shape.js';
 import { LINE_PX } from '../config.js';
 import { litOf } from './light.js';
@@ -52,6 +59,7 @@ const SLIVER_PX = 0.5;    // a curved blade's shade narrower than this (at the b
 const H_MIN = 7, H_MAX = 16;
 const TIP_H = 1;          // tips: the share of a blade's height drawn, from the top (1: down to the ground)
 const H_STD = (7 + 16) / 2;   // tips: the standard blade's height (the cutoff by distance assumes it)
+const FACE_H_MIN = 4.32 * 0.7, FACE_H_MAX = 4.32 * 1.3;   // faces: the tufts' heights
 const FADE_LEVELS = 8;    // tips: a line's fade in this many color steps
 // TIPS' DENSITY BY DISTANCE: the share of a patch's blades drawn at distance d, so that the share of ground pixels covered by tip
 // lines is the same near and far (the illusion of one texture). Fitted offline (tools/render/gpu/grassDensity.mjs: renders walking
@@ -142,7 +150,8 @@ function shadeOfBlade(b0, b, F, L, eye, atGround = false) {
   }
   b.inShadow = b0.inShadow;
   const nn = b.n, seen = nn.x * (eye.x - b.mid.x) + nn.z * (eye.z - b.mid.z), lit = nn.x * L.x + nn.z * L.z, a = Math.min(1, Math.abs(lit));
-  b.f = b.inShadow || L.y <= 0 ? 1 : seen * lit > 0 ? (1 - a) / 2 : (1 + a) / 2;   // the sun down: all shade
+  b.fSun = L.y <= 0 ? 1 : seen * lit > 0 ? (1 - a) / 2 : (1 + a) / 2;   // as if no shadow (faces: the lit part on shaded ground)
+  b.f = b.inShadow ? 1 : b.fSun;   // the sun down: all shade
   b.edge = b.W.x * L.x + b.W.z * L.z > 0 ? -1 : 1;   // the edge away from the sun
 }
 
@@ -181,7 +190,8 @@ function bladesUpTo(leaf, T, m) {
 }
 
 // This frame's grass: { curved: [blades, with host, fill, f, edge], specks: [{ host, sides, depth }] (one per patch) }.
-export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frustum, near = 1, fit = 1, tips = false }) {
+export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frustum, near = 1, fit = 1, tips = false, faces = false }) {
+  if (tips) faces = false;
   const curved = [], specks = [];
   let count = 0;
   const dMax = H_STD * TIP_H * persp.s / (tipTuning.minLen * LINE_PX), dFade = tipTuning.distFade * dMax;
@@ -215,20 +225,30 @@ export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frust
       else { if (rk * d2 >= lk * Math.max(D02, d2)) continue; db = Math.sqrt(d2); tau = lk * (db <= D0 ? 1 : D02 / d2); }
       const b0 = blades[k];
       const gr = tau >= 1 ? 1 : smooth((tau - b0.rank) / (RANK_FADE * tau));
-      // tips: no growing, a fade (rank and distance); leaves: grown out of the ground
-      const alpha = tips ? gr * smooth((dMax - db) / dFade) : 1, g = tips ? 1 : gw * gr;
-      if (g < 0.04 || alpha < 0.5 / FADE_LEVELS) continue;
-      const b = g < 0.999 ? grownBy(b0, g) : b0;
+      // tips: no growing, a fade (rank and distance); faces: the width grows (patch width, rank), the tufts' height; leaves: grown out of the ground
+      const alpha = tips ? gr * smooth((dMax - db) / dFade) : 1;
+      const g = tips ? 1 : faces ? (FACE_H_MIN + ((b0.h - H_MIN) / (H_MAX - H_MIN)) * (FACE_H_MAX - FACE_H_MIN)) / b0.h : gw * gr;
+      const wg = faces ? gw * gr : 1;   // faces: the width's share (0 -> 1)
+      if (g < 0.04 || wg < 0.02 || alpha < 0.5 / FADE_LEVELS) continue;
+      // faces: the tufts' height, the width grown from 0
+      const b = faces ? { ...grownBy(b0, g), W: { x: b0.W.x * wg, y: 0, z: b0.W.z * wg } } : g < 0.999 ? grownBy(b0, g) : b0;
       const z = toCamera(b.mid).z;
       if (z <= near + b.h) continue;
       const px = (b.h * persp.s) / z;   // its height on screen
-      b0.curvedOn = b0.curvedOn ? px >= CURVE_OFF : px >= CURVE_ON;
+      b0.curvedOn = faces || (b0.curvedOn ? px >= CURVE_OFF : px >= CURVE_ON);   // faces: always the curved leaf (no triangles)
       if (tips) {
         shadeOfBlade(b0, b, F, L, eye, true);
         // in the ground's shade (or the sun down) the line is the ground's own tone: nothing to draw
         if (L && (b.inShadow || L.y <= 0)) continue;
         if (!L) b.f = 1;   // the light off: the whole tip
         if (b.f <= 0.02) continue;
+      }
+      let litFace = false;
+      if (faces && L) {   // the face that differs from the ground at its foot
+        shadeOfBlade(b0, b, F, L, eye, true);
+        if (L.y <= 0) continue;   // the sun down: blades and ground alike in shade
+        if (b.inShadow) { if (b.fSun >= 0.98) continue; litFace = true; }   // shaded ground: its lit part
+        else if (b.f <= 0.02) continue;                                     // lit ground: its shade part
       }
       if (!b0.curvedOn && tips) {   // its shade line, in its fade level's path
         const lv = Math.min(FADE_LEVELS, Math.round(alpha * FADE_LEVELS));
@@ -247,7 +267,8 @@ export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frust
       b.fill = litOf(b.ground);   // its lit face: the ground's lit tone
       b.host = leaf;
       b.dist = db;
-      if (!tips) shadeOfBlade(b0, b, F, L, eye);
+      if (!tips && !faces) shadeOfBlade(b0, b, F, L, eye);
+      b.litFace = litFace; b.faces = faces && !!L;
       b.alpha = Math.round(alpha * FADE_LEVELS) / FADE_LEVELS;
       curved.push(b);
     }
@@ -262,11 +283,11 @@ export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frust
 // `shade`; and its size. Not full: only the shade (the lit face is the ground's own color), none when it would not show.
 export function bladePieces(b, projector, shade, colors, full = true, tips = false) {
   if (tips) full = false;
-  if (!full && b.f <= 0.02) return { pieces: [], size: 0 };
+  if (!full && b.f <= 0.02 && !b.litFace) return { pieces: [], size: 0 };
   const T = projector.toCamera, P = projector.persp, pp = projector.projectPoint;
   const qa = pp(b.base), qt = pp(b.tip), size = Math.hypot(qt.x - qa.x, qt.y - qa.y);
   if (tips) return { pieces: [{ sides: tipLine(b, pp, T, P, []), fill: shade, colors }], size };
-  if (!full && 2 * b.f * Math.hypot(b.W.x, b.W.z) * qa.scale < SLIVER_PX) return { pieces: [], size };
+  if (!b.faces && !full && 2 * b.f * Math.hypot(b.W.x, b.W.z) * qa.scale < SLIVER_PX) return { pieces: [], size };
   const at = (k, t) => {   // c_k(t), world
     const s = 1 - Math.sin(t), c = 1 - Math.cos(t), y = Math.sin(t);
     return { x: b.base.x + b.W.x * k * s + b.L.x * c + b.Y.x * y, y: b.base.y + b.L.y * c + b.Y.y * y, z: b.base.z + b.W.z * k * s + b.L.z * c + b.Y.z * y };
@@ -280,6 +301,8 @@ export function bladePieces(b, projector, shade, colors, full = true, tips = fal
   // The part between curves k0 and k1: k0 up to the tip, k1 back down, the base across.
   const part = (k0, k1) => [...curve(k0, 0, Math.PI / 2), ...curve(k1, Math.PI / 2, 0), line(pp(at(k1, 0)), pp(at(k0, 0)))];
   const pieces = [];
+  // faces, on shaded ground: its lit part only, from the edge facing the sun to where its shade would start
+  if (b.litFace) return { pieces: [{ sides: part(b.edge * (1 - 2 * b.fSun), -b.edge), fill: b.fill, colors }], size };
   if (b.f >= 0.98) pieces.push({ sides: part(-1, 1), fill: shade, colors });
   else {
     if (full) pieces.push({ sides: part(-1, 1), fill: b.fill, colors });

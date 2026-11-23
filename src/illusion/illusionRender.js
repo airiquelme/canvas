@@ -173,7 +173,7 @@ export function editGround(action) {
 const sky = { on: false, sunDisc: false };
 export const sceneTerrain = () => terrain;   // for tools
 // Grass on the terrain (grass.js); the Grass button.
-export const grass = { on: true, tips: true };   // tips: only the blades' shaded tips (a texture), grass.js
+export const grass = { on: true, tips: false, faces: true };   // tips: only the blades' shaded tips (a texture); faces: the face that differs from the ground (grass.js)
 // The ground's SILHOUETTE: the sides of floor patches beyond which no ground is drawn. Contour arcs (no `edge` tag: where the
 // surface turns away), and stretches of patch edges whose neighbor is not drawn there (it faces away from the eye at that point: a
 // crest's crease between two triangles) or that have none (the terrain's border). The edge is the same curve in both patches, so
@@ -360,10 +360,11 @@ function silhouetteEdges(shapes, eye, projectPoint, fit) {
         const W = (u) => { const q = pieceAt(pc, u); return liftLocal(o, q.x, q.z); };
         const l = byEdge.get(edgeKeysOf(o)[sd.edge]), N = Array.isArray(l) ? (l[0] === s ? l[1] : l[0]) : l === s ? null : l;
         const ua = Math.min(sd.ua, sd.ub), ub = Math.max(sd.ua, sd.ub), runs = [];
-        if (!N || !N.pieces.length) {
-          // the terrain's BORDER (or a neighbor not drawn at all): grass only where the patch's ground lies below the edge on screen
-          // (seen from outside the terrain, the ground is above its border: spikes would point into the ground and their bases poke
-          // out below the edge as dark teeth)
+        if (N && !N.pieces.length) runs.push([ua, ub]);   // a neighbor selected but drawing nothing: it faces away, a crest
+        else if (!N) {
+          // the terrain's BORDER: grass only where the patch's ground lies below the edge on screen (seen from outside the terrain, the
+          // ground is above its border: spikes would point into the ground and their bases poke out below the edge as dark teeth).
+          // (Not for a crest: the ground there is seen edge-on, so the test point lands on the edge itself and the sign is noise.)
           const um = (ua + ub) / 2, qm = pieceAt(pc, um), M = liftLocal(o, qm.x, qm.z);
           const lx = qm.x + (o.mid.x - o.ox - qm.x) * 0.05, lz = qm.z + (o.mid.z - o.oz - qm.z) * 0.05;
           const pM = projectPoint(M), pI = projectPoint(liftLocal(o, lx, lz)), pU = projectPoint({ x: M.x, y: M.y + 1, z: M.z });
@@ -379,7 +380,8 @@ function silhouetteEdges(shapes, eye, projectPoint, fit) {
             const d = b * b - 4 * a * g0;
             if (d > 0) { const q = Math.sqrt(d); cuts.push((-b - q) / (2 * a), (-b + q) / (2 * a)); }
           } else if (Math.abs(b) > 1e-300) cuts.push(-g0 / b);
-          const vs = [...new Set(cuts.filter((v) => v > 0 && v < 1)), 1].sort((x, y) => x - y);
+          // (0 kept: filtered out with the roots, the stretch before the first root was never tested, and a crest there had no spikes)
+          const vs = [0, ...new Set(cuts.filter((v) => v > 0 && v < 1)), 1].sort((x, y) => x - y);
           for (let i = 0; i + 1 < vs.length; i++) {
             const vm = (vs[i] + vs[i + 1]) / 2;
             if (a * vm * vm + b * vm + g0 <= 0) runs.push([ua + (ub - ua) * vs[i], ua + (ub - ua) * vs[i + 1]]);
@@ -506,7 +508,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     for (const o of sel) pushObject(o);
     if (grass.on && terrain.leafNodes) {   // blades from the patches' seeds (grass.js), near the eye only
       frameBlades = selectGrass(terrain, camPos, { F: light.on ? terrain.F : null, L: light.on ? light.dir : null,
-        toCamera: projector.toCamera, projectPoint, persp, frustum, near: NEAR, fit, tips: grass.tips });
+        toCamera: projector.toCamera, projectPoint, persp, frustum, near: NEAR, fit, tips: grass.tips, faces: grass.faces });
       stats.grass = frameBlades.curved.length; stats.specks = frameBlades.triangles;
     }
   }
@@ -541,7 +543,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
   // Far blades: each patch's shade triangles as one shape (grass.js), drawn after the patch.
   const grassShade = (fill, p) => { const lf = lamps.length ? lampAt(p) : null; return lf ? lampTone(fill, shadeOf(fill), lf) : shadeOf(fill); };
   if (frameBlades) for (const g of frameBlades.specks) shapes.push({ o: g, size: 1, proj: [], depth: g.depth, prebuilt: true,
-    pieces: [{ sides: g.sides, fill: grassShade(g.host.patch.fill, g.host.patch.mid), alpha: g.alpha, colors: SIDE_COLORS }] });
+    pieces: [{ sides: g.sides, fill: g.lit ? litOf(g.host.patch.fill) : grassShade(g.host.patch.fill, g.host.patch.mid), alpha: g.alpha, colors: SIDE_COLORS }] });
   if (frameBlades) for (const b of frameBlades.curved) {
     const z = depthOf(b.mid);
     if (z <= NEAR) continue;
@@ -696,9 +698,9 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
       const hs = s.hostS;
       if (hs && hs.pieces && hs.sil === undefined) hs.sil = hs.pieces.some((p) => p.sides.some((sd) => sd.ci === 4));
       // its lit face only where it can show: near the eye, or on the ground's outline
-      const full = !grass.tips && (s.o.dist < GRASS_FULL_D || !!(hs && hs.sil));
+      const full = !grass.tips && !s.o.faces && (s.o.dist < GRASS_FULL_D || !!(hs && hs.sil));
       s.pieces = bladePieces(s.o, projector, grassShade(s.o.ground ?? s.o.fill, s.o.mid), SIDE_COLORS, full, grass.tips).pieces;
-      if (grass.tips && s.o.alpha < 1) for (const p of s.pieces) p.alpha = s.o.alpha;   // fading: translucent
+      if (grass.tips || grass.faces) for (const p of s.pieces) { const a = (p.alpha ?? 1) * s.o.alpha; if (a < 1) p.alpha = a; }   // fading: translucent
       if (s.pieces.length) { stats.blades++; if (full) stats.fullBlades++; }
       continue;
     }
