@@ -173,7 +173,7 @@ export function editGround(action) {
 const sky = { on: false, sunDisc: false };
 export const sceneTerrain = () => terrain;   // for tools
 // Grass on the terrain (grass.js); the Grass button.
-export const grass = { on: false, tips: true };   // tips: only the blades' shaded tips (a texture), grass.js
+export const grass = { on: true, tips: true };   // tips: only the blades' shaded tips (a texture), grass.js
 // The ground's SILHOUETTE: the sides of floor patches beyond which no ground is drawn. Contour arcs (no `edge` tag: where the
 // surface turns away), and stretches of patch edges whose neighbor is not drawn there (it faces away from the eye at that point: a
 // crest's crease between two triangles) or that have none (the terrain's border). The edge is the same curve in both patches, so
@@ -194,8 +194,7 @@ export const grass = { on: false, tips: true };   // tips: only the blades' shad
 // part lower on screen (nearer, from where the eye is) sprouts, in its own tone, over the other: lit grass over the shade behind
 // it, or shade grass over the lit ground behind it, switching as the eye moves. Water grows none.
 // Each run's spikes are one piece (one loop each) in the tone of the ground piece it lies on, drawn right after its patch.
-// `red`: the silhouette stroked in red on top of its patch (the test view).
-export const silhouette = { on: true, spikes: true, shade: true, red: false, color: '#ff0000', px: 2 };
+export const silhouette = { on: true, spikes: true, shade: true };
 // A loop's turn in (x, z): twice its signed area (> 0 counterclockwise), from its pieces sampled; once per loop.
 const turnCache = new WeakMap();
 function loopTurn(loop) {
@@ -208,7 +207,6 @@ function loopTurn(loop) {
   turnCache.set(loop, a);
   return a;
 }
-export const isSilhouetteSide = (sd) => sd.edge === undefined;
 const TUFT_CELL = 2.4, TUFT_R = 0.6, TUFT_ASPECT = 3.0, TUFT_DOWN_PX = 1.5, TUFT_REACH = 6;
 // NEAR ONLY: a tuft shows once its full height on screen is over TUFT_SHOW_LINES standard lines (LINE_PX), full at TUFT_FULL_LINES
 // (6 / 12: from about 290 units away, full by about 145, at the default zoom); far crests have none.
@@ -312,10 +310,9 @@ function silhouetteEdges(shapes, eye, projectPoint, fit) {
   for (const s of shapes) {
     const o = s.o;
     if (o.kind !== 'patch' || !s.pieces || !s.pieces.length || !(s.pieces[0].ref || s.pieces[0]).floor) continue;
-    const lines = [], spikes = [];
+    const spikes = [];
     const own = (x, z) => liftLocal(o, x - o.ox, z - o.oz).y;
     const emit = (P, fill, groundY = own, keep = null, baseBelow = false) => {
-      if (silhouette.red) lines.push(P.map(projectPoint));
       if (silhouette.spikes) { const sp = tuftPiece(P, fill, projectPoint, fit, groundY, keep, baseBelow); spikeStats.points += P.length; if (sp) { spikes.push(sp); spikeStats.pieces++; } }
     };
     for (const p of s.pieces) {
@@ -400,7 +397,6 @@ function silhouetteEdges(shapes, eye, projectPoint, fit) {
         }
       }
     }
-    s.pieces[0].silLines = lines;
     if (spikes.length) s.pieces = s.pieces.concat(spikes);
   }
 }
@@ -789,8 +785,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     }
   }
   return { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo, projectPoint, camPos, forward: basis.forward,
-    sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit,
-    silhouette: silhouette.on && silhouette.red ? { color: silhouette.color, px: silhouette.px } : null };
+    sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit };
 }
 
 // Canvas 2D drawing of a frame (the reference backend).
@@ -886,22 +881,6 @@ export function drawIllusion2D(ctx, canvas, F) {
       } else if (p.alpha !== undefined && p.alpha < 1) {   // a fading piece (grass): translucent
         flush(); ctx.globalAlpha = p.alpha; drawShape(ctx, p, { stroke: strokes.on }); ctx.globalAlpha = 1; stats.fills++;
       } else { flush(); drawShape(ctx, p, { stroke: strokes.on }); stats.fills++; }
-    }
-    if (F.silhouette && o.kind === 'patch') {   // its silhouette sides, on top of it and under everything drawn later
-      let any = false;
-      for (const p of s.pieces) if (!p.M) {   // (a reused piece, under its map M, never has a contour)
-        for (const sd of p.sides) if (isSilhouetteSide(sd)) {
-          if (!any) { flush(); ctx.save(); ctx.beginPath(); any = true; }
-          const q = sideStart(sd);
-          ctx.moveTo(q.x, q.y); traceSide(ctx, sd);
-        }
-      }
-      for (const L of s.pieces[0].silLines || []) {
-        if (!any) { flush(); ctx.save(); ctx.beginPath(); any = true; }
-        ctx.moveTo(L[0].x, L[0].y);
-        for (let i = 1; i < L.length; i++) ctx.lineTo(L[i].x, L[i].y);
-      }
-      if (any) { ctx.strokeStyle = F.silhouette.color; ctx.lineWidth = F.silhouette.px / fit; ctx.lineCap = 'round'; ctx.stroke(); ctx.restore(); }
     }
     stats.drawn++;
     for (const sh of shadows) if (sh.last === si) { flush(); drawShadow(sh); }

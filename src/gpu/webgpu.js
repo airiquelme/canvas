@@ -102,7 +102,6 @@ export async function createWebGPU(canvas, { preserveDrawingBuffer = false } = {
   const P = {
     sky: pipe({ vs: 'vsSky', fs: 'fsSky', vb: [], front: always }),
     under: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, depth: ['less', true], front: always }),
-    edges: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, depth: ['less', true], front: always }),
     winding: pipe({ vs: 'vsStencil', fs: 'fsStencil', vb: stencilVB, color: false, front: face('always', 'increment-wrap'), back: face('always', 'decrement-wrap') }),
     winding6: pipe({ vs: 'vsStencil', fs: 'fsStencil', vb: stencilVB, color: false, front: face('always', 'increment-wrap'), back: face('always', 'decrement-wrap'), write: 0x3f }),
     parity7: pipe({ vs: 'vsStencil', fs: 'fsStencil', vb: stencilVB, color: false, front: face('always', 'invert'), write: 0x80 }),
@@ -176,7 +175,6 @@ export async function createWebGPU(canvas, { preserveDrawingBuffer = false } = {
     };
     if (F.sky) { pass.setPipeline(P.sky); pass.draw(6); }
     draw(P.under, plan.under);
-    draw(P.edges, plan.edges);   // silhouette edges, at their patches' depths
     for (const G of plan.fills) { draw(P.winding, G.tris, 0, 's'); draw(P.cover, G.boxes); }
     for (const G of plan.crescents) {   // (webgl2.js: the moved shape's winding as a flag, bit 7 = outside it)
       draw(P.winding, G.moved, 0, 's');

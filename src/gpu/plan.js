@@ -183,25 +183,6 @@ export function createFramePlanner() {
         }
       }
     });
-    // SILHOUETTE EDGES (illusionRender.js `silhouette`): bands along each floor patch's sides with no `edge` tag (its contour), at
-    // the patch's own depth: drawn before the fills, so every nearer piece covers them and farther ones don't.
-    const edges = range(cSink, () => {
-      if (!F.silhouette) return;
-      const rgb = rgbOf(F.silhouette.color), ehw = F.silhouette.px / 2 / F.fit;
-      for (let k = 0; k < N; k++) {
-        const E = entries[k];
-        if (E.kind !== 0 || !(E.p.ref || E.p).floor) continue;
-        if (!E.p.M) for (const sd of E.p.sides) {   // (a reused piece, under its map M, has no contour)
-          if (sd.edge !== undefined) continue;
-          if (sd.kind === 'line') { band(sd.from.x, sd.from.y, sd.to.x, sd.to.y, ehw, zOf(k), rgb); continue; }
-          const e = sd.e, R = Math.max(e.a, e.b), sw = sd.t1 - sd.t0;
-          const n = Math.min(64, Math.max(1, Math.ceil(Math.abs(sw) / (2 * Math.sqrt((2 * tol) / Math.max(R, tol))))));
-          let p = ellipsePoint(e, sd.t0);
-          for (let i = 1; i <= n; i++) { const q = ellipsePoint(e, sd.t0 + (sw * i) / n); band(p.x, p.y, q.x, q.y, ehw, zOf(k), rgb); p = q; }
-        }
-        for (const L of E.p.silLines || []) for (let i = 0; i + 1 < L.length; i++) band(L[i].x, L[i].y, L[i + 1].x, L[i + 1].y, ehw, zOf(k), rgb);
-      }
-    });
     const shadows = [];
     for (const k of shadowList) {
       const { sh, hosts } = entries[k].sh;
@@ -222,7 +203,7 @@ export function createFramePlanner() {
       G.allBox = range(cSink, () => pushBox(unionBox(hb, sb), 0, BLACK));
       shadows.push(G);
     }
-    return { sSink, cSink, fills, crescents, shadows, under, edges, entries: N };
+    return { sSink, cSink, fills, crescents, shadows, under, entries: N };
   }
   return { plan };
 }
