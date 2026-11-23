@@ -2,10 +2,10 @@
 // as flat shapes that only have to look right from the camera (shape.js), not a 3D body sorted by depth.
 // Objects are 2-node meshes: capsules (capsule.js) or tubes bent through a point (curve.js), and sheets (sheet.js: panels, discs,
 // ribbons, two-sided), drawn back to front by the mean depth of their points. Borders (each side stroked in its own color) only with the Strokes button.
-import { debug, strokes, DESIGN_WIDTH, DESIGN_HEIGHT } from '../config.js';
+import { debug, strokes, DESIGN_WIDTH, DESIGN_HEIGHT, LINE_PX } from '../config.js';
 import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProjector } from '../core/camera.js';
 import { applyDesignSpaceTransform } from '../core/canvas.js';
-import { drawShape, tracePath, traceSide, sideStart, pointOnEllipse } from './shape.js';
+import { drawShape, tracePath, traceSide, sideStart, pointOnEllipse, line } from './shape.js';
 import { capsuleSides } from './capsule.js';
 import { curvedSides, curveChainSides } from './curve.js';
 import { buildWorld } from './world.js';
@@ -13,7 +13,7 @@ import { buildMeadow } from './meadow.js';
 import { relSize, boundPoints, boundRadius, buildBVH, makeFrustum, sphereBox, makeMask, maskHides, maskAddCapsule, maskAddTube, maskAddConvex, Heap } from './cull.js';
 import { sheetPieces, panelPolygon, backOf } from './sheet.js';
 import { quadPieces, quadConvex } from './quad.js';
-import { patchPieces, ringPatch, heightAt } from './patch.js';
+import { patchPieces, ringPatch, heightAt, pieceAt, liftLocal, facingAt, contourWorld, ringWorld } from './patch.js';
 import { selectTerrain } from './terrain.js';
 import { light, shadeOf, brightOf, litOf, shadeOverlay } from './light.js';
 import { capsuleShadow } from './groundShadow.js';
@@ -173,7 +173,238 @@ export function editGround(action) {
 const sky = { on: false, sunDisc: false };
 export const sceneTerrain = () => terrain;   // for tools
 // Grass on the terrain (grass.js); the Grass button.
-export const grass = { on: true, tips: true };   // tips: only the blades' shaded tips (a texture), grass.js
+export const grass = { on: false, tips: true };   // tips: only the blades' shaded tips (a texture), grass.js
+// The ground's SILHOUETTE: the sides of floor patches beyond which no ground is drawn. Contour arcs (no `edge` tag: where the
+// surface turns away), and stretches of patch edges whose neighbor is not drawn there (it faces away from the eye at that point: a
+// crest's crease between two triangles) or that have none (the terrain's border). The edge is the same curve in both patches, so
+// along a stretch of it the neighbor's facing g is quadratic: its roots give the exact sub-stretches.
+// GRASS EDGE: TUFTS of grass planted in the world, seen where they poke out past the silhouette. One tuft per TUFT_CELL cell, at a
+// jittered point (a hash of the cell), standing on the DRAWN ground there (the run's patch's sheet curve; across a crest edge, the
+// neighbor's), its tip TUFT_ASPECT x R up (x 0.7-1.3 by the tuft; R = TUFT_R x cell, the tuft's half-width). For the tufts within
+// TUFT_REACH (x, z) of a run, the tip is projected and, if it lands past the outline (toward the sky), a spike is drawn from the
+// outline up to it, VERTICAL (along world up on screen, whatever the outline's slant): its foot where the tuft's vertical meets the
+// outline, its base along the outline (R wide each way at the tuft's depth, TUFT_DOWN_PX into the ground). So a tuft just behind a crest sticks up over it and one on the slope in front peeks over its top, by the real geometry:
+// the spikes rise and sink exactly as fast as the hill turns toward or away from the eye, and keep their world size (narrower with
+// distance). A tuft shows at all only once its full height on screen, from its distance, is over TUFT_SHOW_LINES standard lines
+// (config.js LINE_PX, design px: the texture width the grass tips use), growing in up to TUFT_FULL_LINES: near crests only. Fades, all smooth: that one, by distance
+// from the run (a window 1 - (d / REACH)^2, squared, so none pops in at the reach), and a spike under SPIKE_VANISH_PX past the
+// outline is flat, full from SPIKE_FULL_PX.
+// SHADE BORDERS (`shade`): the lit / shade cut inside a patch (edge 'cut', shadow.js; shores too) sprouts the same tufts. Both
+// parts hold the cut; each takes only the tufts on its own side whose ground point is on the near side of the cut on screen, so the
+// part lower on screen (nearer, from where the eye is) sprouts, in its own tone, over the other: lit grass over the shade behind
+// it, or shade grass over the lit ground behind it, switching as the eye moves. Water grows none.
+// Each run's spikes are one piece (one loop each) in the tone of the ground piece it lies on, drawn right after its patch.
+// `red`: the silhouette stroked in red on top of its patch (the test view).
+export const silhouette = { on: true, spikes: true, shade: true, red: false, color: '#ff0000', px: 2 };
+// A loop's turn in (x, z): twice its signed area (> 0 counterclockwise), from its pieces sampled; once per loop.
+const turnCache = new WeakMap();
+function loopTurn(loop) {
+  let a = turnCache.get(loop);
+  if (a !== undefined) return a;
+  const pts = [];
+  for (const pc of loop) { const n = pc.kind === 'line' ? 1 : 8; for (let j = 0; j < n; j++) pts.push(pieceAt(pc, j / n)); }
+  a = 0;
+  for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; a += p.x * q.z - q.x * p.z; }
+  turnCache.set(loop, a);
+  return a;
+}
+export const isSilhouetteSide = (sd) => sd.edge === undefined;
+const TUFT_CELL = 2.4, TUFT_R = 0.6, TUFT_ASPECT = 3.0, TUFT_DOWN_PX = 1.5, TUFT_REACH = 6;
+// NEAR ONLY: a tuft shows once its full height on screen is over TUFT_SHOW_LINES standard lines (LINE_PX), full at TUFT_FULL_LINES
+// (6 / 12: from about 290 units away, full by about 145, at the default zoom); far crests have none.
+const TUFT_SHOW_LINES = 6, TUFT_FULL_LINES = 12;
+const SPIKE_VANISH_PX = 1, SPIKE_FULL_PX = 3;
+const RUN_SEG_PX = 16;   // a run is a polyline of chords about this long on screen (the spikes' base line)
+const smooth01 = (u) => { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); };
+const hash2 = (i, j, L) => {   // 0..1 from a cell
+  let h = Math.imul(i, 374761393) ^ Math.imul(j, 668265263) ^ Math.imul(L + 1, 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+export const spikeStats = { pieces: 0, points: 0, tufts: 0, ms: 0 };
+const edgeKey = (E) => {
+  const a = `${E[0].x.toFixed(3)},${E[0].z.toFixed(3)}`, b = `${E[1].x.toFixed(3)},${E[1].z.toFixed(3)}`;
+  return a < b ? a + '|' + b : b + '|' + a;
+};
+// a patch's edge keys, once per patch (its edges are fixed; an edit builds new patches)
+const edgeKeysOf = (o) => (o.edgeKeysFor === o.edges ? o.edgeKeys : ((o.edgeKeysFor = o.edges), (o.edgeKeys = o.edges.map((E) => (E ? edgeKey(E) : null)))));
+const dist3 = (a, b) => Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+
+// The spikes of the tufts near one run (world polyline P) -> a piece, or null. groundY(x, z): the drawn ground's height there.
+// keep(x, z): which tufts may sprout (shade borders: the part's own side); baseBelow: only tufts whose own ground point is on the
+// near side of the line on screen (a tuft already past it would show in the other part's area, in its own tone: no contrast).
+function tuftPiece(P, fill, projectPoint, fit, groundY, keep = null, baseBelow = false) {
+  const Q = P.map(projectPoint);
+  if (Q.some((q) => !(q.scale > 0))) return null;
+  let smax = 0;
+  for (const q of Q) smax = Math.max(smax, q.scale);
+  const R = TUFT_R * TUFT_CELL, c = TUFT_CELL, S = TUFT_REACH;
+  if (TUFT_ASPECT * R * 1.3 * smax * 1.2 <= TUFT_SHOW_LINES * LINE_PX) return null;   // every tuft too small from here (+ the reach's margin)
+  const sides = [];
+  const tri = (a, b, cc) => {
+    const ar = (b.x - a.x) * (cc.y - a.y) - (b.y - a.y) * (cc.x - a.x);
+    const [p, q, r] = ar < 0 ? [a, cc, b] : [a, b, cc];
+    sides.push({ ...line(p, q), ci: 4, move: sides.length > 0 }, { ...line(q, r), ci: 4 }, { ...line(r, p), ci: 4 });
+  };
+  for (let s = 0; s + 1 < P.length; s++) {
+    const A = P[s], B = P[s + 1], dx = B.x - A.x, dz = B.z - A.z, l2 = dx * dx + dz * dz;
+    if (!(l2 > 1e-12)) continue;
+    const qa = Q[s], qb = Q[s + 1];
+    const sx_ = qb.x - qa.x, sy_ = qb.y - qa.y, sl = Math.hypot(sx_, sy_);
+    if (!(sl > 1e-9)) continue;
+    const tx = sx_ / sl, ty = sy_ / sl;   // the chord on screen and its normal toward the sky (screen up of world up at A)
+    const qu = projectPoint({ x: A.x, y: A.y + 1, z: A.z });
+    let nx = -ty, ny = tx;
+    if (nx * (qu.x - qa.x) + ny * (qu.y - qa.y) < 0) { nx = -nx; ny = -ny; }
+    const i0 = Math.floor((Math.min(A.x, B.x) - S) / c), i1 = Math.floor((Math.max(A.x, B.x) + S) / c);
+    const j0 = Math.floor((Math.min(A.z, B.z) - S) / c), j1 = Math.floor((Math.max(A.z, B.z) + S) / c);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+      const sx = (i + 0.1 + 0.8 * hash2(i, j, 0)) * c, sz = (j + 0.1 + 0.8 * hash2(j, i, 17)) * c;
+      const t = ((sx - A.x) * dx + (sz - A.z) * dz) / l2;   // each tuft to the chord it lies beside (unclamped)
+      if (t < 0 || t >= 1) continue;
+      const ex = A.x + dx * t - sx, ez = A.z + dz * t - sz, d2 = ex * ex + ez * ez;
+      if (d2 >= S * S) continue;
+      if (keep && !keep(sx, sz)) continue;
+      // the real tuft: its tip TUFT_ASPECT x R above its own ground point
+      const h = TUFT_ASPECT * R * (0.7 + 0.6 * hash2(i, j, 33)), y = groundY(sx, sz);
+      const tip = projectPoint({ x: sx, y: y + h, z: sz }), base = projectPoint({ x: sx, y, z: sz });
+      if (!(tip.scale > 0) || !(base.scale > 0)) continue;
+      // SIZE GATE, from distance alone: none while the tuft's full height on screen is under TUFT_SHOW_LINES standard lines, grown in
+      // by TUFT_FULL_LINES
+      const wt = smooth01(((h * tip.scale) / LINE_PX - TUFT_SHOW_LINES) / (TUFT_FULL_LINES - TUFT_SHOW_LINES));
+      if (wt <= 0) continue;
+      if (baseBelow && (base.x - qa.x) * nx + (base.y - qa.y) * ny > 0) continue;
+      // VERTICAL: world up on screen at the tuft (U); its foot is where the vertical through the tip meets the chord's line,
+      // qa + a T + lam U = tip, and lam (> 0) is how far the tip stands past the outline along U
+      const ul = Math.hypot(tip.x - base.x, tip.y - base.y);
+      if (!(ul > 1e-9)) continue;
+      const ux = (tip.x - base.x) / ul, uy = (tip.y - base.y) / ul;
+      if (ux * nx + uy * ny <= 0) continue;
+      const det = tx * uy - ty * ux;
+      if (Math.abs(det) < 0.2) continue;   // the outline nearly vertical on screen: a spike would run along it
+      const rx = tip.x - qa.x, ry = tip.y - qa.y, a = (rx * uy - ry * ux) / det;
+      let out = (tx * ry - ty * rx) / det;
+      if (out <= 0) continue;
+      const win = 1 - d2 / (S * S);
+      out *= wt * win * win;   // a window in x, z (no tuft pops in at its edge) and the size gate's fade
+      const opx = out * fit;
+      if (opx < SPIKE_VANISH_PX) continue;
+      out *= smooth01((opx - SPIKE_VANISH_PX) / (SPIKE_FULL_PX - SPIKE_VANISH_PX));
+      const w = R * tip.scale, down = TUFT_DOWN_PX / fit;
+      const fx = qa.x + tx * a, fy = qa.y + ty * a;   // the foot on the chord
+      tri({ x: fx - tx * w - ux * down, y: fy - ty * w - uy * down }, { x: fx + ux * out, y: fy + uy * out },
+        { x: fx + tx * w - ux * down, y: fy + ty * w - uy * down });
+      spikeStats.tufts++;
+    }
+  }
+  return sides.length ? { sides, fill, colors: SIDE_COLORS, spike: true } : null;
+}
+function silhouetteEdges(shapes, eye, projectPoint, fit) {
+  spikeStats.pieces = spikeStats.points = spikeStats.tufts = 0;
+  const byEdge = new Map();
+  for (const s of shapes) if (s.o.kind === 'patch' && s.o.edges && s.pieces) for (const key of edgeKeysOf(s.o)) {
+    if (!key) continue;
+    const t = byEdge.get(key);
+    if (t === undefined) byEdge.set(key, s); else if (t !== s) byEdge.set(key, [t, s]);
+  }
+  const wholly = (t) => { const p0 = t.pieces[0]; return !!(p0.M || (p0.ref || p0).flat); };   // drawn whole: flat, or reused (front-facing)
+  const screenLen = (A, B) => { const a = projectPoint(A), b = projectPoint(B); return a.scale > 0 && b.scale > 0 ? Math.hypot(b.x - a.x, b.y - a.y) : -1; };
+  for (const s of shapes) {
+    const o = s.o;
+    if (o.kind !== 'patch' || !s.pieces || !s.pieces.length || !(s.pieces[0].ref || s.pieces[0]).floor) continue;
+    const lines = [], spikes = [];
+    const own = (x, z) => liftLocal(o, x - o.ox, z - o.oz).y;
+    const emit = (P, fill, groundY = own, keep = null, baseBelow = false) => {
+      if (silhouette.red) lines.push(P.map(projectPoint));
+      if (silhouette.spikes) { const sp = tuftPiece(P, fill, projectPoint, fit, groundY, keep, baseBelow); spikeStats.points += P.length; if (sp) { spikes.push(sp); spikeStats.pieces++; } }
+    };
+    for (const p of s.pieces) {
+      const r = p.ref || p, loop = r.loop, fill = p.fill;
+      if (!loop || r.water) continue;   // (no grass on water)
+      for (const sd of r.sides) {
+        if (sd.edge === undefined) {   // a contour side: points on the conic
+          if (p.M) continue;
+          if (sd.cl && r.G) {
+            const len = screenLen(liftLocal(o, sd.cl[0].x, sd.cl[0].z), liftLocal(o, sd.cl[1].x, sd.cl[1].z));
+            if (len < 0) continue;
+            emit(contourWorld(o, r.G, sd.cl[0], sd.cl[1], Math.max(1, Math.min(7, Math.ceil(Math.log2((1.3 * len) / RUN_SEG_PX + 1))))), fill);
+          } else if (sd.ring && sd.ua !== undefined) {
+            const [A, B] = ringWorld(o, sd.ring, sd.ua, sd.ub, 1), len = screenLen(A, B);
+            if (len < 0) continue;
+            emit(ringWorld(o, sd.ring, sd.ua, sd.ub, Math.max(2, Math.min(64, Math.ceil((1.3 * len) / RUN_SEG_PX)))), fill);
+          }
+          continue;
+        }
+        if (sd.edge === 'cut' && silhouette.shade && sd.piece !== undefined && loop[sd.piece]) {
+          // a SHADE BORDER (or a shore): this part sprouts tufts from its own side, shown where they poke past the border on screen
+          const pc = loop[sd.piece], W = (u) => { const q = pieceAt(pc, u); return liftLocal(o, q.x, q.z); };
+          const ua = Math.min(sd.ua, sd.ub), ub = Math.max(sd.ua, sd.ub), len = screenLen(W(ua), W(ub));
+          if (len < 0) continue;
+          const n = Math.max(1, Math.min(64, Math.ceil((pc.kind === 'arc' ? 1.3 : 1) * len / RUN_SEG_PX))), P = [];
+          for (let i = 0; i <= n; i++) P.push(W(ua + ((ub - ua) * i) / n));
+          // the part's side of the border: its loop's interior lies left of the piece's direction when the loop turns
+          // counterclockwise in (x, z); tested against the nearest chord of the run
+          const ccw = loopTurn(loop) > 0;
+          const keep = (x, z) => {
+            let best = Infinity, side = true;
+            for (let i = 0; i + 1 < P.length; i++) {
+              const A = P[i], B = P[i + 1], dx = B.x - A.x, dz = B.z - A.z, l2 = dx * dx + dz * dz || 1;
+              const t = Math.max(0, Math.min(1, ((x - A.x) * dx + (z - A.z) * dz) / l2)), ex = A.x + dx * t - x, ez = A.z + dz * t - z, d2 = ex * ex + ez * ez;
+              if (d2 < best) { best = d2; side = (dx * (z - A.z) - dz * (x - A.x) > 0) === ccw; }
+            }
+            return side;
+          };
+          emit(P, fill, own, keep, true);
+          continue;
+        }
+        if (!Number.isInteger(sd.edge) || sd.piece === undefined || !o.edges || !o.edges[sd.edge]) continue;
+        const pc = loop[sd.piece];
+        if (!pc || pc.kind !== 'line') continue;
+        const W = (u) => { const q = pieceAt(pc, u); return liftLocal(o, q.x, q.z); };
+        const l = byEdge.get(edgeKeysOf(o)[sd.edge]), N = Array.isArray(l) ? (l[0] === s ? l[1] : l[0]) : l === s ? null : l;
+        const ua = Math.min(sd.ua, sd.ub), ub = Math.max(sd.ua, sd.ub), runs = [];
+        if (!N || !N.pieces.length) {
+          // the terrain's BORDER (or a neighbor not drawn at all): grass only where the patch's ground lies below the edge on screen
+          // (seen from outside the terrain, the ground is above its border: spikes would point into the ground and their bases poke
+          // out below the edge as dark teeth)
+          const um = (ua + ub) / 2, qm = pieceAt(pc, um), M = liftLocal(o, qm.x, qm.z);
+          const lx = qm.x + (o.mid.x - o.ox - qm.x) * 0.05, lz = qm.z + (o.mid.z - o.oz - qm.z) * 0.05;
+          const pM = projectPoint(M), pI = projectPoint(liftLocal(o, lx, lz)), pU = projectPoint({ x: M.x, y: M.y + 1, z: M.z });
+          if (!(pM.scale > 0) || (pI.x - pM.x) * (pU.x - pM.x) + (pI.y - pM.y) * (pU.y - pM.y) > 0) continue;
+          runs.push([ua, ub]);
+        }
+        else if (!wholly(N)) {
+          // g of N along the stretch: a quadratic through three samples; the runs where it is <= 0
+          const g0 = facingAt(N.o, eye, W(ua)), gh = facingAt(N.o, eye, W((ua + ub) / 2)), g1 = facingAt(N.o, eye, W(ub));
+          const a = 2 * (g1 - 2 * gh + g0), b = 4 * gh - 3 * g0 - g1;   // g(v) = a v^2 + b v + g0, v in [0, 1]
+          const cuts = [0];
+          if (Math.abs(a) > 1e-12 * (Math.abs(b) + Math.abs(g0) + 1e-300)) {
+            const d = b * b - 4 * a * g0;
+            if (d > 0) { const q = Math.sqrt(d); cuts.push((-b - q) / (2 * a), (-b + q) / (2 * a)); }
+          } else if (Math.abs(b) > 1e-300) cuts.push(-g0 / b);
+          const vs = [...new Set(cuts.filter((v) => v > 0 && v < 1)), 1].sort((x, y) => x - y);
+          for (let i = 0; i + 1 < vs.length; i++) {
+            const vm = (vs[i] + vs[i + 1]) / 2;
+            if (a * vm * vm + b * vm + g0 <= 0) runs.push([ua + (ub - ua) * vs[i], ua + (ub - ua) * vs[i + 1]]);
+          }
+        }
+        for (const [u0, u1] of runs) {
+          const len = screenLen(W(u0), W(u1));
+          if (len < 0) continue;
+          const n = Math.max(1, Math.min(64, Math.ceil(len / RUN_SEG_PX))), P = [];
+          for (let i = 0; i <= n; i++) P.push(W(u0 + ((u1 - u0) * i) / n));
+          // tufts on the far side of the edge stand on the neighbor's ground
+          const E0 = W(0), E1 = W(1), ex = E1.x - E0.x, ez = E1.z - E0.z, sideOf = (x, z) => ex * (z - E0.z) - ez * (x - E0.x) > 0;
+          const mine = sideOf(o.mid.x, o.mid.z), No = N && N.o;
+          emit(P, fill, No ? (x, z) => (sideOf(x, z) === mine ? own(x, z) : liftLocal(No, x - No.ox, z - No.oz).y) : own);
+        }
+      }
+    }
+    s.pieces[0].silLines = lines;
+    if (spikes.length) s.pieces = s.pieces.concat(spikes);
+  }
+}
+
 const TERRAIN_TOL_PX = 0.5;   // canvas px
 
 
@@ -499,7 +730,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
           if (p.flat) stats.flat++;
           const base = part.fill || o.fill;   // a part's own color (water), else the patch's
           const sh = part.shade && light.on ? (part.lamp ? lampTone(base, shadeOf(base), part.lamp) : shadeOf(base)) : litOf(base);
-          pieces.push({ sides: p.sides, fill: sh, colors: SIDE_COLORS, keep: !o.move });
+          pieces.push({ sides: p.sides, fill: sh, colors: SIDE_COLORS, keep: !o.move, floor: true, loop: p.loop, G: p.G, flat: !!p.flat, water: !!part.fill });
         }
       }
       // the reference for later frames: only a patch with no contour (wholly front-facing) and a whole view of it
@@ -529,6 +760,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     setCrescents(o, pieces);
     s.pieces = pieces;
   }
+  if (silhouette.on) { const ts = performance.now(); silhouetteEdges(shapes, camPos, projectPoint, fit); spikeStats.ms = performance.now() - ts; }
   const t1 = performance.now();
   // Movers' shadows on the terrain (groundShadow.js): each drawn right after the last ground patch under it, inside the lit parts of
   // those patches (one clip of all of them), as the shade overlay.
@@ -557,7 +789,8 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     }
   }
   return { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo, projectPoint, camPos, forward: basis.forward,
-    sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit };
+    sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit,
+    silhouette: silhouette.on && silhouette.red ? { color: silhouette.color, px: silhouette.px } : null };
 }
 
 // Canvas 2D drawing of a frame (the reference backend).
@@ -631,6 +864,7 @@ export function drawIllusion2D(ctx, canvas, F) {
   if (typeof Path2D !== 'undefined') {
     const under = new Map();
     for (const s of shapes) if ((s.o.kind === 'patch' || s.o.kind === 'quad') && s.pieces) for (const p of s.pieces) {
+      if (p.spike) continue;
       let path = under.get(p.fill);
       if (!path) under.set(p.fill, (path = new Path2D()));
       traceInto(path, p);
@@ -652,6 +886,22 @@ export function drawIllusion2D(ctx, canvas, F) {
       } else if (p.alpha !== undefined && p.alpha < 1) {   // a fading piece (grass): translucent
         flush(); ctx.globalAlpha = p.alpha; drawShape(ctx, p, { stroke: strokes.on }); ctx.globalAlpha = 1; stats.fills++;
       } else { flush(); drawShape(ctx, p, { stroke: strokes.on }); stats.fills++; }
+    }
+    if (F.silhouette && o.kind === 'patch') {   // its silhouette sides, on top of it and under everything drawn later
+      let any = false;
+      for (const p of s.pieces) if (!p.M) {   // (a reused piece, under its map M, never has a contour)
+        for (const sd of p.sides) if (isSilhouetteSide(sd)) {
+          if (!any) { flush(); ctx.save(); ctx.beginPath(); any = true; }
+          const q = sideStart(sd);
+          ctx.moveTo(q.x, q.y); traceSide(ctx, sd);
+        }
+      }
+      for (const L of s.pieces[0].silLines || []) {
+        if (!any) { flush(); ctx.save(); ctx.beginPath(); any = true; }
+        ctx.moveTo(L[0].x, L[0].y);
+        for (let i = 1; i < L.length; i++) ctx.lineTo(L[i].x, L[i].y);
+      }
+      if (any) { ctx.strokeStyle = F.silhouette.color; ctx.lineWidth = F.silhouette.px / fit; ctx.lineCap = 'round'; ctx.stroke(); ctx.restore(); }
     }
     stats.drawn++;
     for (const sh of shadows) if (sh.last === si) { flush(); drawShadow(sh); }
@@ -681,7 +931,7 @@ function drawOverlay(ctx, F) {
     ctx.strokeStyle = ctx.fillStyle = darkMode ? '#ffffff' : '#000000';
     ctx.lineWidth = 1 / fit; ctx.lineJoin = 'round';
     ctx.beginPath();
-    for (const s of shapes) if (s.o.kind) for (const p of s.pieces) tracePath(ctx, p);
+    for (const s of shapes) if (s.o.kind) for (const p of s.pieces) if (!p.spike) tracePath(ctx, p);   // (not the grass edge's spikes)
     ctx.stroke();
     for (const s of shapes) if (!s.o.kind) for (const q of s.proj) { ctx.beginPath(); ctx.arc(q.x, q.y, 2, 0, Math.PI * 2); ctx.fill(); }
     // the BLOCK GRID (grid.js cubes, the player's scale) on the ground around the eye: the terrain's patches are no guide (flat ground

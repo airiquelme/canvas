@@ -35,6 +35,13 @@ const long = (pa, pb) => Math.hypot(pb.x - pa.x, pb.y - pa.y) > CHECK_PX;
 const add = (p, q, k = 1) => ({ x: p.x + q.x * k, y: p.y + q.y * k, z: p.z + q.z * k });
 const sub = (p, q) => ({ x: p.x - q.x, y: p.y - q.y, z: p.z - q.z });
 
+// The world point of a patch at local (x, z), and how much its top faces the eye at the world point X over it (g = n . (eye - X),
+// n = (-hx, 1, -hz): > 0 seen from above).
+export const liftLocal = (o, x, z) => ({ x: o.ox + x, y: o.oy + heightAt(o.q, x, z), z: o.oz + z });
+export function facingAt(o, eye, X) {
+  const x = X.x - o.ox, z = X.z - o.oz, [hx, hz] = slope(o.q, x, z), y = o.oy + heightAt(o.q, x, z);
+  return -hx * (eye.x - X.x) + (eye.y - y) - hz * (eye.z - X.z);
+}
 export const heightAt = (q, x, z) => q[0] * x * x + q[1] * x * z + q[2] * z * z + q[3] * x + q[4] * z + q[5];
 const slope = (q, x, z) => [2 * q[0] * x + q[1] * z + q[3], q[1] * x + 2 * q[2] * z + q[4]];
 const gAt = (G, x, z) => G[0] * x * x + G[1] * x * z + G[2] * z * z + G[3] * x + G[4] * z + G[5];
@@ -81,7 +88,7 @@ function curveSides(at, ua, ub, tag, out, depth = 0) {
     curveSides(at, (ua + ub) / 2, ub, tag, out, depth + 1);
     return;
   }
-  out.push({ ...side, ...tag });
+  out.push({ ...side, ...tag, ua, ub });   // ua, ub: its stretch of the piece it follows (boundary sides)
 }
 
 // The point of the conic g = 0 on the perpendicular bisector of R1 R2 nearest their midpoint (a contour arc's middle).
@@ -110,7 +117,7 @@ function contourSides(o, G, R1, R2, scr, out, depth = 0) {
     contourSides(o, G, M, R2, scr, out, depth + 1);
     return;
   }
-  out.push({ ...side, ci: 4 });
+  out.push({ ...side, ci: 4, cl: [R1, R2] });   // cl: its ends on the contour (local x, z)
 }
 
 function insideLoop(loop, p) {
@@ -194,14 +201,14 @@ export function patchPieces(o, projector, eye, pxScale = Infinity, loop = o.loop
   if (o.bulge !== undefined && o.bulge * pxScale < FLAT_PX && loop.every((pc) => pc.kind === 'line')) {   // flat on screen: its corners' polygon
     if (oneSided && loop.every((pc) => gAt(G, pc.a.x, pc.a.z) <= 0) && gAt(G, 0, 0) <= 0) return [];
     const Q = loop.map((pc) => projector.projectPoint(lift(o, pc.a.x, pc.a.z, 0, 0).X));
-    return [{ sides: Q.map((p, k) => ({ ...line(p, Q[(k + 1) % Q.length]), ci: k % 4, edge: loop[k].edge ?? k, front: true })), flat: true }];
+    return [{ sides: Q.map((p, k) => ({ ...line(p, Q[(k + 1) % Q.length]), ci: k % 4, edge: loop[k].edge ?? k, piece: k, ua: 0, ub: 1, front: true })), flat: true, loop }];
   }
   const at = (i) => (u) => { const p = pieceAt(loop[i], u); return scr(lift(o, p.x, p.z, p.dx, p.dz)); };
   // Boundary from (i, ua) to (j, ub), forward around the loop; arcs cut at ARC_STEP first.
   const span = (i, ua, j, ub, front, out) => {
     const one = (k, u0, u1) => {
       const pc = loop[k], n = pc.kind === 'arc' ? Math.max(1, Math.ceil((Math.abs(pc.t1 - pc.t0) * (u1 - u0)) / ARC_STEP)) : 1;
-      for (let m = 0; m < n; m++) curveSides(at(k), u0 + ((u1 - u0) * m) / n, u0 + ((u1 - u0) * (m + 1)) / n, { ci: k % 4, edge: pc.edge ?? k, front }, out);
+      for (let m = 0; m < n; m++) curveSides(at(k), u0 + ((u1 - u0) * m) / n, u0 + ((u1 - u0) * (m + 1)) / n, { ci: k % 4, edge: pc.edge ?? k, piece: k, front }, out);
     };
     if (i === j && ub > ua) { one(i, ua, ub); return; }
     one(i, ua, 1);
@@ -224,7 +231,7 @@ export function patchPieces(o, projector, eye, pxScale = Infinity, loop = o.loop
       const cs = [];
       const atC = (u) => { const t = u * 2 * Math.PI, c = Math.cos(t), s = Math.sin(t);
         return scr(lift(o, el.c.x + el.U.x * c + el.V.x * s, el.c.z + el.U.z * c + el.V.z * s, el.V.x * c - el.U.x * s, el.V.z * c - el.U.z * s)); };
-      for (let m = 0; m < 8; m++) curveSides(atC, m / 8, (m + 1) / 8, { ci: 4 }, cs);
+      for (let m = 0; m < 8; m++) curveSides(atC, m / 8, (m + 1) / 8, { ci: 4, ring: el }, cs);
       loops.push(cs);
     }
   } else {
@@ -261,7 +268,30 @@ export function patchPieces(o, projector, eye, pxScale = Infinity, loop = o.loop
     const oriented = screenArea(L) < 0 ? reversed(L) : L;
     oriented.forEach((sd, i) => sides.push(i === 0 && sides.length ? { ...sd, move: true } : sd));
   }
-  return sides.length ? [{ sides }] : [];
+  return sides.length ? [{ sides, loop, G }] : [];
+}
+
+// World points along a contour side (`cl`: its ends R1, R2 on the conic g = 0, G the patch's contour for that view), 2^depth + 1 of
+// them, each on the conic (bisector points, as the sides are built).
+export function contourWorld(o, G, R1, R2, depth) {
+  const out = [R1];
+  const rec = (a, b, d) => {
+    if (d === 0) { out.push(b); return; }
+    let m = bisect(G, a, b);
+    if (m.bad) m = { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 };
+    rec(a, m, d - 1); rec(m, b, d - 1);
+  };
+  rec(R1, R2, depth);
+  return out.map((p) => liftLocal(o, p.x, p.z));
+}
+// World points on a closed contour (`ring`: the ellipse c + U cos t + V sin t, t = 2 PI u) from ua to ub, n + 1 of them.
+export function ringWorld(o, el, ua, ub, n) {
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const t = 2 * Math.PI * (ua + ((ub - ua) * i) / n), c = Math.cos(t), sn = Math.sin(t);
+    out.push(liftLocal(o, el.c.x + el.U.x * c + el.V.x * sn, el.c.z + el.U.z * c + el.V.z * sn));
+  }
+  return out;
 }
 
 // The part of a loop (local x, z pieces) whose lifted points are at least `cut` deep (depth(worldPoint)), or null if none: the

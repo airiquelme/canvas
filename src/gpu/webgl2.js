@@ -212,6 +212,7 @@ export function createWebGL2(canvas, { preserveDrawingBuffer = false } = {}) {
     };
     gl.disable(gl.STENCIL_TEST);   // the ground underlay: plain quads at the farthest depth
     boxes(plan.under, { color: true, func: gl.ALWAYS });
+    boxes(plan.edges, { color: true, func: gl.ALWAYS });   // silhouette edges, at their patches' depths
     gl.enable(gl.STENCIL_TEST);
     // fills blend by their opacity (1 but for fading pieces), the canvas's alpha kept
     gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);

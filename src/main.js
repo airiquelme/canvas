@@ -5,7 +5,7 @@ import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from 
 import { render } from './meshes/render.js';
 import { renderShells } from './shells/shellRender.js';
 import { shells } from './shells/shell.js';
-import { grass, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion, buildIllusionFrame, drawIllusionOverlay, walkGround } from './illusion/illusionRender.js';
+import { grass, silhouette, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion, buildIllusionFrame, drawIllusionOverlay, walkGround } from './illusion/illusionRender.js';
 import { bestBackend } from './gpu/backend.js';
 import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
 import { light, setSun } from './illusion/light.js';
@@ -388,6 +388,12 @@ if (illusionScene) {
     tLabel();
     tb.addEventListener('click', () => { grass.tips = !grass.tips; tLabel(); tb.blur(); pendingDraw = true; });
     box.append(tb);
+    const sb = document.createElement('button');   // the grass edge's spikes along silhouettes and shade borders (illusionRender.js)
+    const sLabel = () => { sb.textContent = silhouette.spikes ? 'Spikes: on' : 'Spikes: off'; sb.style.background = silhouette.spikes ? '#1b5e20' : '#333'; };
+    sb.style.cssText = b.style.cssText;
+    sLabel();
+    sb.addEventListener('click', () => { silhouette.spikes = !silhouette.spikes; sLabel(); sb.blur(); pendingDraw = true; });
+    box.append(sb);
     const hint = document.createElement('div');
     hint.textContent = 'E: dig   R: place a cube (at the cross)   Enter: walk / fly';
     hint.style.cssText = 'font-size:12px; opacity:0.8; margin-top:2px;';
