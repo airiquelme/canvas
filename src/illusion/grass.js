@@ -26,9 +26,11 @@
 // to a point by itself); each side one exact arc; the start closed by a half circle. Every line starts the STANDARD LINE wide
 // (config.js LINE_PX, design px) on screen, whatever its blade's size or distance (a stylized stroke; dk may pass the blade's own edges, |k| > 1). Small and curved blades alike; never the lit face. Off: the leaves.
 // FACES (`faces`, the leaves' blades, density and growth): each blade shows only the face that differs from the ground under it
-// (the shadow test at its foot, as tips): on lit ground its SHADE part (shade tone), on ground in shade its LIT part (the ground's
-// lit tone: the share 1 - fSun of its width from the edge facing the sun, fSun its shade share as if the shadow were not there);
-// with the sun down, none. Every blade is the curved leaf, at any size (no small triangles: switching flickered). As tall as
+// (the shadow test at its foot, as tips), WHOLE OR NOT AT ALL (no partial shade), decided by the sun's direction alone: the face seen
+// is lit when it faces the sun (n . sun on the eye's side of the leaf), else in shade. On lit ground a blade whose seen face is in
+// shade is drawn whole in the shade tone; on ground in shade one whose seen face is lit, whole in the ground's lit tone; any other
+// blade is the ground's own tone and is not drawn; with the sun down, none. (The leaves, `faces` off, take the same all-or-nothing
+// shade; the tips keep a share of the width, which places their line.) Every blade is the curved leaf, at any size (no small triangles: switching flickered). As tall as
 // the grass edge's tufts (illusionRender.js: TUFT_ASPECT x TUFT_R x TUFT_CELL = 4.32, x 0.7-1.3): each blade's height (and curl)
 // mapped from H_MIN..H_MAX onto FACE_H_MIN..FACE_H_MAX. Blades come and go by their WIDTH (0 to full; the patch's width fade times
 // their thinning fade), opaque and at full height: no opacity steps, no sliver cutoff.
@@ -49,13 +51,33 @@ const WIDTH_STD = 2.3, W_VANISH = 1.2, W_FULL = 2.0;
 // Thinning fades too: a blade whose rank is within the last RANK_FADE of the share kept at its distance is grown only partly.
 const RANK_FADE = 0.35;
 const smooth = (u) => { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); };
-// A blade grown to g of its size (scaled about its base).
-function grownBy(b, g) {
-  const sc = (v) => ({ x: v.x * g, y: v.y * g, z: v.z * g }), W = sc(b.W), L = sc(b.L), Y = sc(b.Y);
-  return { ...b, W, L, Y, h: b.h * g, tip: { x: b.base.x + L.x + Y.x, y: b.base.y + L.y + Y.y, z: b.base.z + L.z + Y.z },
-    mid: { x: b.base.x + (b.mid.x - b.base.x) * g, y: b.base.y + (b.mid.y - b.base.y) * g, z: b.base.z + (b.mid.z - b.base.z) * g } };
+// A blade grown to g of its size (scaled about its base), its width further by wg: written into the one object kept per blade for
+// this (b.view, reused every frame: a blade is drawn at most once per frame), so no blade is copied per frame.
+// WIND (wind.js): blade v (a view, grownInto) tilted by lean [lx, lz] (radians, toward its direction): its height h becomes
+// h cos th and its tip moves h sin th along the lean, through the curl L, so the blade keeps its length and bends most near its tip;
+// every curve c_k is still a plane 3D ellipse (C = B + k W + L, U = -L, V = Y - k W): the same exact arcs.
+function leanInto(v, lean) {
+  const lx = lean[0], lz = lean[1], th = Math.hypot(lx, lz);
+  if (!(th > 1e-6)) return;
+  const h = v.Y.y, s = (h * Math.sin(th)) / th, B = v.base;
+  v.L.x += lx * s; v.L.z += lz * s;
+  v.Y.y = h * Math.cos(th);
+  v.tip.x = B.x + v.L.x + v.Y.x; v.tip.y = B.y + v.L.y + v.Y.y; v.tip.z = B.z + v.L.z + v.Y.z;
+  v.mid.x = B.x + v.L.x * 0.3 + v.Y.x * 0.7; v.mid.y = B.y + v.L.y * 0.3 + v.Y.y * 0.7; v.mid.z = B.z + v.L.z * 0.3 + v.Y.z * 0.7;
+}
+function grownInto(b, g, wg = 1) {
+  const v = b.view || (b.view = { ...b, view: undefined, W: { x: 0, y: 0, z: 0 }, L: { x: 0, y: 0, z: 0 }, Y: { x: 0, y: 0, z: 0 }, tip: { x: 0, y: 0, z: 0 }, mid: { x: 0, y: 0, z: 0 } });
+  const gw = g * wg, B = b.base;
+  v.W.x = b.W.x * gw; v.W.z = b.W.z * gw;
+  v.L.x = b.L.x * g; v.L.y = b.L.y * g; v.L.z = b.L.z * g;
+  v.Y.x = b.Y.x * g; v.Y.y = b.Y.y * g; v.Y.z = b.Y.z * g;
+  v.h = b.h * g;
+  v.tip.x = B.x + v.L.x + v.Y.x; v.tip.y = B.y + v.L.y + v.Y.y; v.tip.z = B.z + v.L.z + v.Y.z;
+  v.mid.x = B.x + (b.mid.x - B.x) * g; v.mid.y = B.y + (b.mid.y - B.y) * g; v.mid.z = B.z + (b.mid.z - B.z) * g;
+  return v;
 }
 const SLIVER_PX = 0.5;    // a curved blade's shade narrower than this (at the base, on screen) is not drawn
+const EDGE_PX = 1, EDGE_ACROSS = 0.5;   // a curved blade narrower than EDGE_PX on screen (canvas px) seen near edge-on is not drawn
 const H_MIN = 7, H_MAX = 16;
 const TIP_H = 1;          // tips: the share of a blade's height drawn, from the top (1: down to the ground)
 const H_STD = (7 + 16) / 2;   // tips: the standard blade's height (the cutoff by distance assumes it)
@@ -141,7 +163,7 @@ function tipLine(b, pp, T, P, out) {
 // atGround (tips): the shadow test at the blade's foot on the ground, as the ground's own shade parts: a line is only seen against the
 // ground it stands on (at its middle, 0.7 of its height up, a blade near a shade border counted as lit over shaded ground, and its
 // fading line, mixed toward the lit tone, showed as a bright line on the shade).
-function shadeOfBlade(b0, b, F, L, eye, atGround = false) {
+function shadeOfBlade(b0, b, F, L, eye, atGround = false, binary = false) {
   if (!L) { b.f = 0; b.edge = 1; return; }
   if (b0.shadowOf !== F || b0.shadowAt !== atGround) {
     b0.shadowOf = F; b0.shadowAt = atGround;
@@ -150,7 +172,9 @@ function shadeOfBlade(b0, b, F, L, eye, atGround = false) {
   }
   b.inShadow = b0.inShadow;
   const nn = b.n, seen = nn.x * (eye.x - b.mid.x) + nn.z * (eye.z - b.mid.z), lit = nn.x * L.x + nn.z * L.z, a = Math.min(1, Math.abs(lit));
-  b.fSun = L.y <= 0 ? 1 : seen * lit > 0 ? (1 - a) / 2 : (1 + a) / 2;   // as if no shadow (faces: the lit part on shaded ground)
+  // as if no shadow (faces: the lit part on shaded ground). Tips: a share of the width (it places their line). Faces and leaves: ALL
+  // OR NOTHING, from the sun's direction alone: the face seen is wholly lit when it faces the sun, else wholly in shade
+  b.fSun = L.y <= 0 ? 1 : binary ? (seen * lit > 0 ? 0 : 1) : seen * lit > 0 ? (1 - a) / 2 : (1 + a) / 2;
   b.f = b.inShadow ? 1 : b.fSun;   // the sun down: all shade
   b.edge = b.W.x * L.x + b.W.z * L.z > 0 ? -1 : 1;   // the edge away from the sun
 }
@@ -190,7 +214,8 @@ function bladesUpTo(leaf, T, m) {
 }
 
 // This frame's grass: { curved: [blades, with host, fill, f, edge], specks: [{ host, sides, depth }] (one per patch) }.
-export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frustum, near = 1, fit = 1, tips = false, faces = false }) {
+// sway (wind.js windAt): (x, z) => the lean at a ground point, or null (no wind).
+export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frustum, near = 1, fit = 1, tips = false, faces = false, sway = null }) {
   if (tips) faces = false;
   const curved = [], specks = [];
   let count = 0;
@@ -231,9 +256,26 @@ export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frust
       const wg = faces ? gw * gr : 1;   // faces: the width's share (0 -> 1)
       if (g < 0.04 || wg < 0.02 || alpha < 0.5 / FADE_LEVELS) continue;
       // faces: the tufts' height, the width grown from 0
-      const b = faces ? { ...grownBy(b0, g), W: { x: b0.W.x * wg, y: 0, z: b0.W.z * wg } } : g < 0.999 ? grownBy(b0, g) : b0;
+      const b = faces || g < 0.999 || sway ? grownInto(b0, g, faces ? wg : 1) : b0;
+      if (sway) leanInto(b, sway(P[j], P[j + 2]));   // the wind at its base
+      let litFace = false;
+      if (faces && L) {   // the face that differs from the ground at its foot
+        shadeOfBlade(b0, b, F, L, eye, true, true);
+        if (L.y <= 0) continue;   // the sun down: blades and ground alike in shade
+        if (b.inShadow) { if (b.fSun >= 0.98) continue; litFace = true; }   // shaded ground: its lit face (when the face seen faces the sun)
+        else if (b.f <= 0.02) continue;                                     // lit ground: its shade face (when it faces away)
+      }
       const z = toCamera(b.mid).z;
       if (z <= near + b.h) continue;
+      // EDGE-ON: a leaf seen nearly along its own plane is a sliver: its width on screen, 2 |W| |n . v| (v the unit direction to the
+      // eye, n the leaf's normal) times px per unit, under EDGE_PX canvas px, and seen more than 60 degrees from face-on (|n . v| <
+      // EDGE_ACROSS, so it is thin because of the angle, not of the distance: far blades seen face-on stay): not drawn (the curved
+      // leaves; the tips' lines keep the standard width at any angle)
+      if (!tips) {
+        const vx = eye.x - b.mid.x, vy = eye.y - b.mid.y, vz = eye.z - b.mid.z, vl = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        const across = Math.abs(b.n.x * vx + b.n.z * vz) / vl, w = Math.hypot(b.W.x, b.W.z);
+        if (across < EDGE_ACROSS && 2 * w * across * (persp.s / z) * fit < EDGE_PX) continue;
+      }
       const px = (b.h * persp.s) / z;   // its height on screen
       b0.curvedOn = faces || (b0.curvedOn ? px >= CURVE_OFF : px >= CURVE_ON);   // faces: always the curved leaf (no triangles)
       if (tips) {
@@ -242,13 +284,6 @@ export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frust
         if (L && (b.inShadow || L.y <= 0)) continue;
         if (!L) b.f = 1;   // the light off: the whole tip
         if (b.f <= 0.02) continue;
-      }
-      let litFace = false;
-      if (faces && L) {   // the face that differs from the ground at its foot
-        shadeOfBlade(b0, b, F, L, eye, true);
-        if (L.y <= 0) continue;   // the sun down: blades and ground alike in shade
-        if (b.inShadow) { if (b.fSun >= 0.98) continue; litFace = true; }   // shaded ground: its lit part
-        else if (b.f <= 0.02) continue;                                     // lit ground: its shade part
       }
       if (!b0.curvedOn && tips) {   // its shade line, in its fade level's path
         const lv = Math.min(FADE_LEVELS, Math.round(alpha * FADE_LEVELS));
@@ -267,7 +302,7 @@ export function selectGrass(T, eye, { F, L, toCamera, projectPoint, persp, frust
       b.fill = litOf(b.ground);   // its lit face: the ground's lit tone
       b.host = leaf;
       b.dist = db;
-      if (!tips && !faces) shadeOfBlade(b0, b, F, L, eye);
+      if (!tips && !faces) shadeOfBlade(b0, b, F, L, eye, false, true);
       b.litFace = litFace; b.faces = faces && !!L;
       b.alpha = Math.round(alpha * FADE_LEVELS) / FADE_LEVELS;
       curved.push(b);

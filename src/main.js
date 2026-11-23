@@ -5,8 +5,9 @@ import { buildBasicScene, buildFullScene, buildShellScene, nodes, meshes } from 
 import { render } from './meshes/render.js';
 import { renderShells } from './shells/shellRender.js';
 import { shells } from './shells/shell.js';
-import { grass, silhouette, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion, buildIllusionFrame, drawIllusionOverlay, walkGround } from './illusion/illusionRender.js';
+import { grass, silhouette, groundShade, meadowSun, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion, buildIllusionFrame, drawIllusionOverlay, walkGround } from './illusion/illusionRender.js';
 import { bestBackend } from './gpu/backend.js';
+import { wind } from './illusion/wind.js';
 import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
 import { light, setSun } from './illusion/light.js';
 
@@ -26,12 +27,14 @@ if (illusionAtLoad && wantedBackend !== 'canvas') {
   gpu = await bestBackend(gpuCanvas, wantedBackend);
   if (!gpu || gpu.name === 'canvas') { gpuCanvas.remove(); gpuCanvas = null; gpu = null; }
 }
+// The GPU backends shade the ground per pixel (illusionRender.js `groundShade`): the meadow is then built without shade parts
+groundShade.pixel = !!gpu;
 // The illusion scenes paint their whole background every frame, so on its own their canvas is opaque (alpha: false): the browser
 // then composites it without blending it over the page. Over a GPU canvas it is a transparent overlay.
 const ctx = canvas.getContext('2d', illusionAtLoad && !gpu ? { alpha: false } : undefined);
 
-// Canvas pixels per CSS pixel. The illusion world's Quality (panel) sets it; Auto lowers it while frames are slow and raises it
-// back when they are fast (the shapes are vectors, so a lower resolution only softens their edges).
+// Canvas pixels per CSS pixel. The illusion world's Quality (panel) sets it, 100% unless chosen: the resolution is never lowered
+// on its own (no automatic quality: what to lower when frames are slow is decided elsewhere, never the pixel count).
 let renderScale = 1;
 function resizeCanvas() {
   canvas.width = Math.max(1, Math.round(window.innerWidth * renderScale));
@@ -241,18 +244,17 @@ if (worldScene) {
   slider('Movers', 'movers', 3000, 50);
   slider('Walls', 'walls', 240, 12);
   slider('Sheets', 'sheets', 5000, 100);
-  {   // Quality: the canvas resolution (Auto: adapts to the frame rate)
+  {   // Quality: the canvas resolution (only when chosen here)
     const row = document.createElement('label');
     row.style.cssText = 'display:flex; align-items:center; gap:8px;';
     const name = document.createElement('span'); name.textContent = 'Quality'; name.style.width = '64px';
     const sel = document.createElement('select');
     sel.style.flex = '1';
-    for (const [v, t] of [['auto', 'Auto (adapts to the frame rate)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']]) {
+    for (const [v, t] of [['1', '100%'], ['0.75', '75%'], ['0.5', '50%']]) {
       const op = document.createElement('option'); op.value = v; op.textContent = t; sel.append(op);
     }
     sel.addEventListener('change', () => {
-      quality = sel.value;
-      setRenderScale(quality === 'auto' ? 1 : Number(quality));
+      setRenderScale(Number(sel.value));
       sel.blur();   // so Space / WASD go to the camera
     });
     row.append(name, sel);
@@ -263,34 +265,12 @@ if (worldScene) {
   panel.append(statsEl);
   document.body.append(panel);
 }
-// Auto quality: once a second, from the last frames' mean interval. Slower than 45 fps: an eighth less resolution (down to 50%);
-// faster than 55 fps: an eighth more (up to 100%). A rise that had to be undone within 5 s is not tried again for 10 s, so it
-// doesn't seesaw between two levels.
-let quality = 'auto', lastAdapt = 0, lastRise = -1e9, noRiseUntil = 0;
 function setRenderScale(k) {
   if (k === renderScale) return;
   renderScale = k;
   resizeCanvas();
   frameTimes.length = 0;
   drawFrame();
-}
-function adaptQuality(now) {
-  if (quality !== 'auto' || now - lastAdapt < 1000 || frameTimes.length < 20) return;
-  lastAdapt = now;
-  const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
-  // Against the target: uncapped 45 / 55 fps as before; capped, slow when frames miss the cap (under 0.8 of it), fast only when
-  // the cap is held and drawing's JS takes under 40% of the interval (the cap hides how much faster it could go).
-  const target = tracker.capped ? CAP_FPS : 60;
-  const js = tracker.work.length ? tracker.work.reduce((a, b) => a + b, 0) / tracker.work.length : 0;
-  const slow = tracker.capped ? avg > 1000 / (0.8 * CAP_FPS) : avg > 1000 / 45;
-  const fast = tracker.capped ? avg < 1000 / (0.95 * target) && js < 0.4 * 1000 / target : avg < 1000 / 55;
-  if (slow && renderScale > 0.5) {
-    if (now - lastRise < 5000) noRiseUntil = now + 10000;
-    setRenderScale(Math.max(0.5, renderScale - 0.125));
-  } else if (fast && renderScale < 1 && now > noRiseUntil) {
-    lastRise = now;
-    setRenderScale(Math.min(1, renderScale + 0.125));
-  }
 }
 // The panel's text and the bottom bar are rewritten 4 times a second, not every frame (each rewrite is a page layout).
 let lastUi = 0;
@@ -299,7 +279,7 @@ function showStats() {
   if (!statsEl || !lastStats || !frameTimes.length) return;
   const st = lastStats, avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
   statsEl.textContent =
-    `frame  ${avg.toFixed(1)} ms  (${(1000 / avg).toFixed(0)} fps)  resolution ${Math.round(renderScale * 100)}%${quality === 'auto' ? ' (auto)' : ''}\n` +
+    `frame  ${avg.toFixed(1)} ms  (${(1000 / avg).toFixed(0)} fps)  resolution ${Math.round(renderScale * 100)}%\n` +
     `build  ${st.buildMs.toFixed(1)} ms  curved ${st.curvedMs.toFixed(1)} ms\n` +
     `draw   ${st.drawMs.toFixed(1)} ms\n` +
     `shapes ${st.drawn} drawn (${st.curved} curved, ${st.simplified} simplified, ${st.sheets} sheets) of ${st.objects}${st.skipped ? ` (${st.skipped} left out: no free spot)` : ''}\n` +
@@ -339,7 +319,13 @@ const strokeBtn = document.getElementById('strokeBtn');
 if (strokeBtn) {
   const label = () => { strokeBtn.textContent = strokes.on ? 'Strokes: on' : 'Strokes: off'; strokeBtn.style.background = strokes.on ? '#1b5e20' : '#333'; };
   label();
-  strokeBtn.addEventListener('click', () => { strokes.on = !strokes.on; label(); drawFrame(); });
+  strokeBtn.addEventListener('click', () => {
+    strokes.on = !strokes.on;
+    // Strokes draw with Canvas 2D, which can't shade the ground per pixel: the meadow is rebuilt with shade parts (and back)
+    const pixel = !!gpu && !strokes.on;
+    if (meadowScene && groundShade.pixel !== pixel) { groundShade.pixel = pixel; buildMeadowScene(); }
+    label(); drawFrame();
+  });
 }
 
 const lightBtn = document.getElementById('lightBtn');
@@ -348,26 +334,27 @@ if (lightBtn) {   // the illusion scenes: the stylized sun (light.js); the other
   const label = () => { lightBtn.textContent = on() ? 'Light: on' : 'Light: off'; lightBtn.style.background = on() ? '#1b5e20' : '#333'; };
   label();
   lightBtn.addEventListener('click', () => {
-    if (illusionScene) { light.on = !light.on; if (meadowScene) buildMeadowScene(); }   // the meadow's shade regions are built with the sun
+    if (illusionScene) { light.on = !light.on; if (meadowScene) meadowSun(); }   // the meadow's shade is built with the sun
     else lighting.on = !lighting.on;
     label(); drawFrame();
   });
 }
 
-// The sun (illusion scenes): direction and height above the horizon. The meadow rebuilds its shade regions when a slider is let go
-// (about 0.2 s); the other scenes follow while dragging.
+// The sun (illusion scenes): direction and height above the horizon. The meadow redoes its shade when a slider is let go (its
+// shade field, about 40 ms, with per-pixel ground shade; else a whole rebuild); the other scenes follow while dragging.
 if (illusionScene) {
   const box = document.createElement('div');
   box.style.cssText = 'position:fixed; left:16px; top:64px; z-index:10; font:13px sans-serif; color:#fff; background:rgba(51,51,51,0.85);' +
     'padding:8px 12px; border-radius:6px; display:flex; flex-direction:column; gap:4px; width:240px;';
-  const row = (label, min, max, value, set) => {
+  // a slider: degrees (set gets radians) unless `unit` / `scale` say otherwise; `sun`: letting go redoes the meadow's shade
+  const row = (label, min, max, value, set, { unit = '°', scale = Math.PI / 180, sun = true } = {}) => {
     const r = document.createElement('label');
     r.style.cssText = 'display:flex; align-items:center; gap:8px;';
     const name = document.createElement('span'); name.textContent = label; name.style.width = '58px';
     const input = document.createElement('input'); input.type = 'range'; input.min = min; input.max = max; input.step = 1; input.value = value;
     input.style.flex = '1';
-    const val = document.createElement('span'); val.textContent = value + '\u00b0'; val.style.cssText = 'width:36px; text-align:right; font-family:monospace;';
-    const apply = (rebuild) => { val.textContent = input.value + '\u00b0'; set(Number(input.value) * Math.PI / 180); if (rebuild && meadowScene) buildMeadowScene(); pendingDraw = true; };
+    const val = document.createElement('span'); val.textContent = value + unit; val.style.cssText = 'width:36px; text-align:right; font-family:monospace;';
+    const apply = (rebuild) => { val.textContent = input.value + unit; set(Number(input.value) * scale); if (rebuild && sun && meadowScene) meadowSun(); pendingDraw = true; };
     input.addEventListener('input', () => apply(false));
     input.addEventListener('change', () => { apply(true); input.blur(); });
     r.append(name, input, val);
@@ -375,6 +362,10 @@ if (illusionScene) {
   };
   row('Sun dir', 0, 360, Math.round(light.azimuth * 180 / Math.PI), (a) => setSun(a, light.elevation));
   row('Sun height', -10, 80, Math.round(light.elevation * 180 / Math.PI), (e) => setSun(light.azimuth, e));
+  if (meadowScene) {   // the wind (wind.js): the direction it blows toward, and how hard (x the grass's lean)
+    row('Wind dir', 0, 360, Math.round(((wind.angle * 180) / Math.PI + 360) % 360), (a) => { wind.angle = a; }, { sun: false });
+    row('Wind', 0, 200, Math.round(wind.strength * 100), (k) => { wind.strength = k; }, { unit: '%', scale: 0.01, sun: false });
+  }
   if (meadowScene) {   // grass from the patches' seeds (grass.js)
     const b = document.createElement('button');
     const label = () => { b.textContent = grass.on ? 'Grass: on' : 'Grass: off'; b.style.background = grass.on ? '#1b5e20' : '#333'; };
@@ -382,6 +373,12 @@ if (illusionScene) {
     label();
     b.addEventListener('click', () => { grass.on = !grass.on; label(); b.blur(); pendingDraw = true; });
     box.append(b);
+    const wb = document.createElement('button');   // the wind (wind.js): the blades and the grass edge's tufts sway in waves
+    const wLabel = () => { wb.textContent = wind.on ? 'Wind: on' : 'Wind: off'; wb.style.background = wind.on ? '#1b5e20' : '#333'; };
+    wb.style.cssText = b.style.cssText;
+    wLabel();
+    wb.addEventListener('click', () => { wind.on = !wind.on; wLabel(); wb.blur(); pendingDraw = true; });
+    box.append(wb);
     const tb = document.createElement('button');   // the blades' style: shaded tips only (a texture) or whole leaves
     const tLabel = () => { tb.textContent = grass.faces ? 'Grass: faces' : grass.tips ? 'Grass: tips' : 'Grass: leaves'; tb.style.background = grass.faces || grass.tips ? '#1b5e20' : '#333'; };
     tb.style.cssText = b.style.cssText;
@@ -486,7 +483,6 @@ function loop(timestamp) {
       if (lastTime0) { frameTimes.push(timestamp - lastTime0); if (frameTimes.length > 30) frameTimes.shift(); }
       lastTime0 = timestamp;
       drawFrame(); trackFrame(timestamp);
-      adaptQuality(timestamp);
       if (uiDue(timestamp)) { syncAngleUi(); showStats(); }
     } else if (updateFly(dt) || pendingDraw) { pendingDraw = false; drawFrame(); trackFrame(timestamp); if (uiDue(timestamp)) syncAngleUi(); }
   } else if (!paused) {

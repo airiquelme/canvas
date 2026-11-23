@@ -3,6 +3,9 @@
 // evaluates u^2 + v^2 <= 1 at each of the 4 standard sample positions (its (u, v) are affine on screen, so extrapolating them by
 // their screen derivatives is exact) and writes the result as the sample mask, instead of WebGL2's alpha-to-coverage.
 // Stencil masks are pipeline state in WebGPU, so every stencil operation of the passes is its own pipeline.
+// PER-PIXEL GROUND SHADE (F.pixelGround): as webgl2.js (its COVER_FS has the description): the ground pieces' data and the shade
+// field as textures (textureLoad), the camera, field, movers and lamps in a second uniform block. Only the cover passes that write
+// color run it (fsCover); the stencil-only ones use fsPlain.
 import { createFramePlanner, rgbOf } from './plan.js';
 import { skyParams } from '../illusion/sky.js';
 import { light, shadeOverlay } from '../illusion/light.js';
@@ -10,8 +13,76 @@ import { DESIGN_WIDTH, DESIGN_HEIGHT } from '../config.js';
 
 const SAMPLES = 4;
 const SHADER = /* wgsl */ `
+// a ground fragment returns early unless it is ground: gid is flat per triangle, so a 2 x 2 quad never diverges (derivatives stay
+// defined), which the static uniformity analysis can't see
+diagnostic(off, derivative_uniformity);
 struct U { xf: vec4f, size: vec2f, _p: vec2f, zen: vec4f, mid: vec4f, hor: vec4f, sunc: vec4f, gy: vec4f, sun: vec4f };
 @group(0) @binding(0) var<uniform> u: U;
+struct G { eye: vec4f, camR: vec4f, camU: vec4f, camF: vec4f, persp: vec4f, fA: vec4f, fB: vec4f, fN: vec4f, sunL: vec4f,
+  counts: vec4f,   // mode (0 none, 1 field + movers, 2 all shade), hasField, nCast, nLamp
+  castA: array<vec4f, 16>, castB: array<vec4f, 16>, lampP: array<vec4f, 4>, lampC: array<vec4f, 4> };
+@group(0) @binding(1) var<uniform> gu: G;
+@group(0) @binding(2) var gdata: texture_2d<f32>;
+@group(0) @binding(3) var field: texture_2d<f32>;
+fn gd(k: i32) -> vec4f { return textureLoad(gdata, vec2i(k % 1024, k / 1024), 0); }
+fn fieldAt(xz: vec2f) -> f32 {
+  let d = xz - gu.fA.xy;
+  let uu = dot(d, gu.fA.zw); let vv = dot(d, vec2f(-gu.fA.w, gu.fA.z));
+  let fi = (gu.fB.x - uu) / gu.fB.z; let fj = (vv - gu.fB.y) / gu.fB.z;
+  let i = clamp(floor(fi), 0.0, gu.fN.x - 2.0); let j = clamp(floor(fj), 0.0, gu.fN.y - 2.0);
+  let a = clamp(fi - i, 0.0, 1.0); let b = clamp(fj - j, 0.0, 1.0);
+  let k = vec2i(i32(i), i32(j));
+  let d00 = textureLoad(field, k, 0).r; let d10 = textureLoad(field, k + vec2i(1, 0), 0).r;
+  let d01 = textureLoad(field, k + vec2i(0, 1), 0).r; let d11 = textureLoad(field, k + vec2i(1, 1), 0).r;
+  return mix(mix(d00, d10, a), mix(d01, d11, a), b);
+}
+fn raySeg(P: vec3f, L: vec3f, A: vec3f, B: vec3f) -> vec2f {
+  let v = B - A; let c = max(dot(v, v), 1e-9);
+  var t = clamp(dot(P - A, v) / c, 0.0, 1.0); var s = 0.0;
+  for (var it = 0; it < 3; it++) { s = max(0.0, dot(A + v * t - P, L)); t = clamp(dot(P + L * s - A, v) / c, 0.0, 1.0); }
+  return vec2f(length(P + L * s - (A + v * t)), t);
+}
+fn groundColor(fc: vec2f, rgba: vec4f, gid: f32) -> vec4f {
+  let g = i32(gid) * 4;
+  let G0 = gd(g); let G1 = gd(g + 1); let G2 = gd(g + 2); let G3 = gd(g + 3);
+  let dp = (fc - u.xf.yz) / u.xf.x;
+  let D = gu.camF.xyz + ((dp.x - gu.persp.y) / gu.persp.x) * gu.camR.xyz - ((dp.y - gu.persp.z) / gu.persp.x) * gu.camU.xyz;
+  let k2 = -(G0.x * D.x * D.x + G0.y * D.x * D.z + G0.z * D.z * D.z); let k1 = D.y - G0.w * D.x - G1.x * D.z; let k0 = G1.y;
+  var t = 0.0;
+  if (abs(k2) < 1e-9 * abs(k1)) { t = -k0 / k1; }
+  else {
+    let disc = k1 * k1 - 4.0 * k2 * k0;
+    if (disc < 0.0) { t = -k1 / (2.0 * k2); }
+    else {
+      let q = -0.5 * (k1 + select(-1.0, 1.0, k1 >= 0.0) * sqrt(disc)); let r1 = q / k2; let r2 = k0 / q;
+      let h1 = G1.zw + r1 * D.xz; let h2 = G1.zw + r2 * D.xz;
+      t = select(r2, r1, r1 > 0.0 && (dot(h1, h1) < dot(h2, h2) || r2 <= 0.0));
+    }
+  }
+  let P = gu.eye.xyz + max(t, 0.0) * D;
+  let pw = max(length(fwidth(P)), 1e-4);   // (the antialiasing width: no derivative inside the loops, webgl2.js)
+  var sh = 0.0;
+  if (gu.counts.y > 0.5) { let fd = fieldAt(P.xz); sh = clamp((fd - gu.fB.w) / max(fwidth(fd), 1e-4) + 0.5, 0.0, 1.0); }
+  let cm = u32(G3.z); let lm = u32(G3.w);   // the movers and lamps that can reach this piece (plan.js reachOf)
+  for (var i = 0; i < 16; i++) {
+    if (f32(i) >= gu.counts.z) { break; }
+    if (((cm >> u32(i)) & 1u) == 0u) { continue; }
+    let dr = raySeg(P, gu.sunL.xyz, gu.castA[i].xyz, gu.castB[i].xyz);
+    let dd = dr.x - mix(gu.castA[i].w, gu.castB[i].w, dr.y);
+    sh = max(sh, clamp(0.5 - dd / pw, 0.0, 1.0));
+  }
+  if (gu.counts.x > 1.5) { sh = 1.0; }
+  var best = 0.0; var lc = vec3f(0.0);
+  for (var i = 0; i < 4; i++) {
+    if (f32(i) >= gu.counts.w) { break; }
+    if (((lm >> u32(i)) & 1u) == 0u) { continue; }
+    let dl = length(P - gu.lampP[i].xyz) / gu.lampP[i].w; let w = pw / gu.lampP[i].w;
+    let lv = 0.22 * clamp((1.0 - dl) / w + 0.5, 0.0, 1.0) + 0.26 * clamp((0.66 - dl) / w + 0.5, 0.0, 1.0) + 0.27 * clamp((0.33 - dl) / w + 0.5, 0.0, 1.0);
+    if (lv > best) { best = lv; lc = gu.lampC[i].rgb; }
+  }
+  let shadeC = mix(G2.xyz, vec3f(G2.w, G3.x, G3.y) * lc, best);
+  return vec4f(mix(rgba.rgb, shadeC, sh), rgba.a);
+}
 
 fn clip(pos: vec2f, z: f32) -> vec4f {
   let p = vec2f(u.xf.x * pos.x + u.xf.y, u.xf.x * pos.y + u.xf.z);
@@ -41,11 +112,15 @@ struct FOut { @location(0) color: vec4f, @builtin(sample_mask) mask: u32 };
   return o;
 }
 
-struct COut { @builtin(position) pos: vec4f, @location(0) rgba: vec4f };
-@vertex fn vsCover(@location(0) pos: vec2f, @location(1) z: f32, @location(2) rgba: vec4f) -> COut {
-  var o: COut; o.pos = clip(pos, z * 0.5 + 0.5); o.rgba = rgba; return o;   // (clip-space z in -1..1 as in WebGL -> 0..1)
+struct COut { @builtin(position) pos: vec4f, @location(0) rgba: vec4f, @location(1) @interpolate(flat) gid: f32 };
+@vertex fn vsCover(@location(0) pos: vec2f, @location(1) z: f32, @location(2) rgba: vec4f, @location(3) gid: f32) -> COut {
+  var o: COut; o.pos = clip(pos, z * 0.5 + 0.5); o.rgba = rgba; o.gid = gid; return o;   // (clip-space z in -1..1 as in WebGL -> 0..1)
 }
-@fragment fn fsCover(i: COut) -> @location(0) vec4f { return i.rgba; }
+@fragment fn fsCover(i: COut) -> @location(0) vec4f {
+  if (i.gid < 0.0 || gu.counts.x < 0.5) { return i.rgba; }
+  return groundColor(i.pos.xy, i.rgba, i.gid);   // (pos.xy: framebuffer px, y down)
+}
+@fragment fn fsPlain(i: COut) -> @location(0) vec4f { return i.rgba; }
 
 struct KOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 @vertex fn vsSky(@builtin(vertex_index) vi: u32) -> KOut {
@@ -81,12 +156,54 @@ export async function createWebGPU(canvas, { preserveDrawingBuffer = false } = {
   ctx.configure({ device, format, alphaMode: 'opaque', usage: GPUTextureUsage.RENDER_ATTACHMENT | (preserveDrawingBuffer ? GPUTextureUsage.COPY_SRC : 0) });
   const module = device.createShaderModule({ code: SHADER });
   const ubuf = device.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const layout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: {} }] });
-  const bind = device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: ubuf } }] });
+  const GU_FLOATS = 4 * (10 + 16 + 16 + 4 + 4);
+  const gubuf = device.createBuffer({ size: GU_FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const unf = { sampleType: 'unfilterable-float' };
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: {} },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: unf },
+    { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: unf },
+  ] });
+  // per-pixel ground: the pieces' data (rgba32float, 1024 texels a row, 4 per piece) and the shade field (r32float); the bind group
+  // is remade when either texture is
+  const tex = (w, h, format) => device.createTexture({ size: [w, h], format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  let gTex = tex(1024, 1, 'rgba32float'), fTex = tex(2, 2, 'r32float'), gRows = 1, fieldOf = null, fieldV = -1, bind = null;
+  const rebind = () => { bind = device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: ubuf } }, { binding: 1, resource: { buffer: gubuf } },
+    { binding: 2, resource: gTex.createView() }, { binding: 3, resource: fTex.createView() }] }); };
+  rebind();
+  const gu = new Float32Array(GU_FLOATS);
+  const groundUniforms = (F, ground) => {
+    gu.fill(0);
+    const pix = !!F.pixelGround && light.on;
+    gu[36] = !pix ? 0 : light.dir.y <= 0 || (F.field && F.field.all) ? 2 : 1;
+    if (pix) {
+      const rows = Math.max(1, Math.ceil((ground.n * 4) / 1024));
+      if (rows > gRows) { gTex.destroy(); gTex = tex(1024, rows, 'rgba32float'); gRows = rows; bind = null; }
+      if (ground.n) device.queue.writeTexture({ texture: gTex }, ground.data.buffer, { offset: ground.data.byteOffset, bytesPerRow: 1024 * 16 },
+        { width: Math.min(1024, ground.n * 4), height: Math.ceil((ground.n * 4) / 1024) });
+      const Fd = F.field, grid = Fd && Fd.grid;
+      if (grid && (fieldOf !== Fd || fieldV !== Fd.version)) {
+        if (fTex.width !== grid.nu || fTex.height !== grid.nv) { fTex.destroy(); fTex = tex(grid.nu, grid.nv, 'r32float'); bind = null; }
+        device.queue.writeTexture({ texture: fTex }, grid.depth.buffer, { offset: grid.depth.byteOffset, bytesPerRow: grid.nu * 4 }, { width: grid.nu, height: grid.nv });
+        fieldOf = Fd; fieldV = Fd.version;
+      }
+      const E = F.camPos, B = F.basis, Pp = F.persp, L = light.dir;
+      gu.set([E.x, E.y, E.z, 0, B.right.x, B.right.y, B.right.z, 0, B.up.x, B.up.y, B.up.z, 0, B.forward.x, B.forward.y, B.forward.z, 0, Pp.s, Pp.cx, Pp.cy, 0], 0);
+      if (grid) gu.set([grid.cx, grid.cz, grid.ux, grid.uz, grid.umax, grid.vmin, grid.ds, grid.eps, grid.nu, grid.nv, 0, 0], 20);
+      gu.set([L.x, L.y, L.z, 0], 32);
+      const C = F.casters.slice(0, 16), Lm = (F.lamps || []).slice(0, 4);
+      gu[37] = grid ? 1 : 0; gu[38] = C.length; gu[39] = Lm.length;
+      C.forEach((c, i) => { gu.set([c.a.x, c.a.y, c.a.z, c.r], 40 + 4 * i); gu.set([c.b.x, c.b.y, c.b.z, c.r], 104 + 4 * i); });
+      Lm.forEach((l, i) => { gu.set([l.pos.x, l.pos.y, l.pos.z, l.radius], 168 + 4 * i); gu.set(l.color.map((v) => v / 255), 184 + 4 * i); });
+    }
+    if (!bind) rebind();
+    device.queue.writeBuffer(gubuf, 0, gu);
+  };
   const plLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
   const DS = 'depth24plus-stencil8';
   const stencilVB = [{ arrayStride: 20, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }, { shaderLocation: 1, offset: 8, format: 'float32x3' }] }];
-  const coverVB = [{ arrayStride: 28, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }, { shaderLocation: 1, offset: 8, format: 'float32' }, { shaderLocation: 2, offset: 12, format: 'float32x4' }] }];
+  const coverVB = [{ arrayStride: 32, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }, { shaderLocation: 1, offset: 8, format: 'float32' }, { shaderLocation: 2, offset: 12, format: 'float32x4' }, { shaderLocation: 3, offset: 28, format: 'float32' }] }];
   const face = (compare, passOp, failOp = 'keep', depthFailOp = 'keep') => ({ compare, passOp, failOp, depthFailOp });
   // one pipeline per pass kind: { vs, fs, vb, color (write), blend, depth: [compare, write], front / back stencil faces, masks }
   const pipe = ({ vs, fs, vb, color = true, blend, depth = ['always', false], front, back = front, read = 0xff, write = 0xff }) =>
@@ -110,15 +227,15 @@ export async function createWebGPU(canvas, { preserveDrawingBuffer = false } = {
       blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' } } }),
     winding7: pipe({ vs: 'vsStencil', fs: 'fsStencil', vb: stencilVB, color: false, front: face('always', 'increment-wrap'), back: face('always', 'decrement-wrap'), write: 0x7f }),
     cover7: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, depth: ['less', true], front: face('not-equal', 'zero', 'keep', 'zero'), read: 0x7f }),
-    flagZero: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, color: false, front: face('equal', 'invert'), write: 0x80 }),   // ref 0
-    zeroNotFlag: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, color: false, front: face('not-equal', 'zero') }),            // ref 0x80
-    zeroNo7: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, color: false, front: face('equal', 'zero'), read: 0x80 }),        // ref 0
-    zeroAll: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, color: false, front: face('always', 'zero') }),
-    zeroBut6: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, color: false, front: face('always', 'zero'), write: 0xbf }),
-    noHost: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, color: false, front: face('equal', 'zero'), read: 0x3f, write: 0x80 }),   // ref 0
-    shadeMul: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, depth: ['less', false], front: face('equal', 'keep'), read: 0xc0, write: 0,
+    flagZero: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, color: false, front: face('equal', 'invert'), write: 0x80 }),   // ref 0
+    zeroNotFlag: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, color: false, front: face('not-equal', 'zero') }),            // ref 0x80
+    zeroNo7: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, color: false, front: face('equal', 'zero'), read: 0x80 }),        // ref 0
+    zeroAll: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, color: false, front: face('always', 'zero') }),
+    zeroBut6: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, color: false, front: face('always', 'zero'), write: 0xbf }),
+    noHost: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, color: false, front: face('equal', 'zero'), read: 0x3f, write: 0x80 }),   // ref 0
+    shadeMul: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, depth: ['less', false], front: face('equal', 'keep'), read: 0xc0, write: 0,
       blend: { color: { srcFactor: 'zero', dstFactor: 'constant', operation: 'add' }, alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' } } }),
-    shadeAdd: pipe({ vs: 'vsCover', fs: 'fsCover', vb: coverVB, depth: ['less', false], front: face('equal', 'invert'), read: 0xc0, write: 0x40,
+    shadeAdd: pipe({ vs: 'vsCover', fs: 'fsPlain', vb: coverVB, depth: ['less', false], front: face('equal', 'invert'), read: 0xc0, write: 0x40,
       blend: { color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }, alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' } } }),
   };
   let msaa = null, ds = null, tw = 0, th = 0;
@@ -155,9 +272,10 @@ export async function createWebGPU(canvas, { preserveDrawingBuffer = false } = {
       uni.set([S.g0, S.g1], 24);
     }
     device.queue.writeBuffer(ubuf, 0, uni);
+    groundUniforms(F, plan.ground);
     const { sSink, cSink } = plan;
     sBuf = upload(sBuf, sSink.f.subarray(0, sSink.n * 5));
-    cBuf = upload(cBuf, cSink.f.subarray(0, cSink.n * 7));
+    cBuf = upload(cBuf, cSink.f.subarray(0, cSink.n * 8));
     const enc = device.createCommandEncoder();
     const bg = darkMode ? 0 : 1;
     const pass = enc.beginRenderPass({

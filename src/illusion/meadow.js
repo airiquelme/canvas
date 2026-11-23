@@ -18,7 +18,7 @@ const GREENS = ['#7cb342', '#8bc34a', '#689f38', '#9ccc65', '#558b2f', '#aed581'
 // 2^k x 2^k cells over `size` units, centered on `center` (its y is the mean ground height); `hills` bumps, kept off `clear`
 // (x, z offsets from the center, e.g. the camera's start); minErr: diamonds flatter than this (world units) never split; oneColor:
 // a single green (to see how far the geometry alone merges).
-export function buildMeadow({ center = { x: 500, y: 0, z: 0 }, k = 7, size = 3600, hills = 9, clear = [{ x: 700, z: 0 }], minErr = 0.4, oneColor = true, water, edits = null, colorK, colorCells = 1, movers: movers_ = 10 } = {}) {
+export function buildMeadow({ center = { x: 500, y: 0, z: 0 }, k = 7, size = 3600, hills = 9, clear = [{ x: 700, z: 0 }], minErr = 0.4, oneColor = true, water, edits = null, colorK, colorCells = 1, movers: movers_ = 10, pixelShade = false } = {}) {
   const rand = rng(7), N = 2 ** k, cell = size / N;
   const waves = Array.from({ length: 5 }, (_, i) => {
     const a = rand() * 6.283, L = 2200 / (i + 1.2) * (0.7 + rand() * 0.6);
@@ -113,7 +113,8 @@ export function buildMeadow({ center = { x: 500, y: 0, z: 0 }, k = 7, size = 360
     const p = poleSpots[i];
     lamps.push({ pos: { x: p.x + p.dx, y: Hbase(p.x, p.z) + p.h + 6, z: p.z + p.dz }, radius: 230, color: LAMPS[i][0], head: LAMPS[i][1] });
   }
-  const terrain = buildTerrain({ grid: pts, H, colorOf, minErr, colorK, partsOf: F ? (o) => lampParts(o, wetParts(o, splitPatch(o, F, cache)), H) : (o) => wetParts(o, [{ loop: o.loop, shade: false }]) });
+  // pixelShade (a GPU backend that shades the ground per pixel from the field, webgl2.js): no shade or lamp parts, only the shores
+  const terrain = buildTerrain({ grid: pts, H, colorOf, minErr, colorK, partsOf: F && !pixelShade ? (o) => lampParts(o, wetParts(o, splitPatch(o, F, cache)), H) : (o) => wetParts(o, [{ loop: o.loop, shade: false }]) });
   terrain.wet = (x, z) => Hraw(x, z) < level + 1;
   terrain.waterLevel = level;
   terrain.shadowMs = performance.now() - t0;
@@ -167,5 +168,11 @@ export function buildMeadow({ center = { x: 500, y: 0, z: 0 }, k = 7, size = 360
     r.ms = performance.now() - t0;
     return r;
   };
-  return { terrain, groundAt: H, movers, poles, grid, edit };
+  // A new sun with per-pixel ground shade: only the shade field is redone (the patches don't depend on the sun); null otherwise.
+  const setSun = pixelShade ? () => {
+    F = light.on ? buildShadowField({ H, x0: center.x - size / 2, x1: center.x + size / 2, z0: center.z - size / 2, z1: center.z + size / 2, dir: light.dir }) : null;
+    terrain.F = F;
+    cache.clear();
+  } : null;
+  return { terrain, groundAt: H, movers, poles, grid, edit, setSun };
 }

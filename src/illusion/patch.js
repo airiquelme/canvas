@@ -79,13 +79,15 @@ const offFit = (side, p) => {
   return Math.hypot(q.x - p.x, q.y - p.y);
 };
 
-// Sides along a curve given by at(u) -> screen point with tangent, from ua to ub; split while off by more than SPLIT_PX.
-function curveSides(at, ua, ub, tag, out, depth = 0) {
-  const pa = at(ua), pb = at(ub), pm = at((ua + ub) / 2);
+// Sides along a curve given by at(u) -> screen point with tangent, from ua to ub; split while off by more than SPLIT_PX. A split's
+// halves reuse what is known: its ends, its middle (their shared end) and the quarter points it was checked at (their middles).
+function curveSides(at, ua, ub, tag, out, depth = 0, pa = at(ua), pb = at(ub), pm = at((ua + ub) / 2)) {
   const { side, ok } = fitSide(pa, pb, pm);
-  if (depth < 3 && (!ok || (long(pa, pb) && (offFit(side, at(ua + (ub - ua) / 4)) > SPLIT_PX || offFit(side, at(ua + (3 * (ub - ua)) / 4)) > SPLIT_PX)))) {
-    curveSides(at, ua, (ua + ub) / 2, tag, out, depth + 1);
-    curveSides(at, (ua + ub) / 2, ub, tag, out, depth + 1);
+  let q1, q3;
+  if (depth < 3 && (!ok || (long(pa, pb) && (offFit(side, (q1 = at(ua + (ub - ua) / 4))) > SPLIT_PX || offFit(side, (q3 = at(ua + (3 * (ub - ua)) / 4))) > SPLIT_PX)))) {
+    const um = (ua + ub) / 2;
+    curveSides(at, ua, um, tag, out, depth + 1, pa, pm, q1);
+    curveSides(at, um, ub, tag, out, depth + 1, pm, pb, q3);
     return;
   }
   out.push({ ...side, ...tag, ua, ub });   // ua, ub: its stretch of the piece it follows (boundary sides)
@@ -208,7 +210,10 @@ export function patchPieces(o, projector, eye, pxScale = Infinity, loop = o.loop
   const span = (i, ua, j, ub, front, out) => {
     const one = (k, u0, u1) => {
       const pc = loop[k], n = pc.kind === 'arc' ? Math.max(1, Math.ceil((Math.abs(pc.t1 - pc.t0) * (u1 - u0)) / ARC_STEP)) : 1;
-      for (let m = 0; m < n; m++) curveSides(at(k), u0 + ((u1 - u0) * m) / n, u0 + ((u1 - u0) * (m + 1)) / n, { ci: k % 4, edge: pc.edge ?? k, piece: k, front }, out);
+      // an arc's steps share their ends: each point once (keyed by its exact u)
+      const f = at(k), memo = n > 1 ? new Map() : null;
+      const g = memo ? (u) => { let p = memo.get(u); if (p === undefined) { p = f(u); memo.set(u, p); } return p; } : f;
+      for (let m = 0; m < n; m++) curveSides(g, u0 + ((u1 - u0) * m) / n, u0 + ((u1 - u0) * (m + 1)) / n, { ci: k % 4, edge: pc.edge ?? k, piece: k, front }, out);
     };
     if (i === j && ub > ua) { one(i, ua, ub); return; }
     one(i, ua, 1);

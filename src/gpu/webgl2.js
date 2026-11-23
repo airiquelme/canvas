@@ -46,18 +46,101 @@ void main() {
   color = vec4(0.0, 0.0, 0.0, a);
 }`;
 const COVER_VS = `#version 300 es
-in vec2 pos; in float z; in vec4 rgba;
+in vec2 pos; in float z; in vec4 rgba; in float gid;
 uniform vec4 xf; uniform vec2 size;
-out vec4 v_rgba;
+out vec4 v_rgba; flat out float v_gid;
 void main() {
   vec2 p = vec2(xf.x * pos.x + xf.y, xf.x * pos.y + xf.z);
   gl_Position = vec4(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0, z, 1.0);
-  v_rgba = rgba;
+  v_rgba = rgba; v_gid = gid;
 }`;
+// PER-PIXEL GROUND SHADE (gid >= 0: a ground piece, plan.js `groundId`). The pixel's view ray D (design px -> camera -> world) meets
+// the piece's sheet curve where -a2 t^2 + (D.y - gx D.x - gz D.z) t + k0 = 0 (the nearest root; none, at the outline's antialiased
+// edge: the closest approach), at the world point P = eye + t D. Its shade s (0 lit .. 1 shade, antialiased over a pixel by the
+// screen derivative): the sun's shade field there (shadow.js, the same bilinear read as the CPU's), the movers' shadows (the ray
+// from P toward the sun against each capsule) or, with the sun down, all; its shade tone lifted by the lamps' bands (lamps.js:
+// toward base x lamp color by 0.22 / 0.48 / 0.75 within 1 / 0.66 / 0.33 of the reach). Color: lit (the vertex color) -> shade by s.
+// A fragment that is not ground returns at once: gid is flat per triangle, so the 2 x 2 quads that derivatives come from never
+// diverge (the stencil-only box passes, the objects' fills, pay nothing).
 const COVER_FS = `#version 300 es
 precision highp float;
-in vec4 v_rgba; out vec4 color;
-void main() { color = v_rgba; }`;
+precision highp sampler2D;
+in vec4 v_rgba; flat in float v_gid; out vec4 color;
+uniform vec4 xf; uniform vec2 size;
+uniform sampler2D gdata; uniform sampler2D field;
+uniform int mode;                       // 0: no per-pixel shade, 1: field + movers, 2: all in shade (the sun down)
+uniform int hasField;
+uniform vec3 eye, camR, camU, camF, persp;   // persp: s, cx, cy (screen = c + s X / Z)
+uniform vec4 fA; uniform vec4 fB; uniform vec2 fN;   // field: (cx, cz, ux, uz), (umax, vmin, ds, eps), (nu, nv)
+uniform vec3 sunL; uniform int nCast; uniform vec4 castA[16]; uniform vec4 castB[16];
+uniform int nLamp; uniform vec4 lampP[4]; uniform vec3 lampC[4];
+vec4 gd(int k) { return texelFetch(gdata, ivec2(k % 1024, k / 1024), 0); }
+float fieldAt(vec2 xz) {
+  vec2 d = xz - fA.xy;
+  float u = dot(d, fA.zw), v = dot(d, vec2(-fA.w, fA.z));
+  float fi = (fB.x - u) / fB.z, fj = (v - fB.y) / fB.z;
+  float i = clamp(floor(fi), 0.0, fN.x - 2.0), j = clamp(floor(fj), 0.0, fN.y - 2.0);
+  float a = clamp(fi - i, 0.0, 1.0), b = clamp(fj - j, 0.0, 1.0);
+  ivec2 k = ivec2(int(i), int(j));
+  float d00 = texelFetch(field, k, 0).r, d10 = texelFetch(field, k + ivec2(1, 0), 0).r;
+  float d01 = texelFetch(field, k + ivec2(0, 1), 0).r, d11 = texelFetch(field, k + ivec2(1, 1), 0).r;
+  return mix(mix(d00, d10, a), mix(d01, d11, a), b);
+}
+// distance from the ray P + s L (s >= 0) to the segment A B, and the segment's parameter there
+vec2 raySeg(vec3 P, vec3 L, vec3 A, vec3 B) {
+  vec3 v = B - A; float c = max(dot(v, v), 1e-9);
+  float t = clamp(dot(P - A, v) / c, 0.0, 1.0), s = 0.0;
+  for (int it = 0; it < 3; it++) { s = max(0.0, dot(A + v * t - P, L)); t = clamp(dot(P + L * s - A, v) / c, 0.0, 1.0); }
+  return vec2(length(P + L * s - (A + v * t)), t);
+}
+void main() {
+  if (v_gid < 0.0 || mode == 0) { color = v_rgba; return; }
+  int g = int(v_gid) * 4;
+  vec4 G0 = gd(g), G1 = gd(g + 1), G2 = gd(g + 2), G3 = gd(g + 3);   // A B C gx | gz k0 ex ez | shade rgb, base r | base g b
+  vec2 fc = vec2(gl_FragCoord.x, size.y - gl_FragCoord.y);
+  vec2 dp = (fc - xf.yz) / xf.x;
+  vec3 D = camF + ((dp.x - persp.y) / persp.x) * camR - ((dp.y - persp.z) / persp.x) * camU;
+  float k2 = -(G0.x * D.x * D.x + G0.y * D.x * D.z + G0.z * D.z * D.z), k1 = D.y - G0.w * D.x - G1.x * D.z, k0 = G1.y;
+  float t;
+  if (abs(k2) < 1e-9 * abs(k1)) t = -k0 / k1;
+  else {
+    float disc = k1 * k1 - 4.0 * k2 * k0;
+    if (disc < 0.0) t = -k1 / (2.0 * k2);
+    else {
+      float q = -0.5 * (k1 + (k1 >= 0.0 ? 1.0 : -1.0) * sqrt(disc)), r1 = q / k2, r2 = k0 / q;
+      // the hit nearer the patch (its local origin, inside it): the other one is on its sheet curve extended
+      vec2 h1 = G1.zw + r1 * D.xz, h2 = G1.zw + r2 * D.xz;
+      t = (r1 > 0.0 && (dot(h1, h1) < dot(h2, h2) || r2 <= 0.0)) ? r1 : r2;
+    }
+  }
+  vec3 P = eye + max(t, 0.0) * D;
+  // the pixel's footprint on the ground (world units): the antialiasing width of the movers' and lamps' distances (no derivative
+  // inside a loop: that made WebGPU's compiler run every iteration)
+  vec3 fP = fwidth(P);
+  float pw = max(length(fP), 1e-4);
+  float sh = 0.0;
+  if (hasField == 1) { float fd = fieldAt(P.xz); sh = clamp((fd - fB.w) / max(fwidth(fd), 1e-4) + 0.5, 0.0, 1.0); }
+  int cm = int(G3.z), lm = int(G3.w);   // the movers and lamps that can reach this piece (plan.js reachOf)
+  for (int i = 0; i < 16; i++) {
+    if (i >= nCast) break;
+    if (((cm >> i) & 1) == 0) continue;
+    vec2 dr = raySeg(P, sunL, castA[i].xyz, castB[i].xyz);
+    float dd = dr.x - mix(castA[i].w, castB[i].w, dr.y);
+    sh = max(sh, clamp(0.5 - dd / pw, 0.0, 1.0));
+  }
+  if (mode == 2) sh = 1.0;
+  float best = 0.0; vec3 lc = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    if (i >= nLamp) break;
+    if (((lm >> i) & 1) == 0) continue;
+    float dl = length(P - lampP[i].xyz) / lampP[i].w, w = pw / lampP[i].w;
+    float lv = 0.22 * clamp((1.0 - dl) / w + 0.5, 0.0, 1.0) + 0.26 * clamp((0.66 - dl) / w + 0.5, 0.0, 1.0) + 0.27 * clamp((0.33 - dl) / w + 0.5, 0.0, 1.0);
+    if (lv > best) { best = lv; lc = lampC[i]; }
+  }
+  vec3 shadeC = mix(G2.xyz, vec3(G2.w, G3.xy) * lc, best);
+  vec3 ground = mix(v_rgba.rgb, shadeC, sh);
+  color = vec4(ground, v_rgba.a);
+}`;
 // The sky: a vertical gradient (stops at g0, the 0.75 point, g1; clamped beyond, as a canvas gradient), the sun's glow (radial
 // alpha 0.45 -> 0 from 0.8 r to 6 r, inside its square) and disc, in design px.
 const SKY_VS = `#version 300 es
@@ -119,9 +202,10 @@ export function createWebGL2(canvas, { preserveDrawingBuffer = false } = {}) {
   const cVao = gl.createVertexArray();
   gl.bindVertexArray(cVao);
   gl.bindBuffer(gl.ARRAY_BUFFER, cBuf);
-  gl.enableVertexAttribArray(coverP.attr('pos')); gl.vertexAttribPointer(coverP.attr('pos'), 2, gl.FLOAT, false, 28, 0);
-  gl.enableVertexAttribArray(coverP.attr('z')); gl.vertexAttribPointer(coverP.attr('z'), 1, gl.FLOAT, false, 28, 8);
-  gl.enableVertexAttribArray(coverP.attr('rgba')); gl.vertexAttribPointer(coverP.attr('rgba'), 4, gl.FLOAT, false, 28, 12);
+  gl.enableVertexAttribArray(coverP.attr('pos')); gl.vertexAttribPointer(coverP.attr('pos'), 2, gl.FLOAT, false, 32, 0);
+  gl.enableVertexAttribArray(coverP.attr('z')); gl.vertexAttribPointer(coverP.attr('z'), 1, gl.FLOAT, false, 32, 8);
+  gl.enableVertexAttribArray(coverP.attr('rgba')); gl.vertexAttribPointer(coverP.attr('rgba'), 4, gl.FLOAT, false, 32, 12);
+  gl.enableVertexAttribArray(coverP.attr('gid')); gl.vertexAttribPointer(coverP.attr('gid'), 1, gl.FLOAT, false, 32, 28);
   const qVao = gl.createVertexArray();
   gl.bindVertexArray(qVao);
   gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
@@ -146,6 +230,54 @@ export function createWebGL2(canvas, { preserveDrawingBuffer = false } = {}) {
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, dsRb);
   };
   const frame = createFramePlanner();
+  // per-pixel ground: the pieces' data (RGBA32F, 1024 texels a row, 4 per piece) and the shade field (R32F, nu x nv)
+  const texOf = () => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+  const gTex = texOf(), fTex = texOf();
+  let gRows = 0, fieldOf = null, fieldV = -1, gBuf = new Float32Array(0);
+  const ca = new Float32Array(64), cb = new Float32Array(64), lp = new Float32Array(16), lcol = new Float32Array(12);
+  const groundUniforms = (F, ground) => {
+    const u = coverP.u, pix = !!F.pixelGround && light.on;
+    gl.uniform1i(u.mode, !pix ? 0 : light.dir.y <= 0 || (F.field && F.field.all) ? 2 : 1);
+    if (!pix) return;
+    // the pieces' data
+    const rows = Math.max(1, Math.ceil((ground.n * 4) / 1024));
+    if (gBuf.length < rows * 1024 * 4) gBuf = new Float32Array(rows * 1024 * 4);
+    gBuf.set(ground.data.subarray(0, ground.n * 16));
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, gTex);
+    if (rows > gRows) { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1024, rows, 0, gl.RGBA, gl.FLOAT, gBuf.subarray(0, rows * 1024 * 4)); gRows = rows; }
+    else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1024, rows, gl.RGBA, gl.FLOAT, gBuf.subarray(0, rows * 1024 * 4));
+    gl.uniform1i(u.gdata, 0);
+    // the field (re-uploaded when it changes: a rebuild, an edit's sweep lines)
+    const Fd = F.field, grid = Fd && Fd.grid;
+    gl.uniform1i(u.hasField, grid ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fTex);
+    if (grid && (fieldOf !== Fd || fieldV !== Fd.version)) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, grid.nu, grid.nv, 0, gl.RED, gl.FLOAT, grid.depth);
+      fieldOf = Fd; fieldV = Fd.version;
+    }
+    gl.uniform1i(u.field, 1);
+    if (grid) { gl.uniform4f(u.fA, grid.cx, grid.cz, grid.ux, grid.uz); gl.uniform4f(u.fB, grid.umax, grid.vmin, grid.ds, grid.eps); gl.uniform2f(u.fN, grid.nu, grid.nv); }
+    const E = F.camPos, B = F.basis, P = F.persp;
+    gl.uniform3f(u.eye, E.x, E.y, E.z);
+    gl.uniform3f(u.camR, B.right.x, B.right.y, B.right.z); gl.uniform3f(u.camU, B.up.x, B.up.y, B.up.z); gl.uniform3f(u.camF, B.forward.x, B.forward.y, B.forward.z);
+    gl.uniform3f(u.persp, P.s, P.cx, P.cy);
+    const L = light.dir;
+    gl.uniform3f(u.sunL, L.x, L.y, L.z);
+    const C = F.casters.slice(0, 16);
+    C.forEach((c, i) => { ca.set([c.a.x, c.a.y, c.a.z, c.r], 4 * i); cb.set([c.b.x, c.b.y, c.b.z, c.r], 4 * i); });
+    gl.uniform1i(u.nCast, C.length);
+    if (u['castA[0]']) { gl.uniform4fv(u['castA[0]'], ca); gl.uniform4fv(u['castB[0]'], cb); }
+    const Lm = (F.lamps || []).slice(0, 4);
+    Lm.forEach((l, i) => { lp.set([l.pos.x, l.pos.y, l.pos.z, l.radius], 4 * i); lcol.set(l.color.map((v) => v / 255), 3 * i); });
+    gl.uniform1i(u.nLamp, Lm.length);
+    if (u['lampP[0]']) { gl.uniform4fv(u['lampP[0]'], lp); gl.uniform3fv(u['lampC[0]'], lcol); }
+    gl.activeTexture(gl.TEXTURE0);
+  };
 
   function render(F, { darkMode = false } = {}) {
     const t0 = performance.now();
@@ -176,10 +308,11 @@ export function createWebGL2(canvas, { preserveDrawingBuffer = false } = {}) {
     gl.bindBuffer(gl.ARRAY_BUFFER, sBuf);
     gl.bufferData(gl.ARRAY_BUFFER, sSink.f.subarray(0, sSink.n * 5), gl.STREAM_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, cBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, cSink.f.subarray(0, cSink.n * 7), gl.STREAM_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, cSink.f.subarray(0, cSink.n * 8), gl.STREAM_DRAW);
     gl.enable(gl.STENCIL_TEST);
     gl.useProgram(stencilP.p); gl.uniform4fv(stencilP.u.xf, xf); gl.uniform2f(stencilP.u.size, W, H);
     gl.useProgram(coverP.p); gl.uniform4fv(coverP.u.xf, xf); gl.uniform2f(coverP.u.size, W, H);
+    groundUniforms(F, plan.ground);
     const winding = (r, mask) => {   // count the winding of stencil triangles r = [a, b) into the stencil bits `mask`
       if (r[1] <= r[0]) return;
       gl.useProgram(stencilP.p); gl.bindVertexArray(sVao);

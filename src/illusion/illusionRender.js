@@ -21,6 +21,8 @@ import { selectGrass, bladePieces } from './grass.js';
 import { drawSky } from './sky.js';
 import { lamps, lampAt, lampTone } from './lamps.js';
 import { clipLoopNear } from './patch.js';
+import { windAt } from './wind.js';
+let frameSway = null;   // this frame's wind field (buildIllusionFrame), or null
 
 // One color per side (capsule: end arc 2, line, end arc 1, line), distinct from every fill.
 // 5th: a curved mesh's tip; 6th on: the further stretches a fold splits a curved mesh's sides into.
@@ -71,6 +73,13 @@ export function buildSheetsScene() {
 }
 
 // The default: the meadow (meadow.js), rolling ground of edge-sharing panels.
+// A new sun (the sliders, the Light button) in the meadow: with per-pixel ground shade only the shade field is redone (about 40 ms);
+// else the whole meadow is rebuilt (its patches are split along the shade).
+let meadowSetSun = null;
+export function meadowSun() {
+  if (meadowSetSun && terrain && terrain.pixelShade) meadowSetSun();
+  else buildMeadowScene();
+}
 export function buildMeadowScene(opts = {}) {
   // a rebuild (the sun, the light) keeps the ground's edits unless others are given
   if (opts.edits === undefined && groundGrid) opts = { ...opts, edits: groundGrid.edits() };
@@ -80,8 +89,10 @@ export function buildMeadowScene(opts = {}) {
   groundEdit = null;
   sky.on = false;
   lamps.length = 0;
-  const m = buildMeadow(opts);
+  const m = buildMeadow({ ...opts, pixelShade: groundShade.pixel });
   terrain = m.terrain;
+  terrain.pixelShade = groundShade.pixel;
+  meadowSetSun = m.setSun;
   groundEdit = m.edit;
   groundGrid = m.grid;
   groundFn = m.groundAt;
@@ -195,6 +206,10 @@ export const grass = { on: true, tips: false, faces: true };   // tips: only the
 // it, or shade grass over the lit ground behind it, switching as the eye moves. Water grows none.
 // Each run's spikes are one piece (one loop each) in the tone of the ground piece it lies on, drawn right after its patch.
 export const silhouette = { on: true, spikes: true, shade: true };
+// GROUND SHADE PER PIXEL (a GPU backend, webgl2.js): the meadow is built without shade / lamp parts and each ground pixel finds its
+// own world point (its view ray against its patch's sheet curve) and its tone there: the sun's shade field, the movers' shadows (a
+// ray toward the sun against each capsule), the lamps' bands. Set before the scene is built (main.js, from the backend).
+export const groundShade = { pixel: false };
 // A loop's turn in (x, z): twice its signed area (> 0 counterclockwise), from its pieces sampled; once per loop.
 const turnCache = new WeakMap();
 function loopTurn(loop) {
@@ -226,19 +241,31 @@ const edgeKey = (E) => {
 };
 // a patch's edge keys, once per patch (its edges are fixed; an edit builds new patches)
 const edgeKeysOf = (o) => (o.edgeKeysFor === o.edges ? o.edgeKeys : ((o.edgeKeysFor = o.edges), (o.edgeKeys = o.edges.map((E) => (E ? edgeKey(E) : null)))));
+// ... and as small integers (one per distinct edge, interned once per patch), so the frame's edge table is arrays, not a string map
+const edgeIdMap = new Map(), edgeSlot = [], edgeStamp = [];
+let edgeFrame = 0;
+const edgeIdsOf = (o) => (o.edgeIdsFor === o.edges ? o.edgeIds : ((o.edgeIdsFor = o.edges), (o.edgeIds = edgeKeysOf(o).map((k) => {
+  if (k === null) return -1;
+  let id = edgeIdMap.get(k);
+  if (id === undefined) { id = edgeIdMap.size; edgeIdMap.set(k, id); edgeSlot.push(undefined); edgeStamp.push(0); }
+  return id;
+}))));
 const dist3 = (a, b) => Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
 
 // The spikes of the tufts near one run (world polyline P) -> a piece, or null. groundY(x, z): the drawn ground's height there.
 // keep(x, z): which tufts may sprout (shade borders: the part's own side); baseBelow: only tufts whose own ground point is on the
 // near side of the line on screen (a tuft already past it would show in the other part's area, in its own tone: no contrast).
-function tuftPiece(P, fill, projectPoint, fit, groundY, keep = null, baseBelow = false) {
+// toneOf(x, z, y): each tuft's own fill from its ground point (per-pixel ground shade: the field there, as the ground's shader), the
+// spikes grouped by it into one piece each; else every spike in `fill`. Returns [pieces] or null.
+function tuftPiece(P, fill, projectPoint, fit, groundY, keep = null, baseBelow = false, toneOf = null) {
   const Q = P.map(projectPoint);
   if (Q.some((q) => !(q.scale > 0))) return null;
   let smax = 0;
   for (const q of Q) smax = Math.max(smax, q.scale);
   const R = TUFT_R * TUFT_CELL, c = TUFT_CELL, S = TUFT_REACH;
   if (TUFT_ASPECT * R * 1.3 * smax * 1.2 <= TUFT_SHOW_LINES * LINE_PX) return null;   // every tuft too small from here (+ the reach's margin)
-  const sides = [];
+  const groups = new Map();
+  let sides = null;
   const tri = (a, b, cc) => {
     const ar = (b.x - a.x) * (cc.y - a.y) - (b.y - a.y) * (cc.x - a.x);
     const [p, q, r] = ar < 0 ? [a, cc, b] : [a, b, cc];
@@ -254,9 +281,24 @@ function tuftPiece(P, fill, projectPoint, fit, groundY, keep = null, baseBelow =
     const qu = projectPoint({ x: A.x, y: A.y + 1, z: A.z });
     let nx = -ty, ny = tx;
     if (nx * (qu.x - qa.x) + ny * (qu.y - qa.y) < 0) { nx = -nx; ny = -ny; }
-    const i0 = Math.floor((Math.min(A.x, B.x) - S) / c), i1 = Math.floor((Math.max(A.x, B.x) + S) / c);
-    const j0 = Math.floor((Math.min(A.z, B.z) - S) / c), j1 = Math.floor((Math.max(A.z, B.z) + S) / c);
-    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+    // Only the cells whose tuft can lie in the chord's band (t in [0, 1), within S of it in x, z: a rectangle): per column, the
+    // rectangle's z extent over the x the column's tufts can take (jitter 0.1-0.9 of the cell), from its corners and its sides'
+    // crossings of the column's two lines. The tests below are unchanged: this only skips cells that fail them.
+    const l = Math.sqrt(l2), px = (-dz / l) * S, pz = (dx / l) * S;
+    const RX = [A.x + px, B.x + px, B.x - px, A.x - px], RZ = [A.z + pz, B.z + pz, B.z - pz, A.z - pz];
+    const i0 = Math.floor((Math.min(RX[0], RX[1], RX[2], RX[3]) - 0.9 * c) / c), i1 = Math.floor((Math.max(RX[0], RX[1], RX[2], RX[3]) - 0.1 * c) / c);
+    for (let i = i0; i <= i1; i++) {
+      const xa = (i + 0.1) * c, xb = (i + 0.9) * c;
+      let zlo = Infinity, zhi = -Infinity;
+      for (let k = 0; k < 4; k++) {
+        const x0 = RX[k], z0 = RZ[k], x1 = RX[(k + 1) & 3], z1 = RZ[(k + 1) & 3];
+        if (x0 >= xa && x0 <= xb) { if (z0 < zlo) zlo = z0; if (z0 > zhi) zhi = z0; }
+        if ((x0 - xa) * (x1 - xa) < 0) { const z = z0 + ((z1 - z0) * (xa - x0)) / (x1 - x0); if (z < zlo) zlo = z; if (z > zhi) zhi = z; }
+        if ((x0 - xb) * (x1 - xb) < 0) { const z = z0 + ((z1 - z0) * (xb - x0)) / (x1 - x0); if (z < zlo) zlo = z; if (z > zhi) zhi = z; }
+      }
+      if (!(zhi >= zlo)) continue;
+      const j0 = Math.floor((zlo - 0.9 * c) / c - 1e-9), j1 = Math.floor((zhi - 0.1 * c) / c + 1e-9);
+      for (let j = j0; j <= j1; j++) {
       const sx = (i + 0.1 + 0.8 * hash2(i, j, 0)) * c, sz = (j + 0.1 + 0.8 * hash2(j, i, 17)) * c;
       const t = ((sx - A.x) * dx + (sz - A.z) * dz) / l2;   // each tuft to the chord it lies beside (unclamped)
       if (t < 0 || t >= 1) continue;
@@ -290,33 +332,140 @@ function tuftPiece(P, fill, projectPoint, fit, groundY, keep = null, baseBelow =
       out *= smooth01((opx - SPIKE_VANISH_PX) / (SPIKE_FULL_PX - SPIKE_VANISH_PX));
       const w = R * tip.scale, down = TUFT_DOWN_PX / fit;
       const fx = qa.x + tx * a, fy = qa.y + ty * a;   // the foot on the chord
-      tri({ x: fx - tx * w - ux * down, y: fy - ty * w - uy * down }, { x: fx + ux * out, y: fy + uy * out },
+      // WIND (wind.js): the tuft tilted at its ground point (keeping its height) moves its tip on screen by (wdx, wdy); the spike is
+      // placed as without wind (the same foot, base, gates: its base stays on the line) and only SHEARED, its tip moved by the part
+      // of that shift its visible height is of the tuft's (out / ul). (Placing it from the tilted tip slid its foot along the outline,
+      // off the chord's ends, and pushed its base sideways instead of into the ground: spikes came loose from their line.)
+      let wdx = 0, wdy = 0;
+      if (frameSway) {
+        const [lx, lz] = frameSway(sx, sz), th = Math.hypot(lx, lz);
+        if (th > 1e-6) {
+          const k = (h * Math.sin(th)) / th, tl = projectPoint({ x: sx + lx * k, y: y + h * Math.cos(th), z: sz + lz * k });
+          if (tl.scale > 0) { wdx = ((tl.x - tip.x) * out) / ul; wdy = ((tl.y - tip.y) * out) / ul; }
+        }
+      }
+      const tf = toneOf ? toneOf(sx, sz, y) : fill;
+      sides = groups.get(tf);
+      if (!sides) groups.set(tf, (sides = []));
+      tri({ x: fx - tx * w - ux * down, y: fy - ty * w - uy * down }, { x: fx + ux * out + wdx, y: fy + uy * out + wdy },
         { x: fx + tx * w - ux * down, y: fy + ty * w - uy * down });
       spikeStats.tufts++;
+      }
     }
   }
-  return sides.length ? { sides, fill, colors: SIDE_COLORS, spike: true } : null;
+  if (!groups.size) return null;
+  return [...groups].map(([tf, sd]) => ({ sides: sd, fill: tf, colors: SIDE_COLORS, spike: true }));
 }
-function silhouetteEdges(shapes, eye, projectPoint, fit) {
+// pix (per-pixel ground shade): { F, cut(o), tone(base, x, y, z) }: the shade borders come from cut(o) (the patch's lit / shade
+// parts, computed for the tufts only), every tuft takes its tone from tone() at its ground point.
+// The shade field's border inside patch o (a triangle), as world polylines [{ x, z }]: the contour depth = eps of the field (the
+// same bilinear read the ground's shader shades by), traced by MARCHING SQUARES on a grid of BORDER_STEP over the triangle's box
+// (each cell's crossings by linear interpolation along its sides; a saddle cell split by its center), the segments whose middle
+// lies in the triangle chained into polylines.
+const BORDER_STEP = 3;
+function fieldBorder(o, F) {
+  const [A, B, C] = o.loop.map((pc) => ({ x: pc.a.x + o.ox, z: pc.a.z + o.oz }));
+  const x0 = Math.min(A.x, B.x, C.x), x1 = Math.max(A.x, B.x, C.x), z0 = Math.min(A.z, B.z, C.z), z1 = Math.max(A.z, B.z, C.z);
+  const nx = Math.max(1, Math.ceil((x1 - x0) / BORDER_STEP)), nz = Math.max(1, Math.ceil((z1 - z0) / BORDER_STEP));
+  const hx = (x1 - x0) / nx, hz = (z1 - z0) / nz, eps = F.grid.eps;
+  const v = new Float64Array((nx + 1) * (nz + 1));
+  let pos = 0, neg = 0;
+  for (let j = 0; j <= nz; j++) for (let i = 0; i <= nx; i++) { const d = F.at(x0 + i * hx, z0 + j * hz) - eps; v[j * (nx + 1) + i] = d; if (d > 0) pos++; else neg++; }
+  if (!pos || !neg) return [];
+  const side = (p, q, r) => (q.x - p.x) * (r.z - p.z) - (q.z - p.z) * (r.x - p.x);
+  const s0 = side(A, B, C);
+  const inTri = (p) => side(A, B, p) * s0 >= 0 && side(B, C, p) * s0 >= 0 && side(C, A, p) * s0 >= 0;
+  const segs = [];
+  const at = (i, j) => v[j * (nx + 1) + i];
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) {
+    const a = at(i, j), b = at(i + 1, j), c = at(i + 1, j + 1), d = at(i, j + 1);
+    const X = x0 + i * hx, Z = z0 + j * hz;
+    // crossings on the cell's 4 sides (bottom, right, top, left), as points with a key shared by the neighbor cell
+    const cr = [];
+    const edge = (va, vb, pa, pb, key) => { if ((va > 0) !== (vb > 0)) { const t = va / (va - vb); cr.push({ x: pa.x + (pb.x - pa.x) * t, z: pa.z + (pb.z - pa.z) * t, key }); } };
+    const P00 = { x: X, z: Z }, P10 = { x: X + hx, z: Z }, P11 = { x: X + hx, z: Z + hz }, P01 = { x: X, z: Z + hz };
+    edge(a, b, P00, P10, `h${i},${j}`); edge(b, c, P10, P11, `v${i + 1},${j}`); edge(c, d, P11, P01, `h${i},${j + 1}`); edge(d, a, P01, P00, `v${i},${j}`);
+    if (cr.length === 2) segs.push([cr[0], cr[1]]);
+    else if (cr.length === 4) {   // a saddle: pair by the center's sign
+      const m = (a + b + c + d) / 4;
+      if ((m > 0) === (a > 0)) { segs.push([cr[0], cr[1]], [cr[2], cr[3]]); } else { segs.push([cr[0], cr[3]], [cr[1], cr[2]]); }
+    }
+  }
+  const kept = segs.filter(([p, q]) => inTri({ x: (p.x + q.x) / 2, z: (p.z + q.z) / 2 }));
+  // chain by the shared crossing keys
+  const ends = new Map();
+  kept.forEach((sg, k) => { for (const e of sg) (ends.get(e.key) || ends.set(e.key, []).get(e.key)).push(k); });
+  const used = new Uint8Array(kept.length), lines = [];
+  for (let k0 = 0; k0 < kept.length; k0++) {
+    if (used[k0]) continue;
+    used[k0] = 1;
+    const line = [kept[k0][0], kept[k0][1]];
+    for (const dir of [1, 0]) {   // grow from the last point, then from the first
+      for (;;) {
+        const endP = dir ? line[line.length - 1] : line[0], next = (ends.get(endP.key) || []).find((k) => !used[k]);
+        if (next === undefined) break;
+        used[next] = 1;
+        const [p, q] = kept[next], far = p.key === endP.key ? q : p;
+        if (dir) line.push(far); else line.unshift(far);
+      }
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+function silhouetteEdges(shapes, eye, projectPoint, fit, persp, pix = null) {
   spikeStats.pieces = spikeStats.points = spikeStats.tufts = 0;
-  const byEdge = new Map();
-  for (const s of shapes) if (s.o.kind === 'patch' && s.o.edges && s.pieces) for (const key of edgeKeysOf(s.o)) {
-    if (!key) continue;
-    const t = byEdge.get(key);
-    if (t === undefined) byEdge.set(key, s); else if (t !== s) byEdge.set(key, [t, s]);
+  const fr = ++edgeFrame;   // the shapes holding each edge this frame: edgeSlot[id] (s, or [s1, s2]) where edgeStamp[id] === fr
+  const edgeAt = (id) => (id >= 0 && edgeStamp[id] === fr ? edgeSlot[id] : undefined);
+  for (const s of shapes) if (s.o.kind === 'patch' && s.o.edges && s.pieces) for (const id of edgeIdsOf(s.o)) {
+    if (id < 0) continue;
+    const t = edgeAt(id);
+    edgeStamp[id] = fr;
+    if (t === undefined) edgeSlot[id] = s; else if (t !== s) edgeSlot[id] = [t, s];
   }
   const wholly = (t) => { const p0 = t.pieces[0]; return !!(p0.M || (p0.ref || p0).flat); };   // drawn whole: flat, or reused (front-facing)
   const screenLen = (A, B) => { const a = projectPoint(A), b = projectPoint(B); return a.scale > 0 && b.scale > 0 ? Math.hypot(b.x - a.x, b.y - a.y) : -1; };
   for (const s of shapes) {
     const o = s.o;
     if (o.kind !== 'patch' || !s.pieces || !s.pieces.length || !(s.pieces[0].ref || s.pieces[0]).floor) continue;
+    // too far for any tuft: tuftPiece's own size gate, with the patch's nearest depth (its bound's) for every run's points
+    if (silhouette.spikes && s.near > 0 && (TUFT_ASPECT * TUFT_R * TUFT_CELL * 1.3 * 1.2 * persp.s) / s.near <= TUFT_SHOW_LINES * LINE_PX) continue;
     const spikes = [];
+    let curBase;
     const own = (x, z) => liftLocal(o, x - o.ox, z - o.oz).y;
-    const emit = (P, fill, groundY = own, keep = null, baseBelow = false) => {
-      if (silhouette.spikes) { const sp = tuftPiece(P, fill, projectPoint, fit, groundY, keep, baseBelow); spikeStats.points += P.length; if (sp) { spikes.push(sp); spikeStats.pieces++; } }
+    const toneOf = pix ? (x, z, y) => pix.tone(curBase, x, y, z) : null;
+    const emit = (P, fill, groundY = own, keep = null, baseBelow = false, tone = toneOf) => {
+      if (!silhouette.spikes) return;
+      const sps = tuftPiece(P, fill, projectPoint, fit, groundY, keep, baseBelow, tone);
+      spikeStats.points += P.length;
+      if (sps) for (const sp of sps) { spikes.push(sp); spikeStats.pieces++; }
+    };
+    // A SHADE BORDER (or a shore) of a part's loop: the part sprouts tufts from its own side (stretch ua..ub of cut piece pc), shown
+    // where they poke past the border on screen. also(x, z): a further test for a tuft (per-pixel mode: none on water).
+    const cutTufts = (loop, pc, ua, ub, fill, tone = toneOf, also = null) => {
+      const W = (u) => { const q = pieceAt(pc, u); return liftLocal(o, q.x, q.z); };
+      const len = screenLen(W(ua), W(ub));
+      if (len < 0) return;
+      const n = Math.max(1, Math.min(64, Math.ceil((pc.kind === 'arc' ? 1.3 : 1) * len / RUN_SEG_PX))), P = [];
+      for (let i = 0; i <= n; i++) P.push(W(ua + ((ub - ua) * i) / n));
+      // the part's side of the border: its loop's interior lies left of the piece's direction when the loop turns
+      // counterclockwise in (x, z); tested against the nearest chord of the run
+      const ccw = loopTurn(loop) > 0;
+      const keep = (x, z) => {
+        if (also && !also(x, z)) return false;
+        let best = Infinity, side = true;
+        for (let i = 0; i + 1 < P.length; i++) {
+          const A = P[i], B = P[i + 1], dx = B.x - A.x, dz = B.z - A.z, l2 = dx * dx + dz * dz || 1;
+          const t = Math.max(0, Math.min(1, ((x - A.x) * dx + (z - A.z) * dz) / l2)), ex = A.x + dx * t - x, ez = A.z + dz * t - z, d2 = ex * ex + ez * ez;
+          if (d2 < best) { best = d2; side = (dx * (z - A.z) - dz * (x - A.x) > 0) === ccw; }
+        }
+        return side;
+      };
+      emit(P, fill, own, keep, true, tone);
     };
     for (const p of s.pieces) {
       const r = p.ref || p, loop = r.loop, fill = p.fill;
+      curBase = r.base;   // (the spikes' base color, for a per-pixel ground shade)
       if (!loop || r.water) continue;   // (no grass on water)
       for (const sd of r.sides) {
         if (sd.edge === undefined) {   // a contour side: points on the conic
@@ -333,32 +482,14 @@ function silhouetteEdges(shapes, eye, projectPoint, fit) {
           continue;
         }
         if (sd.edge === 'cut' && silhouette.shade && sd.piece !== undefined && loop[sd.piece]) {
-          // a SHADE BORDER (or a shore): this part sprouts tufts from its own side, shown where they poke past the border on screen
-          const pc = loop[sd.piece], W = (u) => { const q = pieceAt(pc, u); return liftLocal(o, q.x, q.z); };
-          const ua = Math.min(sd.ua, sd.ub), ub = Math.max(sd.ua, sd.ub), len = screenLen(W(ua), W(ub));
-          if (len < 0) continue;
-          const n = Math.max(1, Math.min(64, Math.ceil((pc.kind === 'arc' ? 1.3 : 1) * len / RUN_SEG_PX))), P = [];
-          for (let i = 0; i <= n; i++) P.push(W(ua + ((ub - ua) * i) / n));
-          // the part's side of the border: its loop's interior lies left of the piece's direction when the loop turns
-          // counterclockwise in (x, z); tested against the nearest chord of the run
-          const ccw = loopTurn(loop) > 0;
-          const keep = (x, z) => {
-            let best = Infinity, side = true;
-            for (let i = 0; i + 1 < P.length; i++) {
-              const A = P[i], B = P[i + 1], dx = B.x - A.x, dz = B.z - A.z, l2 = dx * dx + dz * dz || 1;
-              const t = Math.max(0, Math.min(1, ((x - A.x) * dx + (z - A.z) * dz) / l2)), ex = A.x + dx * t - x, ez = A.z + dz * t - z, d2 = ex * ex + ez * ez;
-              if (d2 < best) { best = d2; side = (dx * (z - A.z) - dz * (x - A.x) > 0) === ccw; }
-            }
-            return side;
-          };
-          emit(P, fill, own, keep, true);
+          cutTufts(loop, loop[sd.piece], Math.min(sd.ua, sd.ub), Math.max(sd.ua, sd.ub), fill);
           continue;
         }
         if (!Number.isInteger(sd.edge) || sd.piece === undefined || !o.edges || !o.edges[sd.edge]) continue;
         const pc = loop[sd.piece];
         if (!pc || pc.kind !== 'line') continue;
         const W = (u) => { const q = pieceAt(pc, u); return liftLocal(o, q.x, q.z); };
-        const l = byEdge.get(edgeKeysOf(o)[sd.edge]), N = Array.isArray(l) ? (l[0] === s ? l[1] : l[0]) : l === s ? null : l;
+        const l = edgeAt(edgeIdsOf(o)[sd.edge]), N = Array.isArray(l) ? (l[0] === s ? l[1] : l[0]) : l === s ? null : l;
         const ua = Math.min(sd.ua, sd.ub), ub = Math.max(sd.ua, sd.ub), runs = [];
         if (N && !N.pieces.length) runs.push([ua, ub]);   // a neighbor selected but drawing nothing: it faces away, a crest
         else if (!N) {
@@ -399,6 +530,32 @@ function silhouetteEdges(shapes, eye, projectPoint, fit) {
         }
       }
     }
+    // per-pixel ground shade: the patch is drawn whole, so its shade borders come from its parts computed for the tufts alone
+    // (each part's cut, in that part's tone: the lit side's tufts over the shade, the shade side's over the lit ground)
+    // per-pixel ground shade: the shade border drawn is the field's own (the ground's shader reads it per pixel), so the tufts stand
+    // on THAT line: the field's contour traced in the patch (pix.border, world polylines), the shade side's tufts in the shade tone
+    // and the lit side's in the lit tone, each side told by the field at the tuft. (Standing them on the geometric split's cut, which
+    // only approximates the border, put their bases inside the shade or the lit ground wherever the cut missed it.)
+    if (pix && silhouette.shade && silhouette.spikes) {
+      const lines = pix.border(o);
+      if (lines.length) {
+        curBase = o.fill;
+        for (const shadeSide of [true, false]) {
+          const tone = (x, z, y) => pix.tone(curBase, x, y, z, shadeSide);
+          const keep = (x, z) => pix.shaded(x, z) === shadeSide && (!pix.dry || pix.dry(x, z));
+          for (const L of lines) {
+            const W = L.map((p) => liftLocal(o, p.x - o.ox, p.z - o.oz));
+            // a run of chords about RUN_SEG_PX long on screen (the traced line has a point every cell)
+            const P = [W[0]];
+            for (let i = 1; i < W.length; i++) {
+              const len = screenLen(P[P.length - 1], W[i]);
+              if (i === W.length - 1 || len < 0 || len >= RUN_SEG_PX) P.push(W[i]);
+            }
+            if (P.length >= 2) emit(P, null, own, keep, true, tone);
+          }
+        }
+      }
+    }
     if (spikes.length) s.pieces = s.pieces.concat(spikes);
   }
 }
@@ -416,6 +573,7 @@ export function renderIllusion(ctx, canvas, opts = {}) {
 // and the stats. Canvas size only matters through `fit` / `view`.
 export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) {
   const t0 = performance.now();
+  frameSway = windAt(time);   // the wind this frame (wind.js): the blades' and the tufts' lean
   // The visible part of the design space (the canvas may be wider or taller than its aspect).
   const fit = Math.min(canvas.width / DESIGN_WIDTH, canvas.height / DESIGN_HEIGHT);
   const hw = canvas.width / 2 / fit, hh = canvas.height / 2 / fit;
@@ -508,7 +666,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     for (const o of sel) pushObject(o);
     if (grass.on && terrain.leafNodes) {   // blades from the patches' seeds (grass.js), near the eye only
       frameBlades = selectGrass(terrain, camPos, { F: light.on ? terrain.F : null, L: light.on ? light.dir : null,
-        toCamera: projector.toCamera, projectPoint, persp, frustum, near: NEAR, fit, tips: grass.tips, faces: grass.faces });
+        toCamera: projector.toCamera, projectPoint, persp, frustum, near: NEAR, fit, tips: grass.tips, faces: grass.faces, sway: frameSway });
       stats.grass = frameBlades.curved.length; stats.specks = frameBlades.triangles;
     }
   }
@@ -728,7 +886,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
           if (p.flat) stats.flat++;
           const base = part.fill || o.fill;   // a part's own color (water), else the patch's
           const sh = part.shade && light.on ? (part.lamp ? lampTone(base, shadeOf(base), part.lamp) : shadeOf(base)) : litOf(base);
-          pieces.push({ sides: p.sides, fill: sh, colors: SIDE_COLORS, keep: !o.move, floor: true, loop: p.loop, G: p.G, flat: !!p.flat, water: !!part.fill });
+          pieces.push({ sides: p.sides, fill: sh, colors: SIDE_COLORS, keep: !o.move, floor: true, loop: p.loop, G: p.G, flat: !!p.flat, water: !!part.fill, base });
         }
       }
       // the reference for later frames: only a patch with no contour (wholly front-facing) and a whole view of it
@@ -758,12 +916,35 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     setCrescents(o, pieces);
     s.pieces = pieces;
   }
-  if (silhouette.on) { const ts = performance.now(); silhouetteEdges(shapes, camPos, projectPoint, fit); spikeStats.ms = performance.now() - ts; }
+  if (silhouette.on && silhouette.spikes && grass.on) {   // (its only output is the spikes: none without grass)
+    const ts = performance.now();
+    let pix = null;
+    if (terrain && terrain.pixelShade && light.on && terrain.F) {
+      const Fs = terrain.F;
+      // a tuft's tone at its ground point: the field there (or `side`, a shade border's part), its shade lifted by a lamp
+      const tone = (base, x, y, z, side) => {
+        const sh = side !== undefined ? side : Fs.all || (!Fs.none && Fs.at(x, z) > 0.25);
+        return sh ? grassShade(base, { x, y, z }) : litOf(base);
+      };
+      // a patch's shade border: the field's contour (depth = its EPS) traced in the patch, kept per field version
+      const border = (o) => {
+        if (o.tuftBorderF !== Fs || o.tuftBorderV !== Fs.version) { o.tuftBorder = Fs.grid ? fieldBorder(o, Fs) : []; o.tuftBorderF = Fs; o.tuftBorderV = Fs.version; }
+        return o.tuftBorder;
+      };
+      pix = { tone, border, shaded: (x, z) => Fs.all || (!Fs.none && Fs.at(x, z) > Fs.grid.eps), dry: terrain.wet ? (x, z) => !terrain.wet(x, z) : null };
+    }
+    silhouetteEdges(shapes, camPos, projectPoint, fit, projector.persp, pix);
+    spikeStats.ms = performance.now() - ts; }
+  else spikeStats.pieces = spikeStats.points = spikeStats.tufts = spikeStats.ms = 0;
   const t1 = performance.now();
   // Movers' shadows on the terrain (groundShadow.js): each drawn right after the last ground patch under it, inside the lit parts of
   // those patches (one clip of all of them), as the shade overlay.
   const shadows = [];
-  if (light.on && terrain && terrain.H) {
+  const pixelGround = !!(terrain && terrain.pixelShade);
+  // per-pixel ground shade: the movers cast their shadows in the ground's own shader (capsules), no overlays
+  const casters = [];
+  if (pixelGround && light.on && light.dir.y > 0.02) for (const o of tree.movers) if (!o.kind && o.shade) casters.push({ a: o.a.c, b: o.b.c, r: Math.max(o.a.r, o.b.r) });
+  if (light.on && terrain && terrain.H && !pixelGround) {
     // the drawn ground patches' boxes, once (not one scan of every shape per mover)
     let gi = null, gb = null, gn = 0;
     for (const o of tree.movers) if (!o.kind && o.shade) {
@@ -787,6 +968,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     }
   }
   return { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo, projectPoint, camPos, forward: basis.forward,
+    pixelGround, basis, persp: projector.persp, casters, field: terrain && terrain.F, lamps,
     sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit };
 }
 

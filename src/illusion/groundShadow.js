@@ -15,9 +15,21 @@ const unit = (p) => { const l = Math.hypot(p.x, p.y, p.z) || 1; return { x: p.x 
 export function capsuleShadow(o, H, L, projector) {
   if (L.y <= 0.02) return null;
   const c = { x: (o.a.c.x + o.b.c.x) / 2, y: (o.a.c.y + o.b.c.y) / 2, z: (o.a.c.z + o.b.c.z) / 2 };
-  // Where the ray from the center away from the sun meets the ground (a few fixed-point steps), and the ground's normal there.
-  let t = 0;
-  for (let k = 0; k < 6; k++) t = (c.y - H(c.x - t * L.x, c.z - t * L.z)) / L.y;
+  // Where the ray from the center away from the sun meets the ground, and the ground's normal there. The ray's height over the
+  // ground f(t) falls at most (L.y + 1.5 |L horizontal|) per unit for slopes up to 1.5, so a step of f over that can't pass the
+  // ground; then bisection. (Six fixed-point steps t = (c.y - H) / L.y diverged on slopes steeper than tan(elevation): with the
+  // low default sun, 11% of the movers' shadows were off by over 10 units, the worst by 334.)
+  const f = (t) => c.y - t * L.y - H(c.x - t * L.x, c.z - t * L.z);
+  const rate = L.y + 1.5 * Math.hypot(L.x, L.z);
+  let t = 0, ft = f(0), prev = 0;
+  if (ft <= 0) return null;   // (its center under the ground)
+  for (let k = 0; k < 400 && ft > 0.01; k++) {
+    prev = t;
+    t += Math.max(0.25, ft / rate);
+    ft = f(t);
+    if (t > 5000) return null;
+  }
+  if (ft < 0) { let a = prev, b = t; for (let k = 0; k < 30; k++) { const m = (a + b) / 2; if (f(m) > 0) a = m; else b = m; } t = (a + b) / 2; }
   const G = { x: c.x - t * L.x, y: c.y - t * L.y, z: c.z - t * L.z }, e = 1;
   const n = unit({ x: -(H(G.x + e, G.z) - H(G.x - e, G.z)) / (2 * e), y: 1, z: -(H(G.x, G.z + e) - H(G.x, G.z - e)) / (2 * e) });
   const nl = dot(n, L);

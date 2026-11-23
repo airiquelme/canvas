@@ -1,6 +1,6 @@
 // In-page timing of one backend over the flying views (bench.mjs). Per frame: build (the frame's JS, buildIllusionFrame), draw (the
 // backend's JS: Canvas 2D calls, or tessellation + GPU commands), total (until the GPU / rasterizer is done: a 1-pixel readback).
-export async function bench({ backend, W = 1600, H = 900, frames = 40, src = '/src' }) {
+export async function bench({ backend, W = 1600, H = 900, frames = 40, src = '/src', pixel }) {
   const cam = await import(src + '/core/camera.js');
   const R = await import(src + '/illusion/illusionRender.js');
   const B = await import(src + '/gpu/backend.js');
@@ -9,6 +9,7 @@ export async function bench({ backend, W = 1600, H = 900, frames = 40, src = '/s
   document.body.append(canvas);
   const be = await B.createBackend(backend, canvas);
   const sync = backend === 'canvas' ? (() => { const x = be.ctx.getImageData(0, 0, 1, 1); return x; }) : backend === 'webgl2' ? be.readPixel : be.sync;
+  if (pixel !== undefined && R.groundShade) R.groundShade.pixel = pixel;   // per-pixel ground shade (webgl2)
   const g = R.buildMeadowScene();
   const views = [[1200, 0, 60, 500, 0], [1200, 0, 300, 300, 400], [-400, -900, 200, 500, 0], [500, 1300, 40, 400, -600], [-1500, 1500, 30, 1500, -1500], [700, -200, 12, 600, -200]];
   const acc = { build: [], draw: [], total: [] };
