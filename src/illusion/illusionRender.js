@@ -7,6 +7,7 @@ import { camera, getCameraPosition, computeViewBasis, worldToCamera, makeProject
 import { applyDesignSpaceTransform } from '../core/canvas.js';
 import { drawShape, tracePath, traceSide, sideStart, pointOnEllipse, line } from './shape.js';
 import { capsuleSides } from './capsule.js';
+import { eggSides, ovoidSides } from './egg.js';
 import { curvedSides, curveChainSides } from './curve.js';
 import { buildWorld } from './world.js';
 import { buildMeadow } from './meadow.js';
@@ -22,7 +23,7 @@ import { drawSky } from './sky.js';
 import { lamps, lampAt, lampTone } from './lamps.js';
 import { clipLoopNear } from './patch.js';
 import { windAt } from './wind.js';
-import { buildFigure, buildStaticFigure } from './figure.js';
+import { buildFigure, buildStaticFigure, BONES } from './figure.js';
 import { player } from '../core/flyCamera.js';
 let frameSway = null;   // this frame's wind field (buildIllusionFrame), or null
 
@@ -106,7 +107,10 @@ export function buildMeadowScene(opts = {}) {
   // and a static copy of it to inspect, standing ahead of the start view, to the left, facing it
   const sx = eye.x + Math.cos(yaw) * 220 + Math.sin(yaw) * 70, sz = eye.z + Math.sin(yaw) * 220 - Math.cos(yaw) * 70;
   const statue = buildStaticFigure({ height: player.height * m.grid.cube, groundAt: m.groundAt, x: sx, z: sz, yaw: yaw + Math.PI });
-  objects.push(...figure, ...statue, ...m.movers, ...m.poles);
+  // and a female one beside it (to its right as seen from the start)
+  const fx = sx - Math.sin(yaw) * 45, fz = sz + Math.cos(yaw) * 45;
+  const statueF = buildStaticFigure({ height: player.height * m.grid.cube, groundAt: m.groundAt, x: fx, z: fz, yaw: yaw + Math.PI, female: true });
+  objects.push(...figure, ...statue, ...statueF, ...m.movers, ...m.poles);
   tree = null;
   return m.groundAt;
 }
@@ -578,6 +582,46 @@ export function renderIllusion(ctx, canvas, opts = {}) {
   return drawIllusion2D(ctx, canvas, buildIllusionFrame(canvas, opts));
 }
 
+// An OVOID (a disc with `ovoid`: the figures' mittens; its c, e1, e2 only bound it): egg.js. g: its growth (relative size).
+function ovoidOf(o, projector, g = 1) {
+  const H = o.ovoid;
+  return ovoidSides(H.M, H.a, H.w, H.n, H.A1 * g, H.A2 * g, H.Bw * g, H.Bn * g, projector, H.ball && { c: H.ball.c, r: H.ball.r * g });
+}
+
+// An egg-shaped stick (`egg`: { at, B }, world units: its widest circle's distance from a along a -> b and its half-width; it
+// closes onto its ends as balls of radius a.r, b.r): egg.js.
+function eggOf(o, projector, g = 1) {
+  const A = o.a.c, Bp = o.b.c, dx = Bp.x - A.x, dy = Bp.y - A.y, dz = Bp.z - A.z, L = Math.hypot(dx, dy, dz) || 1;
+  const u = { x: dx / L, y: dy / L, z: dz / L }, E = o.egg, at = Math.min(E.at, 0.9 * L);
+  const M = { x: A.x + u.x * at, y: A.y + u.y * at, z: A.z + u.z * at };
+  return eggSides(M, u, E.B * g, at, L - at, o.a.r * g, o.b.r * g, projector);
+}
+
+// A shape's sides split into loops (a side with `move` starts one), a loop's signed area (y down; arcs sampled), a loop reversed.
+function splitLoops(sides) {
+  const out = [];
+  let cur = null;
+  sides.forEach((sd, i) => { if (i === 0 || sd.move) out.push((cur = [])); cur.push(sd); });
+  return out;
+}
+function loopArea(L) {
+  const pts = [];
+  for (const sd of L) {
+    if (sd.kind === 'line') pts.push(sd.from);
+    else for (let k = 0; k < 4; k++) pts.push(pointOnEllipse(sd.e, sd.t0 + (sd.t1 - sd.t0) * k / 4));
+  }
+  let A = 0;
+  for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; A += p.x * q.y - q.x * p.y; }
+  return A / 2;
+}
+const loopsWound = (sides) => splitLoops(sides).map(loopArea);
+function reverseLoop(L) {
+  return L.slice().reverse().map((sd) => {
+    const { move, ...r } = sd;
+    return sd.kind === 'line' ? { ...r, from: sd.to, to: sd.from } : { ...r, t0: sd.t1, t1: sd.t0 };
+  });
+}
+
 // SOLIDS' ORDER. Mean depths mis-order a long stick against a short one (an arm across the torso, a figure beside a pole) and sticks
 // meeting at a joint. For each pair of solids (straight capsules, balls: a = b) that overlap ON SCREEN, which is in front THERE:
 // where they touch in 3D (a joint, a T junction), the depths a little way into each from the contact (3 radii, or the contact
@@ -604,7 +648,7 @@ function orderSolids(shapes, projectPoint, depthOf) {
     return [s, t];
   };
   const idx = [];
-  shapes.forEach((s, i) => { const o = s.o; if (!s.blade && !s.prebuilt && !s.nearCut && !o.kind && !o.bend && o.a && o.b && s.pieces && s.pieces.length && s.box && depthOf(o.a.c) > NEAR && depthOf(o.b.c) > NEAR) idx.push(i); });
+  shapes.forEach((s, i) => { const o = s.o; if (!s.blade && !s.prebuilt && !s.nearCut && !s.body && !o.kind && !o.bend && o.a && o.b && s.pieces && s.pieces.length && s.box && depthOf(o.a.c) > NEAR && depthOf(o.b.c) > NEAR) idx.push(i); });
   const n = idx.length;
   if (n < 2) return;
   const M = idx.map((i) => { const s = shapes[i];
@@ -1014,6 +1058,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
       if (reuseOn && !s.nearCut && ctrlOf(o) && frontAll(o) && !pieces.some((p) => p.sides.some((sd) => sd.ci === 4)))
         o.ref = { Q: o.ctrl.map(projectPoint), pieces, parts: o.parts, light: lightKey };
     }
+    else if (o.kind === 'disc' && o.ovoid) pieces = one(o, ovoidOf(o, projector, g));
     else if (o.kind) {
       pieces = sheetPieces(sh, projector).sort((p, q) => q.depth - p.depth)
         .map((p) => ({ sides: p.sides, fill: litOf(p.front ? o.fill : o.back), base: p.front ? o.fill : o.back, colors: SIDE_COLORS, keep: !o.move }));
@@ -1029,7 +1074,9 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     } else if (curved) {
       pieces = one(o, curveChainSides(o.a.c, o.bend, o.b.c, o.a.r * g, o.b.r * g, projector,
         o.simple ? (s.size > 30 ? 3 : 1) : Math.max(2, Math.ceil(1.2 * Math.sqrt(s.size)))));
-    } else pieces = one(o, capsuleSides(s.c1, s.c2));
+    } else if (o.outline) pieces = one(o, o.outline(projector, g));   // (a figure's part drawing its own outline; its capsule only bounds it)
+    else if (o.egg) pieces = one(o, eggOf(o, projector, g));   // (the figures' limbs, egg.js)
+    else pieces = one(o, capsuleSides(s.c1, s.c2));
     if (curved) { if (o.exact) stats.curved++; else stats.simplified++; }
     if (o.kind && o.kind !== 'quad' && o.kind !== 'patch') stats.sheets++;
     if (!o.move && !s.nearCut && !fading) o.cache = { key: camKey, pieces };
@@ -1070,6 +1117,51 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
       }
     }
   }
+  // FLAT BODIES (`o.body`: the figures, figure.js): all the parts of one body become ONE shape, their loops in one path (nonzero:
+  // their union, no inner edges), in one flat tone (the shade tone with the sun down or the body in a hill's shadow, judged at its
+  // first part), drawn at the place of its nearest part in the order. Kept out of orderSolids.
+  {
+    const groups = new Map();
+    for (let i = 0; i < shapes.length; i++) {
+      const s = shapes[i];
+      if (!s.o.body || !s.pieces || !s.pieces.length) continue;
+      let g = groups.get(s.o.body);
+      if (!g) groups.set(s.o.body, (g = []));
+      g.push(i);
+    }
+    if (groups.size) {
+      const drop = new Set();
+      for (const idxs of groups.values()) {
+        const last = shapes[idxs[idxs.length - 1]];
+        const capsule = idxs.map((i) => shapes[i]).find((t) => !t.o.kind);   // (o: a capsule part, never a quad: quads count as ground)
+        const first = capsule ? capsule.o : last.o;
+        let tone = litOf(first.fill);
+        const probe = first.a ? first.a.c : first.c || first.pts[0];   // (a capsule's end, a disc's center: a hand alone on screen)
+        if (light.on && (light.dir.y <= 0 || (terrain && terrain.F && terrain.F.point && terrain.F.point(probe)))) {
+          const lift = lamps.length ? lampAt(probe) : null;
+          tone = lift ? lampTone(first.fill, shadeOf(first.fill), lift) : shadeOf(first.fill);
+        }
+        const sides = [], box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+        // every loop wound the same way (nonzero: a quad seen from its other side would cancel the capsules it overlaps)
+        let ref = 0;
+        for (const i of idxs) for (const p of shapes[i].pieces) if (!shapes[i].o.kind) { ref = ref || loopsWound(p.sides)[0]; }
+        for (const i of idxs) {
+          const s = shapes[i];
+          for (const p of s.pieces) for (const L of splitLoops(p.sides)) {
+            const lp = ref && Math.sign(loopArea(L)) !== Math.sign(ref) ? reverseLoop(L) : L;
+            lp.forEach((sd, k) => sides.push(k === 0 ? { ...sd, move: true } : sd));
+          }
+          if (s.box) { box.x0 = Math.min(box.x0, s.box.x0); box.y0 = Math.min(box.y0, s.box.y0); box.x1 = Math.max(box.x1, s.box.x1); box.y1 = Math.max(box.y1, s.box.y1); }
+          if (s !== last) drop.add(s);
+        }
+        const merged = { ...last, o: first, body: true, box: box.x0 <= box.x1 ? box : last.box, pieces: [{ sides, fill: tone, base: first.fill, colors: SIDE_COLORS, keep: false }] };
+        shapes[idxs[idxs.length - 1]] = merged;
+      }
+      let w = 0;
+      for (let i = 0; i < shapes.length; i++) if (!drop.has(shapes[i])) shapes[w++] = shapes[i];
+      shapes.length = w;
+    }
+  }
   // SOLIDS (straight capsules and balls: movers, poles, the figures' parts) re-ordered where they overlap on screen (orderSolids).
   orderSolids(shapes, projectPoint, depthOf);
   if (silhouette.on && silhouette.spikes && grass.on) {   // (its only output is the spikes: none without grass)
@@ -1099,14 +1191,14 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
   const pixelGround = !!(terrain && terrain.pixelShade);
   // per-pixel ground shade: the movers cast their shadows in the ground's own shader (capsules), no overlays
   const casters = [];
-  if (pixelGround && light.on && light.dir.y > 0.02) for (const o of tree.movers) if (!o.kind && o.shade) casters.push({ a: o.a.c, b: o.b.c, r: Math.max(o.a.r, o.b.r) });
-  // the shaders take the first 16: the nearest ones (the player's figure is 11 of them)
+  if (pixelGround && light.on && light.dir.y > 0.02) for (const o of tree.movers) if (!o.kind && (o.shade || o.casts)) casters.push({ a: o.a.c, b: o.b.c, r: Math.max(o.a.r, o.b.r) });
+  // the shaders take the first 16: the nearest ones (the player's figure is 11 of them: head, neck, torso, limbs; its feet and hands cast none)
   const cd = (c) => (c.a.x + c.b.x - 2 * camPos.x) ** 2 + (c.a.y + c.b.y - 2 * camPos.y) ** 2 + (c.a.z + c.b.z - 2 * camPos.z) ** 2;
   if (casters.length > 16) casters.sort((p, q) => cd(p) - cd(q));
   if (light.on && terrain && terrain.H && !pixelGround) {
     // the drawn ground patches' boxes, once (not one scan of every shape per mover)
     let gi = null, gb = null, gn = 0;
-    for (const o of tree.movers) if (!o.kind && o.shade) {
+    for (const o of tree.movers) if (!o.kind && (o.shade || o.casts)) {
       const sh = capsuleShadow(o, terrain.H, light.dir, projector);
       if (!sh) continue;
       if (!gi) {
@@ -1126,7 +1218,15 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
       if (last >= 0) shadows.push({ sh, hosts, last });
     }
   }
-  return { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo, projectPoint, camPos, forward: basis.forward,
+  // the figures' SKELETONS (temporary guide, figure.js): each joint on screen, null when behind the eye
+  const skeletons = [], seen = new Set();
+  for (const o of objects) if (o.body && o.body.joints && !seen.has(o.body)) {
+    seen.add(o.body);
+    const J = {};
+    for (const k in o.body.joints) { const p = o.body.joints[k]; J[k] = depthOf(p) > NEAR ? projectPoint(p) : null; }
+    skeletons.push(J);
+  }
+  return { t0, t1, fit, view, darkMode, shapes, shadows, stats, frameNo, projectPoint, camPos, forward: basis.forward, skeletons,
     pixelGround, basis, persp: projector.persp, casters, field: terrain && terrain.F, lamps,
     sky: sky.on && !darkMode ? { sunDisc: sky.sunDisc } : null, groundEdit: !!groundEdit };
 }
@@ -1241,6 +1341,15 @@ export function drawIllusion2D(ctx, canvas, F) {
 // What is drawn over a frame in Canvas 2D whatever the backend (ctx in design space): the ground edit's aim, the Debug view.
 function drawOverlay(ctx, F) {
   const { fit, view, darkMode, shapes } = F;
+  if (F.skeletons && F.skeletons.length) {   // the figures' skeletons (temporary): red bones, joints as dots, over everything
+    ctx.strokeStyle = ctx.fillStyle = '#ff0000'; ctx.lineWidth = 1.5 / fit; ctx.lineCap = 'round';
+    for (const J of F.skeletons) {
+      ctx.beginPath();
+      for (const [a, b] of BONES) if (J[a] && J[b]) { ctx.moveTo(J[a].x, J[a].y); ctx.lineTo(J[b].x, J[b].y); }
+      ctx.stroke();
+      for (const k in J) if (J[k]) { ctx.beginPath(); ctx.arc(J[k].x, J[k].y, 2.5 / fit, 0, Math.PI * 2); ctx.fill(); }
+    }
+  }
   if (F.groundEdit) {   // the grid's aim (main.js: E digs, R places at the screen's center)
     const cx = (view.x0 + view.x1) / 2, cy = (view.y0 + view.y1) / 2, r = 7;
     ctx.lineCap = 'round';
@@ -1283,7 +1392,7 @@ function drawOverlay(ctx, F) {
 export function drawIllusionOverlay(ctx, canvas, F) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!F.groundEdit && !debug.on) return;
+  if (!F.groundEdit && !debug.on && !(F.skeletons && F.skeletons.length)) return;
   ctx.save();
   applyDesignSpaceTransform(ctx, canvas);
   drawOverlay(ctx, F);

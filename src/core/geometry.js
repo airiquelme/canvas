@@ -356,7 +356,7 @@ export function pointEllipseTangents(p, e) {
 // h1(theta) = c1.n + s1 and h2 likewise, so s1 - s2 = (c2 - c1).n =: delta. Squaring twice (2 s1 s2 = q1 + q2 - delta^2,
 // then 4 q1 q2 = R^2) leaves a quartic form in (cos, sin), a quartic in t = tan(theta), solved in closed form
 // (Ferrari); the roots are checked against the original equation and polished on it. Up to 4 angles.
-export function ellipseTangentAngles(e1, e2) {
+export function ellipseTangentAngles(e1, e2, scan = 96) {   // scan: the check's sign scan (angles); the fallback keeps 96
   const quad = (e) => {
     const c = Math.cos(e.angle), s = Math.sin(e.angle), a2 = e.a * e.a, b2 = e.b * e.b;
     return [a2 * c * c + b2 * s * s, 2 * (a2 - b2) * c * s, a2 * s * s + b2 * c * c];   // coefficients of cos^2, cos sin, sin^2
@@ -375,6 +375,7 @@ export function ellipseTangentAngles(e1, e2) {
   const roots = [];
   cand.forEach(th0 => {
     let th = th0;
+    if (scan < 96 && Math.abs(g(th)) > 1e-6 * scaleG) return;   // (fast mode: a candidate the quartic got far from a root is the squaring's extra one)
     for (let it = 0; it < 6; it++) {
       const h = 1e-6, g0 = g(th);
       if (Math.abs(g0) <= 1e-13 * scaleG) break;      // converged
@@ -394,7 +395,7 @@ export function ellipseTangentAngles(e1, e2) {
   // missing two crossings within a 1/96 turn, where the quartic then has to agree), else the bisected scan is the answer.
   const sign = (th) => g(th) < 0;
   let scanned = 0, prevSign = sign(0);
-  for (let i = 1; i <= 96; i++) { const cur = sign((i / 96) * TWO_PI); if (cur !== prevSign) scanned++; prevSign = cur; }
+  for (let i = 1; i <= scan; i++) { const cur = sign((i / scan) * TWO_PI); if (cur !== prevSign) scanned++; prevSign = cur; }
   const srt = roots.slice().sort((a, b) => a - b);
   let changes = 0;
   srt.forEach(r => { if (sign(r + 1e-5) !== sign(r - 1e-5)) changes++; });
@@ -429,7 +430,7 @@ function sampledTangentAngles(g) {
 // Returns the loop in decreasing normal angle (anticlockwise on screen) as ops: { k: 'p', p } (a corner) and
 // { k: 'e', e, from, to, skip } (the arc of e for the normal angles from `from` down to `to`); consecutive ops are
 // joined by the straight common tangents. See shapes.js traceOutline.
-export function hullOutline(items) {
+export function hullOutline(items, scan = 96) {   // scan: ellipseTangentAngles' check
   const verts = [], ells = [];
   items.forEach(it => {
     if (it.pts) { it.pts.forEach(p => verts.push(p)); return; }
@@ -452,7 +453,7 @@ export function hullOutline(items) {
   }
   ells.forEach((E, i) => {
     hv.forEach(v => pointEllipseTangents(v, E.e).forEach(a => crit.push(a)));
-    for (let j = i + 1; j < ells.length; j++) ellipseTangentAngles(E.e, ells[j].e).forEach(a => crit.push(a));
+    for (let j = i + 1; j < ells.length; j++) ellipseTangentAngles(E.e, ells[j].e, scan).forEach(a => crit.push(a));
     if (!E.full) crit.push(E.th0, normAng(E.th0 + E.span));
   });
   const angles = crit.sort((x, y) => x - y).filter((a, i, arr) => i === 0 || a - arr[i - 1] > 1e-12);

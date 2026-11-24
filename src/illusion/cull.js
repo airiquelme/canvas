@@ -20,7 +20,7 @@ export function boundPoints(o) {
   if (o.move) return pointsOf(o);
   return o.boundPts || (o.boundPts = pointsOf(o));
 }
-export const boundRadius = (o) => (o.kind === 'panel' || o.kind === 'disc' || o.kind === 'quad' || o.kind === 'patch' ? 0 : Math.max(o.a.r, o.b.r));
+export const boundRadius = (o) => (o.boundR != null ? o.boundR : o.kind === 'panel' || o.kind === 'disc' || o.kind === 'quad' || o.kind === 'patch' ? 0 : Math.max(o.a.r, o.b.r));
 function pointsOf(o) {
   if (o.kind === 'quad') return o.pts;
   if (o.kind === 'patch') return o.bound;
