@@ -1,7 +1,9 @@
 // Free-flying camera (the illusion scene): WASD moves in the view's horizontal plane (hold Q: 6x faster), Space / Shift up / down,
 // the mouse looks around while the pointer is locked (click the canvas to lock, Esc to release), the wheel zooms.
-// Enter (where the scene has walkable ground, `fly.ground`: the meadow) toggles WALKING: the player's body under gravity on the
-// ground, `player.height` cubes tall with the eyes at `player.eye` of that, WASD at walking pace (Q runs), Space jumps.
+// Enter (where the scene has walkable ground, `fly.ground`: the meadow) toggles WALKING: the player's body (`walk.body`, its feet;
+// drawn as a stick figure, illusion/figure.js) under gravity on the ground, `player.height` cubes tall, WASD at walking pace (Q
+// runs), Space jumps; the camera is THIRD PERSON, over the body's right shoulder (`third`), turned by the mouse around a point
+// above the shoulder, kept above the ground.
 // It drives the shared `camera` (camera.js): `camera.position` overrides the orbit, and `camera.target` is kept one
 // `orbitRadius` ahead of the eye, so the renderers' computeViewBasis(camPos, camera.target) and the projection's
 // scale (refDistance = orbitRadius) work unchanged.
@@ -19,7 +21,11 @@ export const fly = {
 export const player = { height: 2, eye: 0.93 };
 const CUBE_M = 0.875;                                  // meters per cube
 const WALK_MS = 1.4, RUN_MS = 5, GRAVITY_MS2 = 9.81, JUMP_M = 0.45, MAX_FALL_MS = 50;
-export const walk = { on: false, vy: 0, grounded: false };
+// body: the feet (world), yaw: its facing, phase / gait: the stride (radians; 0 standing .. 1 walking), set by updateWalk
+export const walk = { on: false, vy: 0, grounded: false, body: null, yaw: 0, phase: 0, gait: 0 };
+// The over-the-shoulder camera, in body heights: the pivot `up` over the feet and `side` to the right, the camera `back` behind it
+// along the view, at least `clear` over the ground.
+export const third = { up: 0.9, side: 0.3, back: 2.2, clear: 0.12 };
 
 const MAX_PITCH = Math.PI / 2 - 0.01;   // computeViewBasis crosses with world up, so never look straight up / down
 const keys = new Set();
@@ -50,7 +56,8 @@ export function enableFly(canvas, onChange) {
     if (document.pointerLockElement !== canvas) return;
     fly.yaw += e.movementX * fly.sensitivity;
     fly.pitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, fly.pitch - e.movementY * fly.sensitivity));
-    syncTarget();
+    const G = walk.on && fly.ground && fly.ground();
+    if (G && walk.body) { walk.yaw = fly.yaw; placeCamera(G); } else syncTarget();
     onChange();
   });
   canvas.addEventListener('wheel', (e) => {
@@ -62,9 +69,11 @@ export function enableFly(canvas, onChange) {
   window.addEventListener('keydown', (e) => {
     if (e.target instanceof HTMLInputElement) return;   // e.g. a slider with focus
     if ((e.code === 'Enter' || e.code === 'NumpadEnter') && !e.repeat) {
-      if (!fly.ground || !fly.ground()) return;
+      const G = fly.ground && fly.ground();
+      if (!G) return;
       e.preventDefault();
-      walk.on = !walk.on; walk.vy = 0; walk.grounded = false;   // walking starts where the eye is: from the air it falls
+      walk.on = !walk.on; walk.vy = 0; walk.grounded = false; walk.gait = 0;
+      if (walk.on) startWalk(G);   // the body put ahead of the view (from the air it falls); flying leaves it standing there
       onChange();
       return;
     }
@@ -76,25 +85,54 @@ export function enableFly(canvas, onChange) {
   window.addEventListener('blur', () => keys.clear());
 }
 
-// Walking: the feet under the eye, moved by WASD in the horizontal plane, then gravity against the ground's height. On the ground
-// the feet follow it down slopes (up to a drop of twice the step's run, about 63 degrees) instead of leaving it on every step; a
-// bigger drop (a dug hole, a ledge) is a fall.
+// The third-person camera from the body and the view's yaw / pitch (returns whether it moved).
+function placeCamera(G) {
+  const B = walk.body, h = player.height * G.cube, f = forwardOf();
+  const rx = -Math.sin(fly.yaw), rz = Math.cos(fly.yaw);
+  const px = B.x + rx * third.side * h, py = B.y + third.up * h, pz = B.z + rz * third.side * h;
+  const x = px - f.x * third.back * h, z = pz - f.z * third.back * h;
+  const y = Math.max(py - f.y * third.back * h, G.height(x, z) + third.clear * h);
+  const p = camera.position;
+  if (p && p.x === x && p.y === y && p.z === z) return false;
+  camera.position = { x, y, z };
+  syncTarget();
+  return true;
+}
+
+// Walking starts where the view is: the body is put where this camera would follow it from, and falls from there.
+function startWalk(G) {
+  const h = player.height * G.cube, f = forwardOf(), p = camera.position;
+  const rx = -Math.sin(fly.yaw), rz = Math.cos(fly.yaw);
+  const x = p.x + f.x * third.back * h - rx * third.side * h, z = p.z + f.z * third.back * h - rz * third.side * h;
+  walk.body = { x, y: Math.max(G.height(x, z), p.y + f.y * third.back * h - third.up * h), z };
+  walk.yaw = fly.yaw;
+  placeCamera(G);
+}
+
+// Walking: the feet moved by WASD in the horizontal plane (the body turns with the view), then gravity against the ground's height.
+// On the ground the feet follow it down slopes (up to a drop of twice the step's run, about 63 degrees) instead of leaving it on
+// every step; a bigger drop (a dug hole, a ledge) is a fall.
 function updateWalk(dt) {
   const G = fly.ground && fly.ground();
   if (!G) { walk.on = false; return false; }
+  if (!walk.body) startWalk(G);
   const m = G.cube / CUBE_M;                           // world units per meter
-  const eyeH = player.height * player.eye * G.cube;
-  const p = camera.position;
+  const B = walk.body;
   const fwd = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
   const side = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-  let x = p.x, z = p.z, y = p.y - eyeH;
+  let x = B.x, z = B.z, y = B.y;
   let run = 0;
+  walk.yaw = fly.yaw;
   if (fwd || side) {
     const cy = Math.cos(fly.yaw), sy = Math.sin(fly.yaw);
     const mx = fwd * cy - side * sy, mz = fwd * sy + side * cy, len = Math.hypot(mx, mz);
     run = (keys.has('KeyQ') ? RUN_MS : WALK_MS) * m * dt;
     x += mx / len * run; z += mz / len * run;
+    // the stride: one step per 0.75 m walking (a cycle of two steps), longer running; backwards the legs swing back
+    walk.phase += (fwd < 0 ? -1 : 1) * run / ((keys.has('KeyQ') ? 1.3 : 0.75) * m) * Math.PI;
   }
+  const gTarget = run && walk.grounded ? 1 : 0, prevGait = walk.gait;
+  walk.gait += Math.max(-dt * 4, Math.min(dt * 4, gTarget - walk.gait));   // eases in and out over a quarter second
   const g = G.height(x, z);
   if (walk.grounded && keys.has('Space')) { walk.vy = Math.sqrt(2 * GRAVITY_MS2 * JUMP_M) * m; walk.grounded = false; }
   if (walk.grounded && y - g <= 2 * run + 0.01 * m) y = g;   // stays on the ground (uphill: lifted, downhill: follows)
@@ -104,11 +142,9 @@ function updateWalk(dt) {
     y += walk.vy * dt;
     if (y <= g) { y = g; walk.vy = 0; walk.grounded = true; }
   }
-  const ny = y + eyeH;
-  if (x === p.x && z === p.z && ny === p.y) return false;
-  camera.position = { x, y: ny, z };
-  syncTarget();
-  return true;
+  const bodyMoved = x !== B.x || z !== B.z || y !== B.y || walk.gait !== prevGait;
+  walk.body = { x, y, z };
+  return placeCamera(G) || bodyMoved;
 }
 
 // Moves the eye for dt seconds of held keys (walking: and gravity); returns whether it moved.
@@ -130,6 +166,6 @@ export function updateFly(dt) {
 
 export const flyStatus = () => {
   const p = camera.position, deg = (r) => (r * 180 / Math.PI).toFixed(0);
-  const mode = walk.on ? `walk (${player.height} cubes, Enter: fly)  ` : (fly.ground && fly.ground() ? 'fly (Enter: walk)  ' : '');
+  const mode = walk.on ? `walk, 3rd person (${player.height} cubes, Enter: fly)  ` : (fly.ground && fly.ground() ? 'fly (Enter: walk)  ' : '');
   return `${mode}pos ${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}  yaw ${deg(fly.yaw)}  pitch ${deg(fly.pitch)}  zoom ${camera.zoom.toFixed(2)}`;
 };

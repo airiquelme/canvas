@@ -15,13 +15,15 @@ import { sheetPieces, panelPolygon, backOf } from './sheet.js';
 import { quadPieces, quadConvex } from './quad.js';
 import { patchPieces, ringPatch, heightAt, pieceAt, liftLocal, facingAt, contourWorld, ringWorld } from './patch.js';
 import { selectTerrain } from './terrain.js';
-import { light, shadeOf, brightOf, litOf, shadeOverlay } from './light.js';
+import { light, shadeOf, litOf, shadeOverlay } from './light.js';
 import { capsuleShadow } from './groundShadow.js';
 import { selectGrass, bladePieces } from './grass.js';
 import { drawSky } from './sky.js';
 import { lamps, lampAt, lampTone } from './lamps.js';
 import { clipLoopNear } from './patch.js';
 import { windAt } from './wind.js';
+import { buildFigure, buildStaticFigure } from './figure.js';
+import { player } from '../core/flyCamera.js';
 let frameSway = null;   // this frame's wind field (buildIllusionFrame), or null
 
 // One color per side (capsule: end arc 2, line, end arc 1, line), distinct from every fill.
@@ -97,7 +99,14 @@ export function buildMeadowScene(opts = {}) {
   groundGrid = m.grid;
   groundFn = m.groundAt;
   sky.on = true; sky.sunDisc = true;
-  objects.push(...m.movers, ...m.poles);
+  // the player's stick figure (figure.js): first stands ahead of the start view, then wherever the walk mode leaves it
+  const eye = getCameraPosition(), t = camera.target, yaw = Math.atan2(t.z - eye.z, t.x - eye.x);
+  const figure = buildFigure({ height: player.height * m.grid.cube, groundAt: m.groundAt,
+    start: { x: eye.x + Math.cos(yaw) * 120, z: eye.z + Math.sin(yaw) * 120, yaw } });
+  // and a static copy of it to inspect, standing ahead of the start view, to the left, facing it
+  const sx = eye.x + Math.cos(yaw) * 220 + Math.sin(yaw) * 70, sz = eye.z + Math.sin(yaw) * 220 - Math.cos(yaw) * 70;
+  const statue = buildStaticFigure({ height: player.height * m.grid.cube, groundAt: m.groundAt, x: sx, z: sz, yaw: yaw + Math.PI });
+  objects.push(...figure, ...statue, ...m.movers, ...m.poles);
   tree = null;
   return m.groundAt;
 }
@@ -141,6 +150,7 @@ const MIN_PX = 0.35;   // a shape whose screen box is smaller than this is not d
 // at its nearest point is skipped whole.
 const VANISH_PX = 0.6, FULL_PX = 1.5;
 const growOf = (px) => { const u = Math.max(0, Math.min(1, (px - VANISH_PX) / (FULL_PX - VANISH_PX))); return u * u * (3 - 2 * u); };
+const TUBE_FADE = 0.3;   // tube light: the light's part across a stick under this eases toward half shade (setCrescents)
 const OCCLUDER_PX = 40;   // a shape bigger than this on screen is added to the global mask (cull.js)
 // A curved shape smaller than this on screen (its box's diagonal) is drawn simplified: a chain of capsules (curveChainSides), off
 // by under half a pixel, instead of its exact outline (curve.js, 0.1-0.4 ms each). A chain of 16 capsules at 160 px: still far
@@ -568,6 +578,94 @@ export function renderIllusion(ctx, canvas, opts = {}) {
   return drawIllusion2D(ctx, canvas, buildIllusionFrame(canvas, opts));
 }
 
+// SOLIDS' ORDER. Mean depths mis-order a long stick against a short one (an arm across the torso, a figure beside a pole) and sticks
+// meeting at a joint. For each pair of solids (straight capsules, balls: a = b) that overlap ON SCREEN, which is in front THERE:
+// where they touch in 3D (a joint, a T junction), the depths a little way into each from the contact (3 radii, or the contact
+// itself when it is in a stick's middle), a ball covering a joint at its center winning; apart in 3D, the depths at their closest
+// points on screen. Pairs come from a sweep over the screen boxes. Then a solid that must cover one drawn LATER is only DEFERRED
+// to right after it (never moved earlier, so never before the ground patch it stands on; other shapes keep their places);
+// a cycle is drawn in the list's order.
+function orderSolids(shapes, projectPoint, depthOf) {
+  const sub = (p, q) => ({ x: p.x - q.x, y: p.y - q.y, z: p.z - q.z }), dot = (p, q) => p.x * q.x + p.y * q.y + (p.z || 0) * (q.z || 0);
+  const lerp = (p, q, t) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t, z: p.z + (q.z - p.z) * t });
+  // closest points of segments P0 P1 and Q0 Q1 (2D or 3D): params s, t
+  const closest = (P0, P1, Q0, Q1) => {
+    const d1 = sub(P1, P0), d2 = sub(Q1, Q0), r = sub(P0, Q0);
+    const a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+    let s = 0, t = 0;
+    if (a <= 1e-12 && e <= 1e-12) return [0, 0];
+    if (a <= 1e-12) return [0, Math.max(0, Math.min(1, f / e))];
+    const c = dot(d1, r);
+    if (e <= 1e-12) return [Math.max(0, Math.min(1, -c / a)), 0];
+    const b = dot(d1, d2), den = a * e - b * b;
+    s = den > 1e-12 ? Math.max(0, Math.min(1, (b * f - c * e) / den)) : 0;
+    t = (b * s + f) / e;
+    if (t < 0) { t = 0; s = Math.max(0, Math.min(1, -c / a)); } else if (t > 1) { t = 1; s = Math.max(0, Math.min(1, (b - c) / a)); }
+    return [s, t];
+  };
+  const idx = [];
+  shapes.forEach((s, i) => { const o = s.o; if (!s.blade && !s.prebuilt && !s.nearCut && !o.kind && !o.bend && o.a && o.b && s.pieces && s.pieces.length && s.box && depthOf(o.a.c) > NEAR && depthOf(o.b.c) > NEAR) idx.push(i); });
+  const n = idx.length;
+  if (n < 2) return;
+  const M = idx.map((i) => { const s = shapes[i];
+    const o = s.o, A = o.a.c, B = o.b.c, len = Math.hypot(B.x - A.x, B.y - A.y, B.z - A.z), r = Math.max(o.a.r, o.b.r);
+    const qa = projectPoint(A), qb = projectPoint(B);
+    return { s, A, B, len, r, qa, qb, ball: len < 1e-6, z: (depthOf(A) + depthOf(B)) / 2 };
+  });
+  // the depth a little way into m from its contact at param u
+  const into = (m, u) => {
+    if (m.ball) return depthOf(m.A);
+    const k = Math.min(0.5, (3 * m.r) / m.len), uu = u < k ? k : u > 1 - k ? 1 - k : u;   // near an end: moved inward
+    return depthOf(lerp(m.A, m.B, uu));
+  };
+  // +1: a in front of b, -1: b in front, 0: no overlap on screen or no telling
+  const front = (a, b) => {
+    const [s2, t2] = closest(a.qa, a.qb, b.qa, b.qb);
+    const pa = { x: a.qa.x + (a.qb.x - a.qa.x) * s2, y: a.qa.y + (a.qb.y - a.qa.y) * s2 }, pb = { x: b.qa.x + (b.qb.x - b.qa.x) * t2, y: b.qa.y + (b.qb.y - b.qa.y) * t2 };
+    const ra = a.r * (a.qa.scale + (a.qb.scale - a.qa.scale) * s2), rb = b.r * (b.qa.scale + (b.qb.scale - b.qa.scale) * t2);
+    if (Math.hypot(pa.x - pb.x, pa.y - pb.y) >= ra + rb) return 0;
+    const [u, v] = closest(a.A, a.B, b.A, b.B), P = lerp(a.A, a.B, u), Q = lerp(b.A, b.B, v);
+    let za, zb;
+    if (Math.hypot(P.x - Q.x, P.y - Q.y, P.z - Q.z) < 0.5 * (a.r + b.r)) {   // touching in 3D
+      if (a.ball !== b.ball) return a.ball ? 1 : -1;
+      za = into(a, u); zb = into(b, v);
+    } else { za = depthOf(lerp(a.A, a.B, s2)); zb = depthOf(lerp(b.A, b.B, t2)); }
+    return Math.abs(za - zb) < 1e-9 ? 0 : za < zb ? 1 : -1;
+  };
+  // edges: before[k] = the solids k must be drawn after (behind it where they overlap), by a sweep over the boxes' x
+  const before = M.map(() => []), byX = M.map((_, k) => k).sort((p, q) => M[p].s.box.x0 - M[q].s.box.x0);
+  for (let a = 0; a < n; a++) {
+    const i = byX[a], bi = M[i].s.box;
+    for (let b = a + 1; b < n; b++) {
+      const j = byX[b], bj = M[j].s.box;
+      if (bj.x0 > bi.x1) break;
+      if (bj.y0 > bi.y1 || bj.y1 < bi.y0) continue;
+      const f = front(M[i], M[j]);
+      if (f > 0) before[i].push(j); else if (f < 0) before[j].push(i);
+    }
+  }
+  // deferral: walking the list, a solid waits until every solid behind it is out
+  const kOf = new Map(idx.map((i, k) => [shapes[i], k])), left = before.map((b) => b.length), waiters = M.map(() => []);
+  for (let k = 0; k < n; k++) for (const j of before[k]) waiters[j].push(k);
+  const out = [], done = new Array(n).fill(false), waiting = new Set();
+  const emit = (k) => {
+    done[k] = true; out.push(M[k].s);
+    const ready = [];
+    for (const w of waiters[k]) if (--left[w] === 0 && waiting.has(w)) ready.push(w);
+    ready.sort((p, q) => idx[p] - idx[q]);
+    for (const w of ready) { waiting.delete(w); emit(w); }
+  };
+  let moved = false;
+  for (const s of shapes) {
+    const k = kOf.get(s);
+    if (k === undefined) { out.push(s); continue; }
+    if (left[k] === 0) emit(k); else { waiting.add(k); moved = true; }
+  }
+  if (!moved) return;
+  for (const k of [...waiting].sort((p, q) => idx[p] - idx[q])) if (!done[k]) { waiting.delete(k); emit(k); }   // cycles
+  shapes.length = 0; shapes.push(...out);
+}
+
 // THE FRAME: everything but the drawing, the same for every backend (Canvas 2D here, the GPU backends in src/gpu/): the shapes in
 // draw order (back to front, each with its `pieces`), the movers' shadows (each drawn right after shape `last`), the sky's terms
 // and the stats. Canvas size only matters through `fit` / `view`.
@@ -756,11 +854,12 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     const q = s.proj[i];
     return Math.abs(p.x - q.x) <= tol && Math.abs(p.y - q.y) <= tol && Math.abs(p.scale - q.scale) * s.rMax <= tol;
   });
-  // Stylized light (light.js), for objects with `shade: { r, bright? }`: the shade crescent is the shape minus itself moved toward
-  // the sun on screen by r (1 - cos th) (th: between the sun and the view ray; r in world units at the object's center), so a front
-  // lit object has a thin crescent, a side lit one half, a backlit one nearly all; the bright crescent, toward the sun, is
-  // 0.3 r times how much the sun is across the view (none when it is straight behind the eye or the object).
+  // Stylized light (light.js), for objects with `shade: { r }`: TWO TONES, lit (the fill) or unlit (the shade crescent, the shape
+  // minus itself moved toward the sun on screen by r (1 - cos th); th: between the sun and the view ray, r in world units at the
+  // object's center), so a front lit object has a thin crescent, a side lit one half, a backlit one nearly all. No third tone (a
+  // bright crescent toward the sun was dropped).
   const setCrescents = (o, pieces) => {
+    o.shadeShift = null;   // this frame's crescent shift (screen), for the linked shade
     if (!light.on || !o.shade) { for (const p of pieces) p.crescents = null; return; }
     const pts = boundPoints(o), c = { x: 0, y: 0, z: 0 };
     for (const p of pts) { c.x += p.x / pts.length; c.y += p.y / pts.length; c.z += p.z / pts.length; }
@@ -771,18 +870,39 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
       return;
     }
     if (depthOf(c) <= NEAR + 1) { for (const p of pieces) p.crescents = null; return; }   // its middle behind the eye (near clip)
-    const L = light.dir, R = o.shade.r, q0 = projectPoint(c);
+    const R = o.shade.r, q0 = projectPoint(c);
+    let L = light.dir, k = 1;
+    // TUBE light (`shade.tube`: the stick figure's limbs): a cylinder's shade line runs along its axis u wherever the light comes
+    // from, so it is lit by the light's part across the axis (L - (L . u) u) and seen by the view's part across it: the crescent
+    // is shifted ACROSS the stick on screen, never along it (a shift along a stick shaded nothing on it and its end cap a square
+    // patch at a bent joint). Light nearly along the axis (its cross part under TUBE_FADE) eases toward half shade, so the side
+    // doesn't jump as the cross part turns around.
+    const tube = o.shade.tube && o.a && o.b ? { x: o.b.c.x - o.a.c.x, y: o.b.c.y - o.a.c.y, z: o.b.c.z - o.a.c.z } : null;
+    let ux = 0, uy = 0, ul = 0;
+    if (tube) {
+      ul = Math.hypot(tube.x, tube.y, tube.z);
+      if (ul > 1e-9) {
+        const u = { x: tube.x / ul, y: tube.y / ul, z: tube.z / ul }, d = L.x * u.x + L.y * u.y + L.z * u.z;
+        const P = { x: L.x - d * u.x, y: L.y - d * u.y, z: L.z - d * u.z }, pl = Math.hypot(P.x, P.y, P.z);
+        if (pl > 1e-9) { L = { x: P.x / pl, y: P.y / pl, z: P.z / pl }; k = Math.min(1, pl / TUBE_FADE); }
+        else k = 0;
+        const qa = projectPoint(o.a.c), qb = projectPoint(o.b.c);
+        ux = qb.x - qa.x; uy = qb.y - qa.y; ul = Math.hypot(ux, uy);
+        if (ul > 1e-9) { ux /= ul; uy /= ul; }
+        tube.u = u;
+      }
+    }
     const q1 = projectPoint({ x: c.x + L.x * R, y: c.y + L.y * R, z: c.z + L.z * R });
     let dx = q1.x - q0.x, dy = q1.y - q0.y;
+    if (tube && ul > 1e-9) { const a = dx * ux + dy * uy; dx -= a * ux; dy -= a * uy; }   // across the stick on screen only
     const dl = Math.hypot(dx, dy) || 1, px = R * q0.scale;
     dx /= dl; dy /= dl;
-    const vx = c.x - camPos.x, vy = c.y - camPos.y, vz = c.z - camPos.z, vl = Math.hypot(vx, vy, vz) || 1;
-    const cos = -(L.x * vx + L.y * vy + L.z * vz) / vl, sh = px * (1 - cos);
-    const br = o.shade.bright === false ? 0 : 0.3 * px * Math.min(1, dl / (px || 1));
-    for (const p of pieces) {
-      p.crescents = [{ dx: dx * sh, dy: dy * sh, color: shadeTone(p.base ?? p.fill) }];
-      if (br > 0.05) p.crescents.push({ dx: -dx * br, dy: -dy * br, color: brightOf(p.base ?? p.fill) });
-    }
+    let vx = c.x - camPos.x, vy = c.y - camPos.y, vz = c.z - camPos.z;
+    if (tube && tube.u) { const u = tube.u, d = vx * u.x + vy * u.y + vz * u.z; vx -= d * u.x; vy -= d * u.y; vz -= d * u.z; }
+    const vl = Math.hypot(vx, vy, vz) || 1;
+    const cos = -(L.x * vx + L.y * vy + L.z * vz) / vl * k, sh = px * (1 - cos);
+    for (const p of pieces) p.crescents = [{ dx: dx * sh, dy: dy * sh, color: shadeTone(p.base ?? p.fill) }];
+    o.shadeShift = { x: dx * sh, y: dy * sh, px, frame: frameNo };   // px: its radius on screen (the shift is 0 .. 2 px)
   };
   // Pieces: the shapes an object is drawn as, farthest first (one, except a sheet's faces). `keep`: kept for later frames, so
   // its path is recorded once (shape.js).
@@ -916,6 +1036,42 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     setCrescents(o, pieces);
     s.pieces = pieces;
   }
+  // LINKED SHADE (`o.links`: the parts a solid is joined to, figure.js): each part keeps its own fill and place in the order, but
+  // its crescent also takes out its linked parts moved by THEIR shifts (`also`, shape.js / plan.js), i.e. it is the crescent of
+  // the joined shape where it lies in this part: where both bands are on the same side of the joint they run on round it as one,
+  // where they are on opposite sides the neighbor's moved outline cuts the band off.
+  // TWO SIDES OF ONE COIN: taking out the neighbors can only shrink the crescent, so the crescent is always the part's MINORITY
+  // tone. Mostly lit (shift under its radius): a lit fill and a SHADE crescent, moved toward the sun by the shift; mostly in shade:
+  // a shade fill and a LIT crescent, moved away from the sun by the rest (2 px - the shift; a stick's lit and shade bands split
+  // its width). Its neighbors are taken out in the same mode, so a stray cut only ever adds the tone the part mostly has.
+  {
+    const shapeOf = new Map();
+    for (const s of shapes) if (s.o.links && s.pieces && s.pieces.length) shapeOf.set(s.o, s);
+    const live = (o) => o.shadeShift && o.shadeShift.frame === frameNo;
+    const shiftOf = (o, lit) => {   // o's moved shape's shift in the mode `lit`, or null
+      const S = o.shadeShift, L = Math.hypot(S.x, S.y);
+      if (!lit) return { x: S.x, y: S.y };
+      if (L < 1e-9) return null;
+      const k = -(2 * S.px - L) / L;
+      return { x: S.x * k, y: S.y * k };
+    };
+    for (const [o, s] of shapeOf) {
+      if (!live(o)) continue;
+      const S = o.shadeShift, lit = Math.hypot(S.x, S.y) > S.px, d = shiftOf(o, lit);
+      const also = [];
+      for (const n of o.links) {
+        const t = shapeOf.get(n), m = t && live(n) ? shiftOf(n, lit) : null;
+        if (m) for (const q of t.pieces) also.push({ p: q, dx: m.x, dy: m.y });
+      }
+      for (const p of s.pieces) if (p.crescents) {
+        const c = p.crescents[0], litTone = litOf(p.base ?? o.fill);
+        p.fill = lit ? c.color : litTone;   // (set every frame: a static part's pieces are kept)
+        p.crescents = d ? [{ dx: d.x, dy: d.y, color: lit ? litTone : c.color, also: also.length ? also : undefined }] : null;
+      }
+    }
+  }
+  // SOLIDS (straight capsules and balls: movers, poles, the figures' parts) re-ordered where they overlap on screen (orderSolids).
+  orderSolids(shapes, projectPoint, depthOf);
   if (silhouette.on && silhouette.spikes && grass.on) {   // (its only output is the spikes: none without grass)
     const ts = performance.now();
     let pix = null;
@@ -944,6 +1100,9 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
   // per-pixel ground shade: the movers cast their shadows in the ground's own shader (capsules), no overlays
   const casters = [];
   if (pixelGround && light.on && light.dir.y > 0.02) for (const o of tree.movers) if (!o.kind && o.shade) casters.push({ a: o.a.c, b: o.b.c, r: Math.max(o.a.r, o.b.r) });
+  // the shaders take the first 16: the nearest ones (the player's figure is 11 of them)
+  const cd = (c) => (c.a.x + c.b.x - 2 * camPos.x) ** 2 + (c.a.y + c.b.y - 2 * camPos.y) ** 2 + (c.a.z + c.b.z - 2 * camPos.z) ** 2;
+  if (casters.length > 16) casters.sort((p, q) => cd(p) - cd(q));
   if (light.on && terrain && terrain.H && !pixelGround) {
     // the drawn ground patches' boxes, once (not one scan of every shape per mover)
     let gi = null, gb = null, gn = 0;

@@ -8,7 +8,7 @@ import { shells } from './shells/shell.js';
 import { grass, silhouette, groundShade, meadowSun, editGround, groundEdits, buildMeadowScene, buildPatchScene, buildPairsScene, buildSheetsScene, buildWorldScene, renderIllusion, buildIllusionFrame, drawIllusionOverlay, walkGround } from './illusion/illusionRender.js';
 import { bestBackend } from './gpu/backend.js';
 import { wind } from './illusion/wind.js';
-import { enableFly, updateFly, flyStatus, fly } from './core/flyCamera.js';
+import { enableFly, updateFly, flyStatus, fly, walk } from './core/flyCamera.js';
 import { light, setSun } from './illusion/light.js';
 
 const canvas = document.getElementById('game');
@@ -143,7 +143,7 @@ let darkMode = false;
 // The illusion scene flies (flyCamera.js) instead of orbiting.
 if (illusionScene) enableFly(canvas, () => { pendingDraw = true; });
 if (worldScene) fly.speed = 600;
-if (meadowScene) fly.ground = walkGround;   // Enter: walk on it
+if (meadowScene) { fly.ground = walkGround; walk.on = true; }   // starts walking, in third person (Enter: fly)
 let pendingDraw = true;
 
 let worldTime = 0, lastStats = null;

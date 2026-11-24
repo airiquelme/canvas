@@ -69,17 +69,19 @@ export function drawShape(ctx, shape, { lineWidth = 3, stroke = true } = {}) {
 }
 
 // CRESCENTS (stylized light, opt-in: illusionRender.js sets shape.crescents = [{ dx, dy, color }]): the shape minus the same shape
-// moved by (dx, dy), filled in `color`. Moved toward the light, what is left is a shade crescent on the far side; away from it, a
-// bright one on the near side. Its width at each point of the outline is the shift times how much the outline faces away, so it
+// moved by (dx, dy), filled in `color`. Moved toward the light, what is left is a shade crescent on the far side (the only
+// crescent drawn: objects are lit or unlit, two tones). Its width at each point of the outline is the shift times how much the outline faces away, so it
 // tapers to nothing at its tips with no geometry computed. Drawn inside a clip of the shape and of the complement of each moved
 // loop (a big rectangle plus the loop, even-odd: one clip per loop, so a shape that is a union of loops works).
-function crescent(ctx, shape, path, { dx, dy, color }) {
+// `also`: more shapes taken out with the moved one ([{ p: a shape, dx, dy }]: a joined neighbor moved by its own shift), so the
+// crescent is that of their union where it lies in this shape.
+function crescent(ctx, shape, path, { dx, dy, color, also }) {
   if (Math.hypot(dx, dy) < 0.05) return;
   ctx.save();
   ctx.clip(path);
   let loop = null;
   const flush = () => { if (loop) { ctx.clip(loop, 'evenodd'); loop = null; } };
-  shape.sides.forEach((s, i) => {
+  const out = (sides, dx, dy) => sides.forEach((s, i) => {
     if (i === 0 || s.move) {
       flush();
       loop = new Path2D();
@@ -90,7 +92,9 @@ function crescent(ctx, shape, path, { dx, dy, color }) {
     if (s.kind === 'line') loop.lineTo(s.to.x + dx, s.to.y + dy);
     else loop.ellipse(s.e.x + dx, s.e.y + dy, s.e.a, s.e.b, s.e.angle, s.t0, s.t1, s.t1 < s.t0);
   });
+  out(shape.sides, dx, dy);
   flush();
+  if (also) for (const a of also) { out(a.p.sides, a.dx, a.dy); flush(); }
   ctx.fillStyle = color;
   ctx.fill(path);
   ctx.restore();

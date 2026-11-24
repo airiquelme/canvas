@@ -219,7 +219,12 @@ export function createFramePlanner() {
       E.T = triOf(E.p);
       E.box = boxOf(E.T, E.p.M);
       if (E.kind === 0) place(fillOcc, fillGroups, E.box, k, E.p.alpha !== undefined && E.p.alpha < 1);
-      else place(cresOcc, cresGroups, unionBox(E.box, shiftBox(E.box, E.c.dx, E.c.dy)), k);
+      else {
+        // a crescent's moved shape: the piece moved by dx, dy, plus its `also` shapes (a joined neighbor, each moved by its own shift)
+        E.mbox = shiftBox(E.box, E.c.dx, E.c.dy);
+        if (E.c.also) for (const a of E.c.also) { a.T = triOf(a.p); E.mbox = unionBox(E.mbox, shiftBox(boxOf(a.T, a.p.M), a.dx, a.dy)); }
+        place(cresOcc, cresGroups, unionBox(E.box, E.mbox), k);
+      }
     }
     sSink.clear(); cSink.clear();
     const range = (sink, f) => { const a = sink.n; f(); return [a, sink.n]; };
@@ -232,8 +237,8 @@ export function createFramePlanner() {
     const crescents = cresGroups.map((list) => {
       const G = {};
       G.shapes = range(sSink, () => { for (const k of list) pushTris(entries[k].T.tris, entries[k].p.M); });
-      G.moved = range(sSink, () => { for (const k of list) { const E = entries[k]; pushTris(E.T.tris, E.p.M, E.c.dx, E.c.dy); } });
-      G.movedBoxes = range(cSink, () => { for (const k of list) { const E = entries[k]; pushBox(unionBox(E.box, shiftBox(E.box, E.c.dx, E.c.dy)), 0, BLACK); } });
+      G.moved = range(sSink, () => { for (const k of list) { const E = entries[k]; pushTris(E.T.tris, E.p.M, E.c.dx, E.c.dy); if (E.c.also) for (const a of E.c.also) pushTris(a.T.tris, a.p.M, a.dx, a.dy); } });
+      G.movedBoxes = range(cSink, () => { for (const k of list) { const E = entries[k]; pushBox(unionBox(E.box, E.mbox), 0, BLACK); } });
       G.boxes = range(cSink, () => { for (const k of list) pushBox(entries[k].box, zOf(k), rgbOf(entries[k].c.color)); });
       return G;
     });

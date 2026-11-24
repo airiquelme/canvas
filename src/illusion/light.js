@@ -1,5 +1,5 @@
 // The illusion renderer's light: one sun (a direction), stylized. Nothing here is per-pixel 3D shading: shapes that opt in get a
-// shade crescent on their far side and a bright crescent toward the sun (illusionRender.js, shape.js), and the ground gets the
+// shade crescent on their far side, the rest lit (two tones; illusionRender.js, shape.js), and the ground gets the
 // shadow field's regions (shadow.js), computed in world space so they look the same from every angle.
 //
 // light.dir: unit vector TOWARD the sun (y up), from azimuth (around y, from +x toward +z) and elevation (above the horizon).
@@ -14,7 +14,6 @@ export function setSun(azimuth = light.azimuth, elevation = light.elevation) {
   const { tint, bright } = sunTone(elevation);
   light.tint = tint;                       // the sun's hue (0-1 per channel): lit AND shade tones are multiplied by it
   light.bright = bright;                   // the lit tone's brightness
-  light.sun = tint.map((v) => v * 255);    // the bright crescents mix toward it
   { const u = Math.max(0, Math.min(1, elevation / FADE_ELEV)); light.litFade = 1 - u * u * (3 - 2 * u); }
   light.version++;
 }
@@ -59,10 +58,9 @@ function sunTone(elevation) {
 }
 
 // Tones: the shade mixes toward a dusky blue, then everything is times the sun's tint (cached per sun).
-const SHADE = [26, 35, 64], BRIGHT_K = 0.28;
+const SHADE = [26, 35, 64];
 const rgb = (hex) => { const n = parseInt(hex.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
 const toHex = (c) => { const r = c.map((v) => Math.max(0, Math.min(255, Math.round(v)))); return '#' + ((1 << 24) | (r[0] << 16) | (r[1] << 8) | r[2]).toString(16).slice(1); };
-function mix(hex, to, k) { return toHex(rgb(hex).map((v, i) => v + (to[i] - v) * k)); }
 // Per channel, shade = A c + B and lit = Lf c + w B (A = tint (1 - k), B = tint k SHADE, Lf = tint (b (1 - w) + (1 - k) w),
 // w = litFade): both linear in the color c.
 const shadeRgb = (c) => c.map((v, i) => light.tint[i] * (v * (1 - light.shadeK) + SHADE[i] * light.shadeK));
@@ -96,16 +94,4 @@ export function shadeOverlay() {
     { op: 'lighter', color: toHex(SHADE.map((v, i) => light.tint[i] * k * v * (1 - w * m))) },
   ];
 }
-const cache = new Map();
-// The bright side: the lit tone mixed toward the sun's color.
-export function brightOf(hex) {
-  const key = hex + (light.on ? light.version : 'off');
-  let v = cache.get(key);
-  if (!v) {
-    if (cache.size > 4096) cache.clear();
-    cache.set(key, (v = mix(litOf(hex), light.on ? light.sun : [255, 255, 255], BRIGHT_K * (light.on ? 1 - light.litFade : 1))));
-  }
-  return v;
-}
-
 setSun();
