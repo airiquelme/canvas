@@ -11,7 +11,9 @@
 // look at from any side).
 import { walk } from '../core/flyCamera.js';
 import { ovoidSides, hullOfEllipsoids, eggSides } from './egg.js';
-import { filletSides } from './blend.js';
+import { filletSides, loopSamples, insideConvex } from './blend.js';
+import { outlineRuns } from './marks.js';
+import { LINE_PX } from '../config.js';
 
 export const SKIN = '#eac4a5';
 const STICK = 0.018;   // the joints' balls' radius at the elbows, shoulders and ankles, in body heights (the head's top at 1)
@@ -55,13 +57,17 @@ const HAND_A1 = THUMB_K.along / Math.sqrt(1 - (WRIST_R / HAND_BW) ** 2);
 //   - a YOKE over the chest (the HULL of the shoulders' balls and the neck's base: the trapezius sloping from the neck to the
 //     shoulders; the image of a 3D convex hull is the hull of the images). Its shoulder balls are the upper arms' own (STICK at
 //     the shoulder joints): the yoke meets each arm exactly at its joint, nothing past it;
-//   - the LATS (latissimus dorsi, the upper torso's sides): per side, the HULL of the shoulder joint's ball and a small ball on
-//     the lower ribcage's side, at its back (LAT): the V from the armpit down to the waist; filleted to the ribcage and abdomen;
-//   - the PECS (pectoralis major): per side, the HULL of the shoulder joint's ball and a flat ellipsoid on the ribcage's front
-//     (PEC): the line from the armpit to the chest; its lower edge meets the ribcage at a crease (no fillet), as the muscle's;
-//   - FEMALE (`form.female`): a modest BREAST on each pec (BREAST: centered near the nipple's level, 0.715, about 0.1 apart,
-//     turned out by `out`; its lower half hanging a little), in a HULL with a flat ANCHOR above it on the chest: the upper slope
-//     runs smoothly from the chest into it, the fold under it stays a crease.
+//   - the ARMPIT SEGMENT per side (latissimus dorsi): the HULL of the shoulder joint's ball, a small ball on the lower ribcage's
+//     side at its back (LAT) and the pectoral plate (times CHEST[form].inner): from the front the V from the armpit down to the
+//     waist; filleted to the ribcage and abdomen (no pad, no crease);
+//   - the CHEST MOUND per side, ONE object for every form (CHEST[form]: the male's and the female's are the same parts with other
+//     numbers): the HULL of the mound's ellipsoid (male: the pectoral plate itself, thin and tall: a nearly flat chest whose lower
+//     edge curves in to the abdomen; female: a modest round breast, centered near the nipple's level, 0.715, about 0.1 apart,
+//     turned out, its lower half hanging a little), the pectoral plate and a thin COLLAR anchor at the neck's base (no
+//     collarbone ledge: the upper slope runs nearly flat from the neck); filleted to the armpit segment and the ribcage by `fold`
+//     below its middle (male long: no crease; female none: the breast's underside meets the chest at an angle, a crease) and `slope` / `join`
+//     above it. (The pectoral plate inside the mound, not only in the armpit segment: with it outside, views 45-70 degrees off
+//     the front showed its bump above the breast's, two per side.)
 //   THE RULE: every part is CONVEX; every concave curve is a FILLET where two parts' outlines cross (blend.js: an ellipse arc tangent
 //   to both, WAIST_FILLET long on each, on screen), so it stays one smooth line whatever the (smooth) bend or the parts' sizes. The
 //   waist's sides are the chest's, abdomen's and pelvis's fillets; the LUMBAR ARCH (lordosis, about 0.011 deep) is the fillet where
@@ -100,9 +106,44 @@ const ABDOMEN = { at: 0.1, fwd: 0.009, A1: 0.065, A2: 0.065, Bw: 0.064, Bn: 0.04
 const WAIST_FILLET = 0.035, NECK_BASE_R = 0.035;
 // (`at`: height along the spine from the hip joints' middle; `fwd` / `side` from the spine there; half-axes along f, u, s)
 const LAT = { at: 0.115, side: 0.062, fwd: -0.008, r: 0.014 }, LAT_SHOULDER_R = 0.014;
-const PEC = { at: 0.22, side: 0.045, fwd: 0.055, ax: [0.016, 0.035, 0.045] };
-const BREAST = { at: 0.185, side: 0.05, fwd: 0.06, ax: [0.019, 0.037, 0.041], out: 0.3, sag: 0.25,
-  anchor: { at: 0.22, side: 0.048, fwd: 0.056, ax: [0.01, 0.025, 0.04] } };
+// THE CHEST (one object for every form, its parameters per form: CHEST.male, CHEST.female; character creation can blend them):
+//   pec: the pectoral plate on the ribcage (also kept, times `inner`, inside the armpit segment: the hollow under the shoulder);
+//   mound: the ellipsoid over it (the male's: the plate itself; the female's: the breast, set forward of the ribcage and shallow
+//     so its underside comes back to the chest at an angle, and low: hanging), its frame turned out (about U) by `out` and tipped
+//     down by `sag` (nose down: more of it pulls the underside back toward the chest, smoother); in a HULL with `collar` (a thin anchor at the neck's base: the slope from the neck) and the pec;
+//   fold: its fillets (body heights) below its middle, to the armpit segment and the ribcage (a long fold: no crease); above it
+//     `join` to the armpit segment and `slope` to the ribcage (a long one climbs onto the neck: a bump there seen 70 degrees off);
+//   under: its lower edge's mark (UNDER_LINE below: `through`, `sink`; `contour`: under the mound the line is its lower outline on
+//     screen, not the crease on the skin: body.outlineMarks).
+const CHEST = {
+  male: { pec: { at: 0.225, side: 0.045, fwd: 0.054, ax: [0.01, 0.05, 0.045] }, inner: 0.95,
+    mound: { at: 0.225, side: 0.045, fwd: 0.054, ax: [0.01, 0.05, 0.045], out: 0, sag: 0 },
+    collar: { at: 0.29, side: 0.025, fwd: 0.035, ax: [0.008, 0.008, 0.02] }, fold: 0.035, slope: 0.014, join: 0.014,
+    under: { through: [0.6, -0.85], sink: 0.93 } },
+  female: { pec: { at: 0.24, side: 0.045, fwd: 0.054, ax: [0.01, 0.035, 0.045] }, inner: 0.85,
+    mound: { at: 0.175, side: 0.05, fwd: 0.066, ax: [0.017, 0.037, 0.041], out: 0.3, sag: 0.25 },
+    collar: { at: 0.29, side: 0.025, fwd: 0.035, ax: [0.008, 0.008, 0.02] }, fold: 0, slope: 0.014, join: 0.035,
+    under: { through: [0.2, -0.9], sink: 0.93, contour: true } } };
+// the COLLARBONES (a MARK, marks.js: a green line on the skin): control points from the throat out to one shoulder, { side, up, fwd }
+// from the neck's base in the spine's top frame, mirrored to the other side: the notch between the clavicles' heads (the line's
+// dip in the middle), the heads (a little higher), then the bone out to the shoulder's top, curving back as it goes; out: how far
+// each point's normal leans sideways (0 at the throat: facing forward and up)
+const CLAVICLE = [
+  { side: 0, up: -0.017, fwd: 0.032, out: 0 },
+  { side: 0.012, up: -0.009, fwd: 0.034, out: 0.1 },
+  { side: 0.024, up: -0.005, fwd: 0.034, out: 0.2 },
+  { side: 0.045, up: -0.006, fwd: 0.031, out: 0.3 },
+  { side: 0.07, up: -0.005, fwd: 0.024, out: 0.45 },
+  { side: 0.095, up: -0.002, fwd: 0.014, out: 0.6 },
+  { side: 0.113, up: 0.002, fwd: 0.004, out: 0.8 }];
+// the chest's LOWER EDGES (marks): ONE PLANE across the body (it holds the side to side direction, so seen from the side it is
+// edge-on: each line shows as one straight stroke) through the armpit (ARMPIT: { up, fwd, side } from the shoulder joint, its
+// normal { fwd, out, up }) and the bottom of the pec's ellipsoid (the female: the breast's) at `through` ([forward, up] in its
+// half-axes). Per side the line is that plane's cut through the ellipsoid (an exact ellipse; `sink`: drawn a little inside it,
+// toward the cut's middle) from where the straight run from the armpit meets it flush (the tangent from the armpit's point, on the
+// outer side) round under it to where it goes into the ribcage (toward the sternum); the run from the armpit is `steps` points.
+// (`through` and `sink` per form: CHEST[form].under)
+const ARMPIT = { up: -0.016, fwd: 0.004, side: -0.006, normal: { fwd: 0.7, out: 0.7, up: -0.2 }, steps: 3 };
 const HEAD_OV = { up: 0.01, back: 0.005, A1: 0.075, A2: 0.058, Bw: 0.0435, Bn: 0.055 };
 const NECK_EGG = { at: 0.04, B: 0.028 }, NECK_R = 0.024;
 const GLUTE = { back: 0.025, down: 0.035, in: 0.008, depth: 0.036, height: 0.048, width: 0.042, tilt: -0.3, toPelvis: 0.04, toThigh: 0.035, foldOpen: 1.2 };
@@ -132,16 +173,26 @@ function makeFigure(h, extra, form = {}) {
   const ovoidOut = (H) => (pr, g) => ovoidSides(H.M, H.a, H.w, H.n, H.A1 * g, H.A2 * g, H.Bw * g, H.Bn * g, pr, H.ball && { c: H.ball.c, r: H.ball.r * g });
   // the torso: chest and pelvis (filleted where they meet: the waist), the yoke; its capsule from the pelvis's middle to the chest's
   const chestOv = ovoid(CHEST_OV, null), abdomenOv = ovoid(ABDOMEN, null), pelvisOv = ovoid(PELVIS_OV, null), yoke = [];
-  const upper = { lats: [], pecs: [], breasts: [] };   // per side: the bodies of each hull (set by pose)
-  const latJ = [v0(), v0()], pecJ = [v0(), v0()], breastJ = [v0(), v0()];
+  const CH = form.female ? CHEST.female : CHEST.male;   // the chest's parameters for this form
+  const upper = { sides: [], mounds: [], above: [v0(), v0()], facing: [v0(), v0()], seen: null };   // per side: the bodies of each hull (set by pose)
+  const latJ = [v0(), v0()], pecJ = [v0(), v0()], moundJ = [v0(), v0()];
   const torso = own(0.04 * h, 0.04 * h, 0.17 * h, (pr, g) => {
     const chest = ovoidOut(chestOv)(pr, g), abdomen = ovoidOut(abdomenOv)(pr, g), pelvis = ovoidOut(pelvisOv)(pr, g);
     const d = WAIST_FILLET * h * g * pr.projectPoint(torso.a.c).scale;
     const hull = (bodies) => hullOfEllipsoids(pr, bodies.map((b) => grownBody(b, g)));
-    const lats = upper.lats.map(hull), pecs = upper.pecs.map(hull), breasts = upper.breasts.map(hull);
-    return loops(chest, abdomen, pelvis, hull(yoke), ...lats, ...pecs, ...breasts,
+    const sides = upper.sides.map(hull), mounds = upper.mounds.map(hull), px = h * g * pr.projectPoint(torso.a.c).scale, df = CH.fold * px, du = CH.slope * px;
+    const yk = hull(yoke);
+    if (g === 1) upper.seen = { pr, chest, abdomen, sides, mounds };   // (for the mounds' outline marks: body.outlineMarks)
+    return loops(chest, abdomen, pelvis, yk, ...sides, ...mounds,
       filletSides(chest, abdomen, d), filletSides(abdomen, pelvis, d), filletSides(chest, pelvis, d),
-      ...lats.flatMap((l) => [filletSides(l, chest, d), filletSides(l, abdomen, d)]));
+      ...sides.flatMap((l) => [filletSides(l, chest, d), filletSides(l, abdomen, d)]),
+      ...mounds.flatMap((b, i) => {
+        // under the mound (below its middle on screen, along the spine) the fold (CH.fold), above it the slope into the collar
+        // (CH.slope; longer ones walk up onto the shoulder and bulge there)
+        const c = pr.projectPoint(moundJ[i]), u = pr.projectPoint(upper.above[i]);
+        const ux = u.x - c.x, uy = u.y - c.y, above = (X) => (X.x - c.x) * ux + (X.y - c.y) * uy > 0, dX = (X) => (above(X) ? du : df), dS = (X) => (above(X) ? CH.join * px : df);
+        return [filletSides(b, sides[i], dS), filletSides(b, chest, dX)];
+      }));
   });
   const headOv = ovoid(HEAD_OV, null);
   const head = own(0.038 * h, 0.038 * h, 0.08 * h, ovoidOut(headOv));
@@ -214,23 +265,23 @@ function makeFigure(h, extra, form = {}) {
     // the lats, pecs (and breasts) per side: positions in the spine's frame at their height
     const onSpine = (q, sg) => { const f = spineAt(q.at / SPINE); return { f, C: add(add(f.P, f.F, q.fwd), f.S, sg * q.side) }; };
     const ell = (C, fr, [a, b, c]) => ({ C, axes: [[fr.F, a * h], [fr.U, b * h], [fr.S, c * h]] });
-    upper.lats = []; upper.pecs = []; upper.breasts = [];
+    upper.sides = []; upper.mounds = []; const underE = [null, null];
     [1, -1].forEach((sg, i) => {
-      const lat = onSpine(LAT, sg), pec = onSpine(PEC, sg);
-      upper.lats.push([ball(shoulderJ[i], LAT_SHOULDER_R), ell(lat.C, lat.f, [LAT.r, LAT.r, LAT.r])]);
-      upper.pecs.push([ball(shoulderJ[i], LAT_SHOULDER_R), ell(pec.C, pec.f, PEC.ax)]);
+      const lat = onSpine(LAT, sg), pec = onSpine(CH.pec, sg);
+      const pecE = ell(pec.C, pec.f, CH.pec.ax);
+      upper.sides.push([ball(shoulderJ[i], LAT_SHOULDER_R), ell(lat.C, lat.f, [LAT.r, LAT.r, LAT.r]), ell(pec.C, pec.f, CH.pec.ax.map((x) => x * CH.inner))]);
       Object.assign(latJ[i], lat.C); Object.assign(pecJ[i], pec.C);
-      if (!form.female) return;
-      // the breast: its frame turned out (about U) by `out` and its lower half down (about the turned S) by `sag`
-      const br = onSpine(BREAST, sg), an = onSpine(BREAST.anchor, sg), fr = br.f;
-      const co = Math.cos(BREAST.out), so = Math.sin(BREAST.out) * sg;
+      // the mound: its frame turned out (about U) by `out` and its lower half down (about the turned S) by `sag`
+      const MD = CH.mound, br = onSpine(MD, sg), an = onSpine(CH.collar, sg), fr = br.f;
+      const co = Math.cos(MD.out), so = Math.sin(MD.out) * sg;
       const Fo = { x: fr.F.x * co + fr.S.x * so, y: fr.F.y * co + fr.S.y * so, z: fr.F.z * co + fr.S.z * so };
       const So = { x: fr.S.x * co - fr.F.x * so, y: fr.S.y * co - fr.F.y * so, z: fr.S.z * co - fr.F.z * so };
-      const cs = Math.cos(BREAST.sag), ss = Math.sin(BREAST.sag);
+      const cs = Math.cos(MD.sag), ss = Math.sin(MD.sag);
       const Fd = { x: Fo.x * cs - fr.U.x * ss, y: Fo.y * cs - fr.U.y * ss, z: Fo.z * cs - fr.U.z * ss };   // (points a little down)
       const Ud = { x: fr.U.x * cs + Fo.x * ss, y: fr.U.y * cs + Fo.y * ss, z: fr.U.z * cs + Fo.z * ss };
-      upper.breasts.push([{ C: br.C, axes: [[Fd, BREAST.ax[0] * h], [Ud, BREAST.ax[1] * h], [So, BREAST.ax[2] * h]] }, ell(an.C, an.f, BREAST.anchor.ax)]);
-      Object.assign(breastJ[i], br.C);
+      underE[i] = { C: br.C, axes: [[Fd, MD.ax[0] * h], [Ud, MD.ax[1] * h], [So, MD.ax[2] * h]] };
+      upper.mounds.push([underE[i], ell(an.C, an.f, CH.collar.ax), pecE]);
+      Object.assign(moundJ[i], br.C); Object.assign(upper.facing[i], Fo); Object.assign(upper.above[i], add(br.C, fr.U, 0.05 * h));   // (up the body from it)
     });
     torso.a.c = { ...pelvisOv.M }; torso.b.c = { ...chestOv.M };
     const waistJ = spineAt(0.32).P, chestJ = ch.P;
@@ -303,19 +354,88 @@ function makeFigure(h, extra, form = {}) {
     const J = { head: headC, neck: base, chest: chestJ, waist: waistJ, pelvis: hipMid };
     ['L', 'R'].forEach((k, i) => {
       J['shoulder' + k] = shoulderJ[i]; J['lat' + k] = latJ[i]; J['pec' + k] = pecJ[i];
-      if (form.female) J['breast' + k] = breastJ[i]; J['elbow' + k] = arms[i][0].b.c; J['wrist' + k] = arms[i][1].b.c;
+      J['mound' + k] = moundJ[i]; J['elbow' + k] = arms[i][0].b.c; J['wrist' + k] = arms[i][1].b.c;
       J['knuckles' + k] = knuckles[i]; J['fingertip' + k] = tips[i]; J['thumbKnuckle' + k] = thumbs[i];
       J['hip' + k] = hipJ[i]; J['glute' + k] = gluteJ[i]; J['knee' + k] = legs[i][0].b.c; J['ankle' + k] = legs[i][1].b.c;
       J['heel' + k] = heelJ[i]; J['ball' + k] = ballJ[i]; J['ballOut' + k] = ballOutJ[i]; J['toe' + k] = toeJ[i];
     });
     body.joints = J;
+    // the mounds' OUTLINE MARKS (CH.under.contour): per side, the lower half of the mound's outline on screen, wherever it lies:
+    // over the rest of the body (the edge under a hanging breast, its crease on the skin hidden behind it) and on the body's own
+    // silhouette (seen from the side). Drawn just inside the outline (the band's outer edge on it), so it never leaves the body.
+    // Not drawn when the mound turns away from the eye (from behind, or the far one from the side), nor where the nearer mound
+    // covers the farther one. Uses the torso's outline as last built for this projector (upper.seen).
+    body.outlineMarks = !CH.under.contour ? null : (pr, eye) => {
+      const S = upper.seen;
+      if (!S || S.pr !== pr) return [];
+      // (the mounds' samples from their fillets, blend.js: built already this frame; convex: a span table per loop)
+      const runs = [], inset = LINE_PX / 2 + 0.25, M = S.mounds.map((L) => (L.length ? loopSamples(L) : null));
+      const depth = moundJ.map((C) => pr.toCamera(C).z);
+      S.mounds.forEach((L, i) => {
+        const C = moundJ[i], F = upper.facing[i];
+        if (!L.length || F.x * (eye.x - C.x) + F.y * (eye.y - C.y) + F.z * (eye.z - C.z) <= 0) return;
+        const c = pr.projectPoint(C), u = pr.projectPoint(upper.above[i]), ux = u.x - c.x, uy = u.y - c.y;
+        const j = 1 - i, front = M[j] && depth[j] < depth[i] ? M[j] : null;   // (the other mound, when nearer: it may cover this one)
+        runs.push(...outlineRuns(L, (p, n) => {
+          if ((p.x - c.x) * ux + (p.y - c.y) * uy > 0) return false;   // (its lower half only)
+          return !front || !insideConvex(front, { x: p.x - n.x * inset, y: p.y - n.y * inset });
+        }, M[i], inset));
+      });
+      return runs;
+    };
+    // the marks (marks.js): the collarbones, from the left shoulder through the notch to the right one
+    const cl = [...CLAVICLE.slice(1).reverse().map((c) => [c, -1]), [CLAVICLE[0], 1], ...CLAVICLE.slice(1).map((c) => [c, 1])];
+    const nrm3 = (v) => { const l = Math.hypot(v.x, v.y, v.z); return { x: v.x / l, y: v.y / l, z: v.z / l }; };
+    body.marks = [{
+      pts: cl.map(([c, sg]) => add(add(add(base, top.S, sg * c.side), top.U, c.up), top.F, c.fwd)),
+      normals: cl.map(([c, sg]) => nrm3(add(add(top.F, top.U, 0.4 / h), top.S, (sg * c.out) / h))) }];
+    // the chest's lower edges (UNDER_LINE): one plane, per side its cut through the mound's ellipsoid and the run from the armpit
+    const U_ = CH.under;
+    const dot = (p, q) => p.x * q.x + p.y * q.y + p.z * q.z, sub = (p, q) => ({ x: p.x - q.x, y: p.y - q.y, z: p.z - q.z });
+    const cross = (p, q) => ({ x: p.y * q.z - p.z * q.y, y: p.z * q.x - p.x * q.z, z: p.x * q.y - p.y * q.x });
+    const armpit = (i) => add(add(add(shoulderJ[i], top.U, ARMPIT.up), top.F, ARMPIT.fwd), top.S, (i === 0 ? 1 : -1) * ARMPIT.side);
+    const bottom = (E) => { const [[d1, a1], [d2, a2]] = E.axes, [f, u] = U_.through;
+      return { x: E.C.x + d1.x * a1 * f + d2.x * a2 * u, y: E.C.y + d1.y * a1 * f + d2.y * a2 * u, z: E.C.z + d1.z * a1 * f + d2.z * a2 * u }; };
+    const A0 = armpit(0), N = nrm3(cross(ch.S, sub(bottom(underE[0]), A0)));   // (the plane: through A0, normal N; holds ch.S)
+    const inChest = (x) => { const O = chestOv, p = sub(x, O.M), t = dot(p, O.a), L = t > 0 ? O.A2 : O.A1;
+      return (t / L) ** 2 + (dot(p, O.w) / O.Bw) ** 2 + (dot(p, O.n) / O.Bn) ** 2 < 1; };
+    underE.forEach((E, i) => {
+      const sg = i === 0 ? 1 : -1, ax = E.axes, A = armpit(i);
+      if (U_.contour) return;   // (the line is drawn on screen: body.outlineMarks, the mound's lower edge)
+      // in the ellipsoid's unit-sphere coordinates y (x = C + sum d_k a_k y_k) the plane is w . y = c: its cut a circle (y0, rho)
+      const w = ax.map(([d, a]) => dot(N, d) * a), c = dot(N, sub(A0, E.C)), ww = w[0] ** 2 + w[1] ** 2 + w[2] ** 2;
+      if (c * c >= ww) return;
+      const y0 = w.map((v) => (v * c) / ww), rho = Math.sqrt(1 - (c * c) / ww);
+      const yA = ax.map(([d, a]) => dot(d, sub(A, E.C)) / a), toA = yA.map((v, k) => v - y0[k]), D = Math.hypot(...toA);
+      if (D <= rho) return;   // (the armpit inside the cut: no run to it)
+      const e1 = toA.map((v) => v / D), e2r = [w[1] * e1[2] - w[2] * e1[1], w[2] * e1[0] - w[0] * e1[2], w[0] * e1[1] - w[1] * e1[0]];
+      const e2l = Math.hypot(...e2r), e2 = e2r.map((v) => v / e2l);
+      const yAt = (ph, k = 1) => y0.map((v, q) => v + rho * k * (e1[q] * Math.cos(ph) + e2[q] * Math.sin(ph)));
+      const xOf = (y) => ({ x: E.C.x + ax.reduce((s_, [d, a], q) => s_ + d.x * a * y[q], 0), y: E.C.y + ax.reduce((s_, [d, a], q) => s_ + d.y * a * y[q], 0), z: E.C.z + ax.reduce((s_, [d, a], q) => s_ + d.z * a * y[q], 0) });
+      const nOf = (y) => nrm3({ x: ax.reduce((s_, [d, a], q) => s_ + (d.x * y[q]) / a, 0), y: ax.reduce((s_, [d, a], q) => s_ + (d.y * y[q]) / a, 0), z: ax.reduce((s_, [d, a], q) => s_ + (d.z * y[q]) / a, 0) });
+      // the tangents from the armpit's point to the circle: at +-acos(rho / D) from e1; the one on the outer side
+      const g = Math.acos(rho / D), outer = (ph) => sg * dot(xOf(yAt(ph)), ch.S);
+      const phT = outer(g) > outer(-g) ? g : -g, dir = phT > 0 ? 1 : -1;   // (on round away from the armpit)
+      const An = nrm3(add(add(top.F, top.S, (sg * ARMPIT.normal.out) / ARMPIT.normal.fwd / h), top.U, ARMPIT.normal.up / ARMPIT.normal.fwd / h));
+      const T = xOf(yAt(phT, U_.sink)), Tn = nOf(yAt(phT)), pts = [A], normals = [An];
+      for (let k = 1; k < ARMPIT.steps; k++) {
+        const t = k / ARMPIT.steps, mix = (a, b) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t });
+        pts.push(mix(A, T)); normals.push(nrm3(mix(An, Tn)));
+      }
+      for (let k = 0; k * 0.08 < 1.7 * Math.PI; k++) {
+        const ph = phT + dir * k * 0.08, x = xOf(yAt(ph, U_.sink));
+        if (k > 1 && inChest(x)) break;
+        pts.push(x); normals.push(nOf(yAt(ph)));
+      }
+      body.marks.push({ pts, normals, front: { ...ch.F } });   // (seen only from the chest's front half)
+    });
   };
   return { parts, pose };
 }
 
 // The skeleton's bones, as pairs of joint names (figure body.joints).
 export const BONES = [['neck', 'head'], ['neck', 'chest'], ['chest', 'waist'], ['waist', 'pelvis'],
-  ...['L', 'R'].flatMap((k) => [['neck', 'shoulder' + k], ['shoulder' + k, 'lat' + k], ['shoulder' + k, 'pec' + k], ['pec' + k, 'breast' + k], ['shoulder' + k, 'elbow' + k], ['elbow' + k, 'wrist' + k], ['wrist' + k, 'knuckles' + k], ['knuckles' + k, 'fingertip' + k], ['wrist' + k, 'thumbKnuckle' + k],
+  ...['L', 'R'].flatMap((k) => [['neck', 'shoulder' + k], ['shoulder' + k, 'lat' + k], ['shoulder' + k, 'pec' + k], ['pec' + k, 'mound' + k], ['shoulder' + k, 'elbow' + k], ['elbow' + k, 'wrist' + k], ['wrist' + k, 'knuckles' + k], ['knuckles' + k, 'fingertip' + k], ['wrist' + k, 'thumbKnuckle' + k],
     ['pelvis', 'hip' + k], ['hip' + k, 'glute' + k], ['hip' + k, 'knee' + k], ['knee' + k, 'ankle' + k], ['ankle' + k, 'heel' + k], ['ankle' + k, 'ball' + k], ['ankle' + k, 'ballOut' + k], ['ball' + k, 'toe' + k]])];
 
 // height: the body's height in world units (player.height cubes); groundAt(x, z): the ground under the feet; start: where the
@@ -326,9 +446,19 @@ export function buildFigure({ height, groundAt, start }) {
     walk.yaw = start.yaw;
   }
   const { parts, pose } = makeFigure(height);
-  // every part's move redoes the pose (a few dozen trig calls)
-  const move = () => pose({ body: walk.body, yaw: walk.yaw, phase: walk.phase, gait: walk.gait, air: walk.on && !walk.grounded ? 1 : 0 });
-  for (const p of parts) p.move = move;
+  // every part is a mover (the renderer moves them all before building anything), but only the first part's move poses the
+  // body, and only when the walk's state changed: then the others' are nothing; `idle` (unchanged since the last frame) lets the
+  // renderer keep their outlines while the camera stays put, as a static figure's
+  let last = null;
+  const move = () => {
+    const b = walk.body, air = walk.on && !walk.grounded ? 1 : 0;
+    const same = !!last && last[0] === b.x && last[1] === b.y && last[2] === b.z && last[3] === walk.yaw && last[4] === walk.phase && last[5] === walk.gait && last[6] === air;
+    for (const p of parts) p.idle = same;
+    if (same) return;
+    last = [b.x, b.y, b.z, walk.yaw, walk.phase, walk.gait, air];
+    pose({ body: b, yaw: walk.yaw, phase: walk.phase, gait: walk.gait, air });
+  };
+  parts.forEach((p, i) => { p.move = i === 0 ? move : () => {}; });
   return parts;
 }
 

@@ -366,7 +366,9 @@ export function ellipseTangentAngles(e1, e2, scan = 96) {   // scan: the check's
   // product of two forms (a, b, c) in t = sin / cos: coefficients of t^0 .. t^4
   const mul = (u, v) => [u[0] * v[0], u[0] * v[1] + u[1] * v[0], u[0] * v[2] + u[1] * v[1] + u[2] * v[0], u[1] * v[2] + u[2] * v[1], u[2] * v[2]];
   const P = mul(q1, q2), RR = mul(R, R), F = P.map((x, i) => 4 * x - RR[i]);
-  const g = (th) => ellipseSupport(e2, th) - ellipseSupport(e1, th);
+  // (the supports' difference from the same forms: one cos and sin per angle)
+  const g = (th) => { const c = Math.cos(th), s = Math.sin(th), cc = c * c, cs = c * s, ss = s * s;
+    return dx * c + dy * s + Math.sqrt(q2[0] * cc + q2[1] * cs + q2[2] * ss) - Math.sqrt(q1[0] * cc + q1[1] * cs + q1[2] * ss); };
   const scaleG = Math.abs(dx) + Math.abs(dy) + e1.a + e2.a + 1e-12;
   const cand = [];
   solveQuartic(F[4], F[3], F[2], F[1], F[0]).forEach(t => { const th = Math.atan(t); cand.push(th, th + Math.PI); });

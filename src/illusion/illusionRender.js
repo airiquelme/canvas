@@ -24,6 +24,7 @@ import { lamps, lampAt, lampTone } from './lamps.js';
 import { clipLoopNear } from './patch.js';
 import { windAt } from './wind.js';
 import { buildFigure, buildStaticFigure, BONES } from './figure.js';
+import { markSides, polylineSides, MARK_COLOR } from './marks.js';
 import { player } from '../core/flyCamera.js';
 let frameSway = null;   // this frame's wind field (buildIllusionFrame), or null
 
@@ -1036,7 +1037,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     let pieces;
     const g = s.grow ?? 1, fading = g < 1;
     const sh = fading && o.kind && o.kind !== 'quad' && o.kind !== 'patch' ? shrunkSheet(o, g) : o;
-    if (!o.move && !s.nearCut && !fading && o.cache && o.cache.key === camKey) { pieces = o.cache.pieces; stats.reused++; }
+    if ((!o.move || o.idle) && !s.nearCut && !fading && o.cache && o.cache.key === camKey) { pieces = o.cache.pieces; stats.reused++; }   // (idle: a mover that didn't move, the player's figure standing)
     else if (o.kind === 'quad') pieces = quadPieces(s.proj).map((p) => ({ sides: p.sides, fill: litOf(o.fill), base: o.fill, colors: SIDE_COLORS, keep: !o.move }));
     else if (o.kind === 'patch' && !s.nearCut && o.oneSided !== false && ctrlOf(o) && gRange(o, o.ctrl)[1] <= 0) { pieces = []; stats.backGround++; }   // seen from below only
     else if (o.kind === 'patch' && reuseOn && !s.nearCut && ctrlOf(o) && frontAll(o) &&
@@ -1079,7 +1080,7 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
     else pieces = one(o, capsuleSides(s.c1, s.c2));
     if (curved) { if (o.exact) stats.curved++; else stats.simplified++; }
     if (o.kind && o.kind !== 'quad' && o.kind !== 'patch') stats.sheets++;
-    if (!o.move && !s.nearCut && !fading) o.cache = { key: camKey, pieces };
+    if ((!o.move || o.body) && !s.nearCut && !fading) o.cache = { key: camKey, pieces };
     setCrescents(o, pieces);
     s.pieces = pieces;
   }
@@ -1141,20 +1142,38 @@ export function buildIllusionFrame(canvas, { darkMode = false, time = 0 } = {}) 
           const lift = lamps.length ? lampAt(probe) : null;
           tone = lift ? lampTone(first.fill, shadeOf(first.fill), lift) : shadeOf(first.fill);
         }
-        const sides = [], box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
-        // every loop wound the same way (nonzero: a quad seen from its other side would cancel the capsules it overlaps)
-        let ref = 0;
-        for (const i of idxs) for (const p of shapes[i].pieces) if (!shapes[i].o.kind) { ref = ref || loopsWound(p.sides)[0]; }
+        const body = shapes[idxs[0]].o.body, box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
         for (const i of idxs) {
           const s = shapes[i];
-          for (const p of s.pieces) for (const L of splitLoops(p.sides)) {
-            const lp = ref && Math.sign(loopArea(L)) !== Math.sign(ref) ? reverseLoop(L) : L;
-            lp.forEach((sd, k) => sides.push(k === 0 ? { ...sd, move: true } : sd));
-          }
           if (s.box) { box.x0 = Math.min(box.x0, s.box.x0); box.y0 = Math.min(box.y0, s.box.y0); box.x1 = Math.max(box.x1, s.box.x1); box.y1 = Math.max(box.y1, s.box.y1); }
           if (s !== last) drop.add(s);
         }
-        const merged = { ...last, o: first, body: true, box: box.x0 <= box.x1 ? box : last.box, pieces: [{ sides, fill: tone, base: first.fill, colors: SIDE_COLORS, keep: false }] };
+        // a STILL body (a statue: no part moves) while the camera stays put: its parts' pieces are the kept ones (o.cache), so the
+        // merged shape and its marks are kept too (kept pieces: their path and triangles are reused); the tone is set every frame.
+        // (Its outline marks are built from the torso's outline of the frame it was built, figure.js: rebuilt only with it.)
+        const still = idxs.every((i) => !shapes[i].o.move || shapes[i].o.idle), parts = idxs.map((i) => shapes[i].pieces), C = body.mergedCache;
+        let pieces = still && C && C.key === camKey && C.parts.length === parts.length && C.parts.every((q, k) => q === parts[k]) ? C.pieces : null;
+        if (!pieces) {
+          const sides = [];
+          // every loop wound the same way (nonzero: a quad seen from its other side would cancel the capsules it overlaps)
+          let ref = 0;
+          for (const i of idxs) for (const p of shapes[i].pieces) if (!shapes[i].o.kind) { ref = ref || loopsWound(p.sides)[0]; }
+          for (const i of idxs) for (const p of shapes[i].pieces) for (const L of splitLoops(p.sides)) {
+            const lp = ref && Math.sign(loopArea(L)) !== Math.sign(ref) ? reverseLoop(L) : L;
+            lp.forEach((sd, k) => sides.push(k === 0 ? { ...sd, move: true } : sd));
+          }
+          pieces = [{ sides, fill: tone, base: first.fill, colors: SIDE_COLORS, keep: still }];
+          // its MARKS (marks.js: the collarbones, the breasts' lower edges): green lines on the skin, over the body's fill, in the
+          // same shape (drawn with it)
+          if (body.marks) {
+            const ms = markSides(body.marks, camPos, (p) => (depthOf(p) > NEAR ? projectPoint(p) : null));
+            if (body.outlineMarks) ms.push(...polylineSides(body.outlineMarks(projector, camPos)));   // (view dependent: a breast's lower edge)
+            if (ms.length) pieces.push({ sides: ms, fill: MARK_COLOR, base: MARK_COLOR, colors: SIDE_COLORS, keep: still });
+          }
+          body.mergedCache = still ? { key: camKey, parts, pieces } : null;
+        }
+        pieces[0].fill = tone;
+        const merged = { ...last, o: first, body: true, box: box.x0 <= box.x1 ? box : last.box, pieces };
         shapes[idxs[idxs.length - 1]] = merged;
       }
       let w = 0;
